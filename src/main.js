@@ -22,6 +22,28 @@ function saveConfig(cfg) {
   catch (e) { log(`saveConfig error: ${e.message}`) }
 }
 
+const GEMINI_MODELS = [
+  'gemini-2.5-flash-preview-04-17',
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
+  'gemini-1.5-flash',
+]
+
+let currentModelIndex = 0
+
+function currentModel() {
+  return GEMINI_MODELS[currentModelIndex]
+}
+
+function nextModel() {
+  if (currentModelIndex < GEMINI_MODELS.length - 1) {
+    currentModelIndex++
+    log(`Переключаемся на модель: ${currentModel()}`)
+    return true
+  }
+  return false
+}
+
 let tray = null
 let history = []
 
@@ -114,10 +136,10 @@ function capture() {
 }
 
 function callGemini(apiKey, imagePath, callback) {
-  // bug fix: use async read to avoid blocking Electron main thread on large screenshots
   let imageData
   try { imageData = fs.readFileSync(imagePath).toString('base64') }
   catch (e) { callback(`Не удалось прочитать скриншот: ${e.message}`); return }
+
   const prompt = `На изображении есть числа. Найди ВСЕ числа (целые и дробные), которые являются количеством или суммой — например, цены, значения, показатели. Игнорируй: даты (2024, 01.01.2024), номера телефонов, артикулы, коды, номера строк и любые числа которые являются идентификаторами. Верни ответ СТРОГО в формате JSON без markdown-обёртки: {"numbers": [список чисел как Number], "sum": итоговая сумма, "note": ""} Если чисел нет, верни numbers:[] и sum:0.`
 
   const body = JSON.stringify({
@@ -125,9 +147,12 @@ function callGemini(apiKey, imagePath, callback) {
     generationConfig: { temperature: 0 }
   })
 
+  const model = currentModel()
+  log(`Используем модель: ${model}`)
+
   const options = {
     hostname: 'generativelanguage.googleapis.com',
-    path: `/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+    path: `/v1beta/models/${model}:generateContent?key=${apiKey}`,
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
   }
@@ -138,12 +163,21 @@ function callGemini(apiKey, imagePath, callback) {
     res.on('end', () => {
       try {
         const json = JSON.parse(raw)
-        if (json.error) { callback(json.error.message || 'Ошибка API'); return }
+        if (json.error) {
+          const msg = json.error.message || 'Ошибка API'
+          const isQuota = msg.toLowerCase().includes('quota') || msg.toLowerCase().includes('rate') || json.error.code === 429
+          if (isQuota && nextModel()) {
+            log(`Квота исчерпана для ${model}, пробуем ${currentModel()}`)
+            callGemini(apiKey, imagePath, callback)
+            return
+          }
+          callback(msg)
+          return
+        }
         let text = json.candidates?.[0]?.content?.parts?.[0]?.text
         if (!text) { callback(`Пустой ответ от Gemini: ${raw.slice(0, 200)}`); return }
         log(`Gemini raw text: ${text.slice(0, 300)}`)
         text = text.replace(/```json|```/g, '').trim()
-        // extract first JSON object in case there's extra text
         const match = text.match(/\{[\s\S]*\}/)
         if (!match) { callback(`Не удалось найти JSON в ответе: ${text.slice(0, 200)}`); return }
         callback(null, JSON.parse(match[0]))
@@ -154,7 +188,6 @@ function callGemini(apiKey, imagePath, callback) {
     })
   })
 
-  // bug fix: timeout so tray doesn't get stuck on '…' if network hangs
   req.setTimeout(15000, () => {
     req.destroy()
     callback('Таймаут запроса (15 сек) — проверь интернет-соединение')
