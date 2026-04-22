@@ -22,11 +22,12 @@ function saveConfig(cfg) {
   catch (e) { log(`saveConfig error: ${e.message}`) }
 }
 
+// ✅ Модели с доступными лимитами (в порядке приоритета)
 const GEMINI_MODELS = [
-  'gemini-2.5-flash-preview-04-17',
-  'gemini-2.0-flash',
-  'gemini-2.0-flash-lite',
-  // 'gemini-1.5-flash-latest',
+  'gemini-3.1-flash-lite-preview',    // 15 RPM, 500 RPD — лучшая
+  'gemini-3-flash-preview',           // 5 RPM, 20 RPD
+  'gemini-2.5-flash-lite',            // 10 RPM, 20 RPD
+  'gemini-2.5-flash',                 // 5 RPM, 20 RPD — запасная
 ]
 
 let currentModelIndex = 0
@@ -42,6 +43,10 @@ function nextModel() {
     return true
   }
   return false
+}
+
+function resetModel() {
+  currentModelIndex = 0
 }
 
 let tray = null
@@ -64,10 +69,17 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {})
 
 function buildMenu() {
+  const modelShort = currentModel()
+    .replace('gemini-', 'G-')
+    .replace('-preview', '')
+    .replace('-lite', 'L')
+
   const menu = Menu.buildFromTemplate([
     { label: 'Выделить область', click: capture },
     { type: 'separator' },
     { label: history.length ? `История (${history.length})` : 'История', click: showHistory },
+    { type: 'separator' },
+    { label: `Модель: ${modelShort}`, enabled: false },
     { type: 'separator' },
     { label: 'API-ключ…', click: promptApiKey },
     { label: 'Выйти', role: 'quit' },
@@ -83,7 +95,12 @@ function capture() {
   if (capturing) return
   const cfg = loadConfig()
   if (!cfg.api_key) {
-    dialog.showMessageBoxSync({ type: 'warning', title: 'numsum', message: 'Сначала укажи API-ключ', detail: 'Меню → API-ключ…' })
+    dialog.showMessageBoxSync({
+      type: 'warning',
+      title: 'numsum',
+      message: 'Сначала укажи API-ключ',
+      detail: 'Меню → API-ключ…'
+    })
     return
   }
 
@@ -91,7 +108,6 @@ function capture() {
   const tmpPath = path.join(os.tmpdir(), `numsum_${Date.now()}.png`)
 
   execFile('/usr/sbin/screencapture', ['-i', '-s', tmpPath], (err) => {
-    // screencapture returns err when user presses Escape — not a real error, just check file
     if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size === 0) {
       try { fs.unlinkSync(tmpPath) } catch {}
       capturing = false
@@ -107,15 +123,20 @@ function capture() {
 
       if (error) {
         log(`ERROR: ${error}`)
-        dialog.showMessageBoxSync({ type: 'error', title: 'numsum — ошибка', message: String(error) })
+        dialog.showMessageBoxSync({
+          type: 'error',
+          title: 'numsum — ошибка',
+          message: String(error)
+        })
         return
       }
 
       log(`OK: numbers=${JSON.stringify(data.numbers)} sum=${data.sum}`)
 
-      // Gemini sometimes returns strings instead of numbers — normalize
       const numbers = (data.numbers || []).map(n => Number(n)).filter(n => !isNaN(n))
-      const sum = numbers.length ? Math.round(numbers.reduce((a, b) => a + b, 0) * 1e10) / 1e10 : 0
+      const sum = numbers.length
+        ? Math.round(numbers.reduce((a, b) => a + b, 0) * 1e10) / 1e10
+        : 0
 
       if (!numbers.length) {
         dialog.showMessageBoxSync({ title: 'numsum', message: 'Чисел не найдено' })
@@ -143,7 +164,12 @@ function callGemini(apiKey, imagePath, callback) {
   const prompt = `На изображении есть числа. Найди ВСЕ числа (целые и дробные), которые являются количеством или суммой — например, цены, значения, показатели. Игнорируй: даты (2024, 01.01.2024), номера телефонов, артикулы, коды, номера строк и любые числа которые являются идентификаторами. Верни ответ СТРОГО в формате JSON без markdown-обёртки: {"numbers": [список чисел как Number], "sum": итоговая сумма, "note": ""} Если чисел нет, верни numbers:[] и sum:0.`
 
   const body = JSON.stringify({
-    contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: 'image/png', data: imageData } }] }],
+    contents: [{
+      parts: [
+        { text: prompt },
+        { inline_data: { mime_type: 'image/png', data: imageData } }
+      ]
+    }],
     generationConfig: { temperature: 0 }
   })
 
@@ -154,7 +180,10 @@ function callGemini(apiKey, imagePath, callback) {
     hostname: 'generativelanguage.googleapis.com',
     path: `/v1beta/models/${model}:generateContent?key=${apiKey}`,
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body)
+    }
   }
 
   const req = https.request(options, (res) => {
@@ -163,24 +192,48 @@ function callGemini(apiKey, imagePath, callback) {
     res.on('end', () => {
       try {
         const json = JSON.parse(raw)
+
         if (json.error) {
           const msg = json.error.message || 'Ошибка API'
-          const isQuota = msg.toLowerCase().includes('quota') || msg.toLowerCase().includes('rate') || json.error.code === 429
+          const code = json.error.code
+          
+          // Проверяем на исчерпание лимитов
+          const isQuota = msg.toLowerCase().includes('quota') ||
+                          msg.toLowerCase().includes('rate') ||
+                          msg.toLowerCase().includes('limit') ||
+                          code === 429 || code === 403
+
           if (isQuota && nextModel()) {
             log(`Квота исчерпана для ${model}, пробуем ${currentModel()}`)
-            callGemini(apiKey, imagePath, callback)
+            buildMenu() // обновляем меню с новой моделью
+            setTimeout(() => callGemini(apiKey, imagePath, callback), 1000) // пауза 1 сек
             return
           }
-          callback(msg)
+          
+          callback(`${msg} (код: ${code})`)
           return
         }
+
         let text = json.candidates?.[0]?.content?.parts?.[0]?.text
-        if (!text) { callback(`Пустой ответ от Gemini: ${raw.slice(0, 200)}`); return }
+        if (!text) {
+          callback(`Пустой ответ от Gemini: ${raw.slice(0, 200)}`)
+          return
+        }
+
         log(`Gemini raw text: ${text.slice(0, 300)}`)
         text = text.replace(/```json|```/g, '').trim()
         const match = text.match(/\{[\s\S]*\}/)
-        if (!match) { callback(`Не удалось найти JSON в ответе: ${text.slice(0, 200)}`); return }
+        if (!match) {
+          callback(`Не удалось найти JSON в ответе: ${text.slice(0, 200)}`)
+          return
+        }
+
+        // ✅ Успех — сбрасываем на лучшую модель
+        resetModel()
+        buildMenu()
+
         callback(null, JSON.parse(match[0]))
+
       } catch (e) {
         log(`Parse error: ${e.message} | raw: ${raw.slice(0, 300)}`)
         callback(`Ошибка парсинга: ${e.message} | ${raw.slice(0, 100)}`)
@@ -188,27 +241,33 @@ function callGemini(apiKey, imagePath, callback) {
     })
   })
 
-  req.setTimeout(15000, () => {
+  req.setTimeout(20000, () => {
     req.destroy()
-    callback('Таймаут запроса (15 сек) — проверь интернет-соединение')
+    callback('Таймаут запроса (20 сек) — проверь интернет-соединение')
   })
+
   req.on('error', e => callback(e.message))
   req.write(body)
   req.end()
 }
 
 function showHistory() {
-  if (!history.length) { dialog.showMessageBoxSync({ title: 'numsum', message: 'Пока нет результатов' }); return }
-  const lines = history.slice(0, 10).map((e, i) => `${i + 1}. [${e.numbers.slice(0, 5).join(', ')}]  →  ${e.sum}`).join('\n')
+  if (!history.length) {
+    dialog.showMessageBoxSync({ title: 'numsum', message: 'Пока нет результатов' })
+    return
+  }
+  const lines = history
+    .slice(0, 10)
+    .map((e, i) => `${i + 1}. [${e.numbers.slice(0, 5).join(', ')}]  →  ${e.sum}`)
+    .join('\n')
   dialog.showMessageBoxSync({ title: 'История', message: lines })
 }
 
 function promptApiKey() {
   const cfg = loadConfig()
-  // bug fix: pass current key via separate arg to avoid osascript injection if key has quotes
   const script = `display dialog "Введи Gemini API-ключ:" default answer "" with title "numsum" buttons {"Отмена", "Сохранить"} default button "Сохранить"`
   execFile('/usr/bin/osascript', ['-e', script], (err, stdout) => {
-    if (err) return  // user clicked Отмена
+    if (err) return
     const match = stdout.match(/text returned:(.+)/)
     if (match) {
       const key = match[1].trim()
