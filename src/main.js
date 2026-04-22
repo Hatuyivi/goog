@@ -22,12 +22,12 @@ function saveConfig(cfg) {
   catch (e) { log(`saveConfig error: ${e.message}`) }
 }
 
-// ✅ Модели с доступными лимитами (в порядке приоритета)
+// ✅ Стабильные модели первыми
 const GEMINI_MODELS = [
-  'gemini-3.1-flash-lite-preview',    // 15 RPM, 500 RPD — лучшая
-  'gemini-3-flash-preview',           // 5 RPM, 20 RPD
-  'gemini-2.5-flash-lite',            // 10 RPM, 20 RPD
-  'gemini-2.5-flash',                 // 5 RPM, 20 RPD — запасная
+  'gemini-2.5-flash-lite',            // 10 RPM, 20 RPD — стабильная
+  'gemini-2.5-flash',                 // 5 RPM, 20 RPD — резервная
+  'gemini-2.0-flash-lite',            // стабильная
+  'gemini-3.1-flash-lite-preview',    // 15 RPM, 500 RPD — может быть перегружена
 ]
 
 let currentModelIndex = 0
@@ -116,13 +116,14 @@ function capture() {
 
     tray.setTitle('…')
 
-    callGemini(cfg.api_key, tmpPath, (error, data) => {
+    // ✅ Запускаем с retry логикой
+    callGeminiWithRetry(cfg.api_key, tmpPath, (error, data) => {
       try { fs.unlinkSync(tmpPath) } catch {}
       tray.setTitle('Σ')
       capturing = false
 
       if (error) {
-        log(`ERROR: ${error}`)
+        log(`FINAL ERROR: ${error}`)
         dialog.showMessageBoxSync({
           type: 'error',
           title: 'numsum — ошибка',
@@ -156,6 +157,75 @@ function capture() {
   })
 }
 
+// ✅ Новая функция с retry логикой
+function callGeminiWithRetry(apiKey, imagePath, callback, attemptNum = 1, maxAttempts = 8) {
+  const model = currentModel()
+  log(`Попытка ${attemptNum}/${maxAttempts} с моделью: ${model}`)
+
+  callGemini(apiKey, imagePath, (error, data) => {
+    if (!error) {
+      // ✅ Успех — сбрасываем на лучшую модель
+      resetModel()
+      buildMenu()
+      callback(null, data)
+      return
+    }
+
+    const isTemporaryError = 
+      error.includes('503') ||                    // service unavailable
+      error.includes('502') ||                    // bad gateway
+      error.includes('high demand') ||            // перегрузка
+      error.includes('temporarily unavailable') ||
+      error.includes('Try again later') ||
+      error.includes('timeout') ||                // таймаут
+      error.includes('ECONNRESET') ||            // сеть
+      error.includes('ETIMEDOUT')
+
+    const isQuotaError = 
+      error.includes('quota') ||
+      error.includes('rate') ||
+      error.includes('limit') ||
+      error.includes('429') ||
+      error.includes('403')
+
+    if (attemptNum < maxAttempts) {
+      if (isQuotaError && nextModel()) {
+        // Квота исчерпана — переключаемся на следующую модель
+        log(`Квота исчерпана для ${model}, переключаемся на ${currentModel()}`)
+        buildMenu()
+        setTimeout(() => {
+          callGeminiWithRetry(apiKey, imagePath, callback, attemptNum + 1, maxAttempts)
+        }, 1000)
+        return
+      }
+
+      if (isTemporaryError) {
+        // Временная ошибка — retry с экспоненциальной задержкой
+        const delay = Math.min(1000 * Math.pow(2, attemptNum - 1), 8000) // 1s, 2s, 4s, 8s
+        log(`Временная ошибка (${error}), retry через ${delay}ms`)
+        
+        setTimeout(() => {
+          callGeminiWithRetry(apiKey, imagePath, callback, attemptNum + 1, maxAttempts)
+        }, delay)
+        return
+      }
+
+      // Другая ошибка — пробуем следующую модель
+      if (nextModel()) {
+        log(`Ошибка с ${model}, пробуем ${currentModel()}`)
+        buildMenu()
+        setTimeout(() => {
+          callGeminiWithRetry(apiKey, imagePath, callback, attemptNum + 1, maxAttempts)
+        }, 1000)
+        return
+      }
+    }
+
+    // ✅ Все попытки исчерпаны
+    callback(`Все попытки исчерпаны. Последняя ошибка: ${error}`)
+  })
+}
+
 function callGemini(apiKey, imagePath, callback) {
   let imageData
   try { imageData = fs.readFileSync(imagePath).toString('base64') }
@@ -174,7 +244,6 @@ function callGemini(apiKey, imagePath, callback) {
   })
 
   const model = currentModel()
-  log(`Используем модель: ${model}`)
 
   const options = {
     hostname: 'generativelanguage.googleapis.com',
@@ -196,20 +265,6 @@ function callGemini(apiKey, imagePath, callback) {
         if (json.error) {
           const msg = json.error.message || 'Ошибка API'
           const code = json.error.code
-          
-          // Проверяем на исчерпание лимитов
-          const isQuota = msg.toLowerCase().includes('quota') ||
-                          msg.toLowerCase().includes('rate') ||
-                          msg.toLowerCase().includes('limit') ||
-                          code === 429 || code === 403
-
-          if (isQuota && nextModel()) {
-            log(`Квота исчерпана для ${model}, пробуем ${currentModel()}`)
-            buildMenu() // обновляем меню с новой моделью
-            setTimeout(() => callGemini(apiKey, imagePath, callback), 1000) // пауза 1 сек
-            return
-          }
-          
           callback(`${msg} (код: ${code})`)
           return
         }
@@ -228,10 +283,6 @@ function callGemini(apiKey, imagePath, callback) {
           return
         }
 
-        // ✅ Успех — сбрасываем на лучшую модель
-        resetModel()
-        buildMenu()
-
         callback(null, JSON.parse(match[0]))
 
       } catch (e) {
@@ -243,7 +294,7 @@ function callGemini(apiKey, imagePath, callback) {
 
   req.setTimeout(20000, () => {
     req.destroy()
-    callback('Таймаут запроса (20 сек) — проверь интернет-соединение')
+    callback('Таймаут запроса (20 сек)')
   })
 
   req.on('error', e => callback(e.message))
