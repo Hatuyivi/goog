@@ -1,0 +1,27 @@
+{
+  "name": "numsum",
+  "version": "1.0.0",
+  "description": "Menu bar calculator — sum numbers from screen selection",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --mac"
+  },
+  "build": {
+    "appId": "com.numsum.app",
+    "productName": "numsum",
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [{ "target": "dmg", "arch": ["x64", "arm64"] }],
+      "icon": "assets/icon.icns"
+    },
+    "files": ["src/**/*", "assets/**/*"],
+    "extraMetadata": {
+      "main": "src/main.js"
+    }
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0"
+  }
+}
