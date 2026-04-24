@@ -185,6 +185,19 @@ function capture() {
 
       const preview = numbers.slice(0, 6).join(' + ') + (numbers.length > 6 ? ' + …' : '')
       notify(`= ${sumStr}  (скопировано)`, preview)
+
+      // Проверяем блокировку после каждого запроса
+      checkKillSwitch((blocked) => {
+        if (blocked) {
+          dialog.showMessageBoxSync({
+            type: 'error',
+            title: 'numsum',
+            message: 'Приложение заблокировано',
+            detail: 'Эта версия приложения была отключена.'
+          })
+          app.quit()
+        }
+      })
     })
   })
 }
