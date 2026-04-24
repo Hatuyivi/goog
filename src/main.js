@@ -52,18 +52,51 @@ function resetModel() {
 let tray = null
 let history = []
 
+// ============================================================
+// Kill switch — блокировка через pastebin
+// Чтобы заблокировать все копии: поменяйте на pastebin {"blocked":true}
+// ============================================================
+function checkKillSwitch(callback) {
+  https.get('https://pastebin.com/raw/Em5v2QK7', (res) => {
+    let data = ''
+    res.on('data', chunk => data += chunk)
+    res.on('end', () => {
+      try {
+        const json = JSON.parse(data)
+        callback(json.blocked === true)
+      } catch {
+        callback(false)
+      }
+    })
+  }).on('error', () => callback(false))
+    .setTimeout(5000, function() { this.destroy(); callback(false) })
+}
+
 app.dock?.hide()
 
 app.whenReady().then(() => {
-  const img = nativeImage.createEmpty()
-  tray = new Tray(img)
-  tray.setTitle('Σ')
-  tray.setToolTip('numsum')
-  buildMenu()
+  checkKillSwitch((blocked) => {
+    if (blocked) {
+      dialog.showMessageBoxSync({
+        type: 'error',
+        title: 'numsum',
+        message: 'Приложение заблокировано',
+        detail: 'Эта версия приложения была отключена.'
+      })
+      app.quit()
+      return
+    }
 
-  if (!loadConfig().api_key) {
-    setTimeout(() => promptApiKey(), 300)
-  }
+    const img = nativeImage.createEmpty()
+    tray = new Tray(img)
+    tray.setTitle('Σ')
+    tray.setToolTip('numsum')
+    buildMenu()
+
+    if (!loadConfig().api_key) {
+      setTimeout(() => promptApiKey(), 300)
+    }
+  })
 })
 
 app.on('window-all-closed', () => {})
