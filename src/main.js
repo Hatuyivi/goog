@@ -176,6 +176,149 @@ ipcMain.handle('save-dir-dialog', async () => {
   return result.filePaths?.[0] || null
 })
 
+ipcMain.handle('get-gemini-models', () => GEMINI_MODELS)
+ipcMain.handle('get-openrouter-models', () => openrouterModels)
+
+// ── Planner: analyse floor plan via Vision API ─────────────
+ipcMain.handle('planner-analyse', async (e, { b64, mime, provider, modelId, imgW, imgH }) => {
+  const cfg = loadConfig()
+  const apiKey = provider === 'openrouter'
+    ? cfg.openrouter_api_key
+    : (cfg.gemini_api_key || cfg.api_key)
+
+  if (!apiKey) return { error: `Нет API-ключа для ${provider}` }
+
+  const model = { id: modelId, provider }
+  log(`Planner analyse: ${provider} / ${modelId} | img ${imgW}x${imgH}`)
+
+  const PROMPT = `Это план этажа здания или квартиры.
+
+Твоя задача — найти ВСЕ отдельные помещения (офисы, комнаты, коридоры, санузлы, лестницы и т.д.) и вернуть их контуры.
+
+Правила:
+1. Каждое помещение — отдельный полигон из 4–20 точек [x, y] в пикселях оригинала (${imgW}x${imgH}).
+2. Обходи контур по часовой стрелке, по внутренней границе стен.
+3. Название: используй номер помещения с плана (например «261Н», «255Н») или площадь («56,5 м²»), если нет номера — «Комната N».
+4. Разные помещения не должны перекрываться.
+5. Игнорируй: надписи, размерные линии, сетки, мебель, внешние контуры за пределами здания, мини-схемы генплана.
+
+Верни СТРОГО JSON без markdown, без пояснений:
+{"rooms":[{"id":"r1","label":"261Н","polygon":[[x1,y1],[x2,y2],[x3,y3],[x4,y4]]},...]}`
+
+  return new Promise((resolve) => {
+    const done = (err, rooms) => {
+      if (err) { log(`Planner error: ${err}`); resolve({ error: err, rooms: [] }) }
+      else resolve({ rooms })
+    }
+
+    if (provider === 'openrouter') {
+      plannerCallOpenRouter(apiKey, modelId, b64, mime, PROMPT, done)
+    } else {
+      plannerCallGemini(apiKey, modelId, b64, mime, PROMPT, done)
+    }
+  })
+})
+
+function plannerCallGemini(apiKey, modelId, b64, mime, prompt, done) {
+  const body = JSON.stringify({
+    contents: [{ parts: [
+      { text: prompt },
+      { inline_data: { mime_type: mime, data: b64 } }
+    ]}],
+    generationConfig: { temperature: 0, maxOutputTokens: 8192 }
+  })
+
+  const options = {
+    hostname: 'generativelanguage.googleapis.com',
+    path: `/v1beta/models/${modelId}:generateContent?key=${apiKey}`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+  }
+
+  const req = https.request(options, (res) => {
+    let raw = ''
+    res.on('data', c => raw += c)
+    res.on('end', () => {
+      try {
+        const json = JSON.parse(raw)
+        if (json.error) { done(json.error.message); return }
+        const text = json.candidates?.[0]?.content?.parts?.[0]?.text || ''
+        log(`Planner Gemini raw (${text.length} chars): ${text.slice(0, 200)}`)
+        done(null, parseRoomsFromText(text))
+      } catch(e) { done(`Парсинг: ${e.message} | ${raw.slice(0, 100)}`) }
+    })
+  })
+  req.setTimeout(90000, () => { req.destroy(); done('Таймаут 90с') })
+  req.on('error', e => done(e.message))
+  req.write(body); req.end()
+}
+
+function plannerCallOpenRouter(apiKey, modelId, b64, mime, prompt, done) {
+  const body = JSON.stringify({
+    model: modelId,
+    temperature: 0,
+    messages: [{ role: 'user', content: [
+      { type: 'text', text: prompt },
+      { type: 'image_url', image_url: { url: `data:${mime};base64,${b64}` } }
+    ]}]
+  })
+
+  const options = {
+    hostname: 'openrouter.ai',
+    path: '/api/v1/chat/completions',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      'HTTP-Referer': 'https://numsum.app',
+      'X-Title': 'numsum',
+      'Content-Length': Buffer.byteLength(body)
+    }
+  }
+
+  const req = https.request(options, (res) => {
+    let raw = ''
+    res.on('data', c => raw += c)
+    res.on('end', () => {
+      try {
+        const json = JSON.parse(raw)
+        if (json.error) { done(json.error.message); return }
+        const text = json.choices?.[0]?.message?.content || ''
+        log(`Planner OR raw (${text.length} chars): ${text.slice(0, 200)}`)
+        done(null, parseRoomsFromText(text))
+      } catch(e) { done(`Парсинг: ${e.message} | ${raw.slice(0, 100)}`) }
+    })
+  })
+  req.setTimeout(90000, () => { req.destroy(); done('Таймаут 90с') })
+  req.on('error', e => done(e.message))
+  req.write(body); req.end()
+}
+
+function parseRoomsFromText(text) {
+  if (!text) return []
+  try {
+    // Убираем markdown-обёртку
+    const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim()
+    // Ищем JSON-объект
+    const match = clean.match(/\{[\s\S]*\}/)
+    if (!match) { log('parseRooms: no JSON found'); return [] }
+    const json = JSON.parse(match[0])
+    const raw  = json.rooms || []
+    const result = raw
+      .filter(r => Array.isArray(r.polygon) && r.polygon.length >= 3)
+      .map((r, i) => ({
+        id:      r.id || `r${i + 1}`,
+        label:   r.label || `Комната ${i + 1}`,
+        polygon: r.polygon.map(pt => Array.isArray(pt) ? [Number(pt[0]), Number(pt[1])] : [Number(pt.x), Number(pt.y)]),
+      }))
+    log(`parseRooms: found ${result.length} rooms`)
+    return result
+  } catch(e) {
+    log(`parseRooms error: ${e.message}`)
+    return []
+  }
+}
+
 // ── App init ───────────────────────────────────────────────
 app.dock?.hide()
 
