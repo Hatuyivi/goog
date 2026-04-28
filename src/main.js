@@ -50,32 +50,30 @@ function fetchGeminiModels(apiKey, callback) {
       try {
         const list = (JSON.parse(raw).models || [])
           .filter(m => {
-            // только Flash/Pro с поддержкой vision (generateContent)
-            const name = m.name || ''
-            const id   = name.replace('models/', '')
+            const id = (m.name || '').replace('models/', '')
             if (!id.startsWith('gemini')) return false
             const methods = m.supportedGenerationMethods || []
             if (!methods.includes('generateContent')) return false
-            // исключаем embedding, aqa, deprecated
             if (id.includes('embedding') || id.includes('aqa')) return false
+            // Оставляем только модели с ненулевым бесплатным лимитом
+            const rpm = m.rateLimit?.requestsPerMinute ?? m.rpmFree ?? null
+            // Если API не вернул лимиты — оставляем (поле может отсутствовать)
+            // Если вернул явный 0 — убираем
+            if (rpm !== null && rpm === 0) return false
             return true
           })
           .map(m => {
             const id = m.name.replace('models/', '')
-            const label = (m.displayName || id)
-              .replace('models/', '')
-              .replace(/\bExp\b/gi, 'Exp')
+            const label = (m.displayName || id).replace('models/', '')
             return { id, provider: 'gemini', label }
           })
-          // сортируем: 2.5 > 2.0 > 1.5, flash перед pro
           .sort((a, b) => {
             const ver = s => {
-              const m = s.id.match(/gemini-(\d+)\.(\d+)/)
-              return m ? Number(m[1]) * 100 + Number(m[2]) : 0
+              const mm = s.id.match(/gemini-(\d+)\.(\d+)/)
+              return mm ? Number(mm[1]) * 100 + Number(mm[2]) : 0
             }
             if (ver(b) !== ver(a)) return ver(b) - ver(a)
-            const rank = s => s.id.includes('flash') ? 0 : 1
-            return rank(a) - rank(b)
+            return (a.id.includes('flash') ? 0 : 1) - (b.id.includes('flash') ? 0 : 1)
           })
         if (list.length) callback(null, list)
         else callback('empty list', [])
@@ -246,7 +244,15 @@ ipcMain.handle('save-dir-dialog', async () => {
 ipcMain.handle('get-gemini-models', () => geminiModels)
 ipcMain.handle('get-openrouter-models', () => openrouterModels)
 
-// ── Planner: analyse floor plan via Vision API ─────────────
+// ── Planner: ИИ распознаёт помещения, приложение строит полигоны ──
+//
+// Схема:
+//   1. Пользователь загружает план
+//   2. Приложение отправляет план в Vision API
+//   3. ИИ возвращает JSON с полигонами помещений
+//   4. Приложение рендерит: оригинал в ч/б + зелёные (#c9ffd4) полигоны поверх
+//   5. Клик по помещению — только оно остаётся цветным
+
 ipcMain.handle('planner-analyse', async (e, { b64, mime, provider, modelId, imgW, imgH }) => {
   const cfg = loadConfig()
   const apiKey = provider === 'openrouter'
@@ -255,29 +261,29 @@ ipcMain.handle('planner-analyse', async (e, { b64, mime, provider, modelId, imgW
 
   if (!apiKey) return { error: `Нет API-ключа для ${provider}` }
 
-  const model = { id: modelId, provider }
   log(`Planner analyse: ${provider} / ${modelId} | img ${imgW}x${imgH}`)
 
-  const PROMPT = `Это план этажа здания или квартиры.
+  const PROMPT = `Ты — точный анализатор архитектурных планов этажей.
 
-Твоя задача — найти ВСЕ отдельные помещения (офисы, комнаты, коридоры, санузлы, лестницы и т.д.) и вернуть их контуры.
+На изображении: план этажа здания (офисы, квартиры). Размер изображения: ${imgW}×${imgH} пикселей.
 
-Правила:
-1. Каждое помещение — отдельный полигон из 4–20 точек [x, y] в пикселях оригинала (${imgW}x${imgH}).
-2. Обходи контур по часовой стрелке, по внутренней границе стен.
-3. Название: используй номер помещения с плана (например «261Н», «255Н») или площадь («56,5 м²»), если нет номера — «Комната N».
-4. Разные помещения не должны перекрываться.
-5. Игнорируй: надписи, размерные линии, сетки, мебель, внешние контуры за пределами здания, мини-схемы генплана.
+ЗАДАЧА: найди все отдельные помещения внутри основного контура здания и верни их полигоны.
 
-Верни СТРОГО JSON без markdown, без пояснений:
-{"rooms":[{"id":"r1","label":"261Н","polygon":[[x1,y1],[x2,y2],[x3,y3],[x4,y4]]},...]}`
+ПРАВИЛА:
+1. Каждое помещение = отдельный полигон из 4–12 точек [x, y] в пикселях.
+2. Координаты — внутренняя граница стен (не центр стены).
+3. label = номер помещения с плана (пример: «261Н», «255Н»). Нет номера — «Коридор», «Лестница» и т.д.
+4. Полигоны не должны перекрываться.
+5. СТРОГО ИГНОРИРУЙ: мини-схему генплана (маленькая карта в углу с компасом и номерами корпусов), надписи этажа, оси, размерные линии, мебель, всё вне контура здания.
+
+Верни СТРОГО только JSON без markdown и пояснений:
+{"rooms":[{"id":"r1","label":"261Н","polygon":[[x1,y1],[x2,y2],[x3,y3],[x4,y4]]}]}`
 
   return new Promise((resolve) => {
     const done = (err, rooms) => {
       if (err) { log(`Planner error: ${err}`); resolve({ error: err, rooms: [] }) }
-      else resolve({ rooms })
+      else resolve({ rooms: rooms || [] })
     }
-
     if (provider === 'openrouter') {
       plannerCallOpenRouter(apiKey, modelId, b64, mime, PROMPT, done)
     } else {
@@ -292,16 +298,14 @@ function plannerCallGemini(apiKey, modelId, b64, mime, prompt, done) {
       { text: prompt },
       { inline_data: { mime_type: mime, data: b64 } }
     ]}],
-    generationConfig: { temperature: 0, maxOutputTokens: 8192 }
+    generationConfig: { temperature: 0, maxOutputTokens: 16384 }
   })
-
   const options = {
     hostname: 'generativelanguage.googleapis.com',
     path: `/v1beta/models/${modelId}:generateContent?key=${apiKey}`,
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
   }
-
   const req = https.request(options, (res) => {
     let raw = ''
     res.on('data', c => raw += c)
@@ -310,12 +314,12 @@ function plannerCallGemini(apiKey, modelId, b64, mime, prompt, done) {
         const json = JSON.parse(raw)
         if (json.error) { done(json.error.message); return }
         const text = json.candidates?.[0]?.content?.parts?.[0]?.text || ''
-        log(`Planner Gemini raw (${text.length} chars): ${text.slice(0, 200)}`)
+        log(`Planner Gemini raw (${text.length} chars): ${text.slice(0, 300)}`)
         done(null, parseRoomsFromText(text))
       } catch(e) { done(`Парсинг: ${e.message} | ${raw.slice(0, 100)}`) }
     })
   })
-  req.setTimeout(90000, () => { req.destroy(); done('Таймаут 90с') })
+  req.setTimeout(120000, () => { req.destroy(); done('Таймаут 120с') })
   req.on('error', e => done(e.message))
   req.write(body); req.end()
 }
@@ -324,12 +328,12 @@ function plannerCallOpenRouter(apiKey, modelId, b64, mime, prompt, done) {
   const body = JSON.stringify({
     model: modelId,
     temperature: 0,
+    max_tokens: 16384,
     messages: [{ role: 'user', content: [
       { type: 'text', text: prompt },
       { type: 'image_url', image_url: { url: `data:${mime};base64,${b64}` } }
     ]}]
   })
-
   const options = {
     hostname: 'openrouter.ai',
     path: '/api/v1/chat/completions',
@@ -342,7 +346,6 @@ function plannerCallOpenRouter(apiKey, modelId, b64, mime, prompt, done) {
       'Content-Length': Buffer.byteLength(body)
     }
   }
-
   const req = https.request(options, (res) => {
     let raw = ''
     res.on('data', c => raw += c)
@@ -351,12 +354,12 @@ function plannerCallOpenRouter(apiKey, modelId, b64, mime, prompt, done) {
         const json = JSON.parse(raw)
         if (json.error) { done(json.error.message); return }
         const text = json.choices?.[0]?.message?.content || ''
-        log(`Planner OR raw (${text.length} chars): ${text.slice(0, 200)}`)
+        log(`Planner OR raw (${text.length} chars): ${text.slice(0, 300)}`)
         done(null, parseRoomsFromText(text))
       } catch(e) { done(`Парсинг: ${e.message} | ${raw.slice(0, 100)}`) }
     })
   })
-  req.setTimeout(90000, () => { req.destroy(); done('Таймаут 90с') })
+  req.setTimeout(120000, () => { req.destroy(); done('Таймаут 120с') })
   req.on('error', e => done(e.message))
   req.write(body); req.end()
 }
@@ -364,19 +367,19 @@ function plannerCallOpenRouter(apiKey, modelId, b64, mime, prompt, done) {
 function parseRoomsFromText(text) {
   if (!text) return []
   try {
-    // Убираем markdown-обёртку
     const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim()
-    // Ищем JSON-объект
     const match = clean.match(/\{[\s\S]*\}/)
     if (!match) { log('parseRooms: no JSON found'); return [] }
     const json = JSON.parse(match[0])
-    const raw  = json.rooms || []
+    const raw = json.rooms || []
     const result = raw
       .filter(r => Array.isArray(r.polygon) && r.polygon.length >= 3)
       .map((r, i) => ({
         id:      r.id || `r${i + 1}`,
-        label:   r.label || `Комната ${i + 1}`,
-        polygon: r.polygon.map(pt => Array.isArray(pt) ? [Number(pt[0]), Number(pt[1])] : [Number(pt.x), Number(pt.y)]),
+        label:   r.label || `Помещение ${i + 1}`,
+        polygon: r.polygon.map(pt =>
+          Array.isArray(pt) ? [Number(pt[0]), Number(pt[1])] : [Number(pt.x), Number(pt.y)]
+        ),
       }))
     log(`parseRooms: found ${result.length} rooms`)
     return result
