@@ -25,26 +25,93 @@ const PROVIDERS = {
   gemini:     { label: 'Gemini',     key: 'gemini_api_key' },
   openrouter: { label: 'OpenRouter', key: 'openrouter_api_key' },
 }
-const GEMINI_MODELS = [
-  { id: 'gemini-2.5-flash-preview-05-20', provider: 'gemini', label: 'Gemini 2.5 Flash' },
-  { id: 'gemini-2.0-flash',               provider: 'gemini', label: 'Gemini 2.0 Flash' },
-  { id: 'gemini-2.0-flash-lite',          provider: 'gemini', label: 'Gemini 2.0 Flash Lite' },
-  { id: 'gemini-1.5-flash',               provider: 'gemini', label: 'Gemini 1.5 Flash' },
+const GEMINI_MODELS_FALLBACK = [
+  { id: 'gemini-2.0-flash',      provider: 'gemini', label: 'Gemini 2.0 Flash' },
+  { id: 'gemini-2.0-flash-lite', provider: 'gemini', label: 'Gemini 2.0 Flash Lite' },
+  { id: 'gemini-1.5-flash',      provider: 'gemini', label: 'Gemini 1.5 Flash' },
 ]
+let geminiModels     = [...GEMINI_MODELS_FALLBACK]
+let geminiLoaded     = false
 let openrouterModels = []
 let openrouterLoaded = false
 
+// ── Gemini models (dynamic) ────────────────────────────────
+function fetchGeminiModels(apiKey, callback) {
+  const options = {
+    hostname: 'generativelanguage.googleapis.com',
+    path: `/v1beta/models?key=${apiKey}&pageSize=100`,
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json' }
+  }
+  const req = https.request(options, (res) => {
+    let raw = ''
+    res.on('data', c => raw += c)
+    res.on('end', () => {
+      try {
+        const list = (JSON.parse(raw).models || [])
+          .filter(m => {
+            // только Flash/Pro с поддержкой vision (generateContent)
+            const name = m.name || ''
+            const id   = name.replace('models/', '')
+            if (!id.startsWith('gemini')) return false
+            const methods = m.supportedGenerationMethods || []
+            if (!methods.includes('generateContent')) return false
+            // исключаем embedding, aqa, deprecated
+            if (id.includes('embedding') || id.includes('aqa')) return false
+            return true
+          })
+          .map(m => {
+            const id = m.name.replace('models/', '')
+            const label = (m.displayName || id)
+              .replace('models/', '')
+              .replace(/\bExp\b/gi, 'Exp')
+            return { id, provider: 'gemini', label }
+          })
+          // сортируем: 2.5 > 2.0 > 1.5, flash перед pro
+          .sort((a, b) => {
+            const ver = s => {
+              const m = s.id.match(/gemini-(\d+)\.(\d+)/)
+              return m ? Number(m[1]) * 100 + Number(m[2]) : 0
+            }
+            if (ver(b) !== ver(a)) return ver(b) - ver(a)
+            const rank = s => s.id.includes('flash') ? 0 : 1
+            return rank(a) - rank(b)
+          })
+        if (list.length) callback(null, list)
+        else callback('empty list', [])
+      } catch(e) { callback(e.message, []) }
+    })
+  })
+  req.setTimeout(10000, () => { req.destroy(); callback('timeout', []) })
+  req.on('error', e => callback(e.message, []))
+  req.end()
+}
+
+function loadGeminiModels(apiKey, done) {
+  fetchGeminiModels(apiKey, (err, models) => {
+    if (!err && models.length) {
+      geminiModels = models
+      geminiLoaded = true
+      log(`Gemini models loaded: ${models.map(m => m.id).join(', ')}`)
+    } else {
+      log(`Gemini models fetch error: ${err} — using fallback`)
+    }
+    buildMenu()
+    if (done) done()
+  })
+}
+
 function modelsForProvider(p) {
-  if (p === 'gemini')     return GEMINI_MODELS
+  if (p === 'gemini')     return geminiModels
   if (p === 'openrouter') return openrouterModels
   return []
 }
-function getAllModelsFlat() { return [...GEMINI_MODELS, ...openrouterModels] }
+function getAllModelsFlat() { return [...geminiModels, ...openrouterModels] }
 
 let selectedProvider = 'gemini'
-let selectedModelId  = GEMINI_MODELS[0].id
+let selectedModelId  = geminiModels[0].id
 let activeProvider   = 'gemini'
-let activeModelId    = GEMINI_MODELS[0].id
+let activeModelId    = geminiModels[0].id
 
 function getActiveModel() {
   return modelsForProvider(activeProvider).find(m => m.id === activeModelId)
@@ -176,7 +243,7 @@ ipcMain.handle('save-dir-dialog', async () => {
   return result.filePaths?.[0] || null
 })
 
-ipcMain.handle('get-gemini-models', () => GEMINI_MODELS)
+ipcMain.handle('get-gemini-models', () => geminiModels)
 ipcMain.handle('get-openrouter-models', () => openrouterModels)
 
 // ── Planner: analyse floor plan via Vision API ─────────────
@@ -342,6 +409,9 @@ app.whenReady().then(() => {
 
     if (!cfg.gemini_api_key && !cfg.api_key) setTimeout(() => promptApiKey('gemini'), 300)
 
+    const geminiKey = cfg.gemini_api_key || cfg.api_key
+    if (geminiKey) loadGeminiModels(geminiKey)
+
     if (cfg.openrouter_api_key) {
       loadOpenRouterModels(cfg.openrouter_api_key, () => {
         if (cfg.selected_model_id) {
@@ -352,7 +422,7 @@ app.whenReady().then(() => {
       })
     } else {
       if (cfg.selected_model_id) {
-        const found = GEMINI_MODELS.find(m => m.id===cfg.selected_model_id)
+        const found = geminiModels.find(m => m.id===cfg.selected_model_id)
         if (found) { selectedModelId = found.id; activeModelId = found.id }
       }
       buildMenu()
@@ -385,7 +455,7 @@ function buildMenu() {
 
   let modelItems = []
   if (selectedProvider === 'gemini') {
-    modelItems = GEMINI_MODELS.map(m => ({
+    modelItems = geminiModels.map(m => ({
       label: m.label, type:'radio', checked: m.id===selectedModelId, click:()=>setModel(m.id)
     }))
   } else {
@@ -587,7 +657,7 @@ function promptApiKey(provider){
     log(`${title} сохранён`)
     dialog.showMessageBoxSync({title:'numsum',message:`${title} сохранён ✓`})
     if(isOR){ openrouterLoaded=false; buildMenu(); loadOpenRouterModels(key) }
-    else buildMenu()
+    else { geminiLoaded=false; buildMenu(); loadGeminiModels(key) }
     if(mainWindow) mainWindow.webContents.send('model-changed', getActiveModel())
   })
 }
