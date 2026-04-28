@@ -77,19 +77,10 @@
     text-transform: uppercase; letter-spacing: .5px;
   }
 
-  /* provider/model selector */
-  .selector-group { display: flex; flex-direction: column; gap: 5px; }
-  .selector-row { display: flex; gap: 5px; align-items: center; }
-  .selector-label { font-size: 11px; color: #666; width: 48px; flex-shrink: 0; }
-  select {
-    flex: 1; font-size: 12px; padding: 5px 7px; border-radius: 7px;
-    border: 1px solid #d0d0d5; background: #f5f5f7; color: #1d1d1f;
-    -webkit-appearance: none; cursor: pointer; outline: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E");
-    background-repeat: no-repeat; background-position: right 7px center; padding-right: 22px;
-  }
-  select:focus { border-color: #007aff; }
-  select:disabled { opacity: .5; cursor: default; }
+  /* active model display */
+  .active-model-row { display: flex; flex-direction: column; gap: 2px; }
+  .active-model-label { font-size: 12px; font-weight: 600; color: #1d1d1f; }
+  .active-model-hint  { font-size: 10px; color: #aaa; }
 
   /* analyse btn */
   .btn {
@@ -216,20 +207,11 @@
 
         <hr>
 
-        <!-- Provider & model -->
-        <div class="section-label">Модель для анализа</div>
-        <div class="selector-group">
-          <div class="selector-row">
-            <span class="selector-label">Провайдер</span>
-            <select id="providerSelect" onchange="onProviderChange()">
-              <option value="gemini">Gemini</option>
-              <option value="openrouter">OpenRouter</option>
-            </select>
-          </div>
-          <div class="selector-row">
-            <span class="selector-label">Модель</span>
-            <select id="modelSelect" onchange="onModelChange()"></select>
-          </div>
+        <!-- Active model (from tray) -->
+        <div class="section-label">Модель</div>
+        <div class="active-model-row">
+          <span id="activeModelLabel" class="active-model-label">…</span>
+          <span class="active-model-hint">Меняется в меню Σ</span>
         </div>
 
         <button class="btn btn-primary" id="analyseBtn" disabled onclick="analysePlan()">
