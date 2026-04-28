@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>numsum</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif;
+    background: #f5f5f7;
+    color: #1d1d1f;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    -webkit-app-region: no-drag;
+    user-select: none;
+  }
+
+  /* ── Title bar ── */
+  .titlebar {
+    height: 38px;
+    background: #ffffff;
+    border-bottom: 1px solid #e0e0e5;
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    -webkit-app-region: drag;
+    flex-shrink: 0;
+  }
+  .titlebar-spacer { width: 70px; }
+  .tabs {
+    display: flex;
+    gap: 4px;
+    -webkit-app-region: no-drag;
+    margin: 0 auto;
+  }
+  .tab {
+    padding: 4px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    color: #666;
+    border: none;
+    background: transparent;
+    transition: all .15s;
+  }
+  .tab:hover { background: #f0f0f5; color: #333; }
+  .tab.active { background: #e8e8ed; color: #1d1d1f; }
+
+  /* ── Pages ── */
+  .page { display: none; flex: 1; overflow: hidden; flex-direction: column; }
+  .page.active { display: flex; }
+
+  /* ══════════════════════════════════
+     TAB 1 — Σ Сумма (оставляем заглушку, управление через трей)
+  ══════════════════════════════════ */
+  .sum-placeholder {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    color: #888;
+  }
+  .sum-placeholder .icon { font-size: 48px; line-height: 1; }
+  .sum-placeholder p { font-size: 14px; text-align: center; max-width: 260px; line-height: 1.5; }
+  .sum-placeholder .hint {
+    background: #e8e8ed;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 12px;
+    color: #555;
+  }
+
+  /* ══════════════════════════════════
+     TAB 2 — ⌂ Планировщик
+  ══════════════════════════════════ */
+  .planner-layout {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+  }
+
+  /* Left: dropzone + controls */
+  .left-panel {
+    width: 260px;
+    flex-shrink: 0;
+    background: #fff;
+    border-right: 1px solid #e0e0e5;
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+    gap: 12px;
+    overflow-y: auto;
+  }
+
+  .dropzone {
+    border: 2px dashed #c7c7cc;
+    border-radius: 12px;
+    padding: 24px 12px;
+    text-align: center;
+    cursor: pointer;
+    transition: all .2s;
+    background: #fafafa;
+    flex-shrink: 0;
+  }
+  .dropzone:hover, .dropzone.drag-over {
+    border-color: #007aff;
+    background: #f0f5ff;
+  }
+  .dropzone .dz-icon { font-size: 32px; margin-bottom: 8px; }
+  .dropzone p { font-size: 12px; color: #888; line-height: 1.5; }
+  .dropzone strong { color: #333; font-size: 13px; }
+
+  .preview-thumb {
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid #e0e0e5;
+    flex-shrink: 0;
+    display: none;
+    position: relative;
+  }
+  .preview-thumb img { width: 100%; display: block; }
+  .preview-thumb .remove-btn {
+    position: absolute;
+    top: 6px; right: 6px;
+    width: 22px; height: 22px;
+    background: rgba(0,0,0,.5);
+    color: #fff;
+    border: none;
+    border-radius: 50%;
+    font-size: 12px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  .section-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: .5px;
+    flex-shrink: 0;
+  }
+
+  .model-info {
+    background: #f5f5f7;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: #555;
+    flex-shrink: 0;
+  }
+  .model-info span { color: #007aff; font-weight: 500; }
+
+  .btn {
+    padding: 9px 0;
+    border-radius: 9px;
+    font-size: 13px;
+    font-weight: 600;
+    border: none;
+    cursor: pointer;
+    width: 100%;
+    transition: all .15s;
+    flex-shrink: 0;
+  }
+  .btn-primary { background: #007aff; color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: #0066d9; }
+  .btn-primary:disabled { background: #b0c8ef; cursor: default; }
+  .btn-secondary { background: #e8e8ed; color: #333; }
+  .btn-secondary:hover:not(:disabled) { background: #d8d8dd; }
+  .btn-secondary:disabled { opacity: .5; cursor: default; }
+
+  /* Room list */
+  .rooms-list { display: flex; flex-direction: column; gap: 6px; flex: 1; overflow-y: auto; }
+  .room-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 9px;
+    border-radius: 8px;
+    cursor: pointer;
+    border: 1.5px solid transparent;
+    transition: all .15s;
+    font-size: 12px;
+    background: #f5f5f7;
+  }
+  .room-item:hover { background: #eeeef3; }
+  .room-item.selected { border-color: #007aff; background: #f0f5ff; }
+  .room-color {
+    width: 12px; height: 12px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    border: 1px solid rgba(0,0,0,.1);
+  }
+  .room-label { flex: 1; font-weight: 500; color: #1d1d1f; }
+  .room-save {
+    width: 22px; height: 22px;
+    background: #e8e8ed;
+    border: none; border-radius: 5px;
+    font-size: 11px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    transition: background .15s;
+  }
+  .room-save:hover { background: #007aff; color: #fff; }
+
+  .rooms-empty {
+    color: #aaa;
+    font-size: 12px;
+    text-align: center;
+    padding: 16px 0;
+  }
+
+  /* Right: canvas area */
+  .right-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: #e8e8ed;
+    position: relative;
+  }
+
+  .canvas-toolbar {
+    height: 38px;
+    background: #fff;
+    border-bottom: 1px solid #e0e0e5;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .canvas-toolbar .view-label {
+    font-size: 12px;
+    color: #888;
+    flex: 1;
+  }
+  .view-btn {
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    border: none;
+    cursor: pointer;
+    background: #e8e8ed;
+    color: #444;
+    transition: all .15s;
+  }
+  .view-btn.active { background: #007aff; color: #fff; }
+  .view-btn:hover:not(.active) { background: #d8d8dd; }
+
+  .canvas-wrap {
+    flex: 1;
+    overflow: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+
+  #planCanvas {
+    border-radius: 10px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.18);
+    max-width: 100%;
+    max-height: 100%;
+    display: none;
+    cursor: crosshair;
+  }
+
+  .canvas-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    color: #aaa;
+  }
+  .canvas-placeholder .big-icon { font-size: 64px; }
+  .canvas-placeholder p { font-size: 14px; }
+
+  /* Progress overlay */
+  .progress-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(245,245,247,.92);
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    z-index: 10;
+  }
+  .progress-overlay.visible { display: flex; }
+  .progress-spinner {
+    width: 36px; height: 36px;
+    border: 3px solid #e0e0e5;
+    border-top-color: #007aff;
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .progress-text { font-size: 14px; color: #555; font-weight: 500; }
+  .progress-step  { font-size: 12px; color: #999; }
+
+  /* Save all button */
+  .save-all-bar {
+    padding: 10px 16px;
+    background: #fff;
+    border-top: 1px solid #e0e0e5;
+    display: none;
+    gap: 8px;
+    align-items: center;
+    flex-shrink: 0;
+  }
+  .save-all-bar.visible { display: flex; }
+  .save-all-bar .stats { flex: 1; font-size: 12px; color: #666; }
+  .save-all-bar .stats strong { color: #1d1d1f; }
+</style>
+</head>
+<body>
+
+<!-- Title bar with tabs -->
+<div class="titlebar">
+  <div class="titlebar-spacer"></div>
+  <div class="tabs">
+    <button class="tab" id="tab-sum" onclick="switchTab('sum')">Σ Сумма</button>
+    <button class="tab active" id="tab-plan" onclick="switchTab('plan')">⌂ Планировщик</button>
+  </div>
+  <div class="titlebar-spacer"></div>
+</div>
+
+<!-- Tab 1: Sum -->
+<div class="page" id="page-sum">
+  <div class="sum-placeholder">
+    <div class="icon">Σ</div>
+    <p>Используй иконку в строке меню для выделения области и подсчёта суммы</p>
+    <div class="hint">Нажми на Σ в меню → «Выделить область»</div>
+  </div>
+</div>
+
+<!-- Tab 2: Planner -->
+<div class="page active" id="page-plan">
+  <div class="planner-layout">
+
+    <!-- Left panel -->
+    <div class="left-panel">
+      <!-- Dropzone -->
+      <div class="dropzone" id="dropzone"
+           onclick="document.getElementById('fileInput').click()"
+           ondragover="onDragOver(event)"
+           ondragleave="onDragLeave(event)"
+           ondrop="onDrop(event)">
+        <div class="dz-icon">🏠</div>
+        <strong>Перетяни план</strong>
+        <p>или нажми чтобы выбрать файл<br>PNG, JPG, PDF</p>
+      </div>
+      <input type="file" id="fileInput" accept="image/*,.pdf" style="display:none" onchange="onFileSelected(event)">
+
+      <!-- Thumb -->
+      <div class="preview-thumb" id="previewThumb">
+        <img id="previewImg" src="" alt="">
+        <button class="remove-btn" onclick="clearPlan()">✕</button>
+      </div>
+
+      <!-- Model info -->
+      <div class="model-info" id="modelInfo">
+        Модель: <span id="modelName">загрузка…</span>
+      </div>
+
+      <!-- Analyse button -->
+      <button class="btn btn-primary" id="analyseBtn" disabled onclick="analysePlan()">
+        Распознать помещения
+      </button>
+
+      <div class="section-title" id="roomsTitle" style="display:none">Помещения</div>
+
+      <!-- Rooms list -->
+      <div class="rooms-list" id="roomsList">
+        <div class="rooms-empty" id="roomsEmpty">Загрузи план и нажми «Распознать»</div>
+      </div>
+    </div>
+
+    <!-- Right panel: canvas -->
+    <div class="right-panel">
+      <div class="canvas-toolbar">
+        <span class="view-label" id="viewLabel">Загрузи план слева</span>
+        <button class="view-btn active" id="viewAll" onclick="setView('all')" style="display:none">Все</button>
+        <button class="view-btn" id="viewSelected" onclick="setView('selected')" style="display:none">Выбранное</button>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="planCanvas"></canvas>
+        <div class="canvas-placeholder" id="canvasPlaceholder">
+          <div class="big-icon">🏗️</div>
+          <p>Здесь появится план</p>
+        </div>
+      </div>
+
+      <!-- Progress -->
+      <div class="progress-overlay" id="progressOverlay">
+        <div class="progress-spinner"></div>
+        <div class="progress-text" id="progressText">Отправляем план…</div>
+        <div class="progress-step" id="progressStep"></div>
+      </div>
+
+      <!-- Save bar -->
+      <div class="save-all-bar" id="saveAllBar">
+        <div class="stats">Найдено помещений: <strong id="roomCount">0</strong></div>
+        <button class="btn btn-secondary" style="width:auto;padding:6px 14px" onclick="saveSelected()">💾 Сохранить выбранное</button>
+        <button class="btn btn-primary" style="width:auto;padding:6px 14px" onclick="saveAll()">💾 Сохранить все</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script src="planner.js"></script>
+</body>
+</html>
