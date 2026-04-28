@@ -244,50 +244,47 @@ ipcMain.handle('save-dir-dialog', async () => {
 ipcMain.handle('get-gemini-models', () => geminiModels)
 ipcMain.handle('get-openrouter-models', () => openrouterModels)
 
-// ── Planner: ИИ распознаёт помещения, приложение строит полигоны ──
-//
-// Схема:
-//   1. Пользователь загружает план
-//   2. Приложение отправляет план в Vision API
-//   3. ИИ возвращает JSON с полигонами помещений
-//   4. Приложение рендерит: оригинал в ч/б + зелёные (#c9ffd4) полигоны поверх
-//   5. Клик по помещению — только оно остаётся цветным
+// ── Planner: analyse floor plan ──────────────────────────────
+// Используем ту же активную модель что и для суммы (getActiveModel + callGemini/callOpenRouter)
 
-ipcMain.handle('planner-analyse', async (e, { b64, mime, provider, modelId, imgW, imgH }) => {
-  const cfg = loadConfig()
-  const apiKey = provider === 'openrouter'
-    ? cfg.openrouter_api_key
-    : (cfg.gemini_api_key || cfg.api_key)
+const PLANNER_PROMPT = (imgW, imgH) => `Ты — точный анализатор архитектурных планов этажей.
 
-  if (!apiKey) return { error: `Нет API-ключа для ${provider}` }
+На изображении: план этажа здания. Размер: ${imgW}×${imgH} пикселей.
 
-  log(`Planner analyse: ${provider} / ${modelId} | img ${imgW}x${imgH}`)
+ЗАДАЧА: найди все отдельные ОФИСЫ/КВАРТИРЫ/КАБИНЕТЫ внутри основного контура здания.
+НЕ включай: коридоры, холлы, МОПы (места общего пользования), лестничные клетки, лифтовые холлы, санузлы общего пользования, технические помещения.
 
-  const PROMPT = `Ты — точный анализатор архитектурных планов этажей.
+Для каждого помещения верни полигон из 4–16 точек [x, y] в пикселях, обходя внутреннюю границу стен.
+label = номер помещения с плана (пример: «261Н», «255Н»). Если номера нет — пропусти помещение.
 
-На изображении: план этажа здания (офисы, квартиры). Размер изображения: ${imgW}×${imgH} пикселей.
-
-ЗАДАЧА: найди все отдельные помещения внутри основного контура здания и верни их полигоны.
-
-ПРАВИЛА:
-1. Каждое помещение = отдельный полигон из 4–12 точек [x, y] в пикселях.
-2. Координаты — внутренняя граница стен (не центр стены).
-3. label = номер помещения с плана (пример: «261Н», «255Н»). Нет номера — «Коридор», «Лестница» и т.д.
-4. Полигоны не должны перекрываться.
-5. СТРОГО ИГНОРИРУЙ: мини-схему генплана (маленькая карта в углу с компасом и номерами корпусов), надписи этажа, оси, размерные линии, мебель, всё вне контура здания.
+СТРОГО ИГНОРИРУЙ: мини-схему генплана (маленькая карта в углу с компасом и номерами корпусов), надписи этажа, оси, размерные линии, мебель, всё вне контура здания.
 
 Верни СТРОГО только JSON без markdown и пояснений:
 {"rooms":[{"id":"r1","label":"261Н","polygon":[[x1,y1],[x2,y2],[x3,y3],[x4,y4]]}]}`
+
+ipcMain.handle('planner-analyse', async (e, { b64, mime, imgW, imgH }) => {
+  const cfg = loadConfig()
+  const model = getActiveModel()
+  if (!model) return { error: 'Нет доступной модели. Выбери модель в меню.' }
+
+  const apiKey = activeProvider === 'openrouter'
+    ? cfg.openrouter_api_key
+    : (cfg.gemini_api_key || cfg.api_key)
+  if (!apiKey) return { error: `Нет API-ключа для ${PROVIDERS[activeProvider]?.label}` }
+
+  log(`Planner analyse: ${activeProvider} / ${model.id} | img ${imgW}x${imgH}`)
+  const prompt = PLANNER_PROMPT(imgW, imgH)
 
   return new Promise((resolve) => {
     const done = (err, rooms) => {
       if (err) { log(`Planner error: ${err}`); resolve({ error: err, rooms: [] }) }
       else resolve({ rooms: rooms || [] })
     }
-    if (provider === 'openrouter') {
-      plannerCallOpenRouter(apiKey, modelId, b64, mime, PROMPT, done)
+
+    if (activeProvider === 'openrouter') {
+      plannerCallOpenRouter(apiKey, model.id, b64, mime, prompt, done)
     } else {
-      plannerCallGemini(apiKey, modelId, b64, mime, PROMPT, done)
+      plannerCallGemini(apiKey, model.id, b64, mime, prompt, done)
     }
   })
 })
