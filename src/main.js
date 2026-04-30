@@ -5,6 +5,13 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 
+// Tesseract loaded lazily — heavy first init (downloads language data)
+let _tesseract = null
+function getTesseract() {
+  if (!_tesseract) _tesseract = require('tesseract.js')
+  return _tesseract
+}
+
 const CONFIG_PATH = path.join(os.homedir(), '.numsum_config.json')
 const LOG_PATH    = path.join(os.homedir(), '.numsum_log.txt')
 
@@ -22,9 +29,17 @@ function saveConfig(cfg) {
 
 // ── Providers & Models ────────────────────────────────────
 const PROVIDERS = {
-  gemini:     { label: 'Gemini',     key: 'gemini_api_key' },
-  openrouter: { label: 'OpenRouter', key: 'openrouter_api_key' },
+  gemini:     { label: 'Gemini',     key: 'gemini_api_key',     needsKey: true  },
+  openrouter: { label: 'OpenRouter', key: 'openrouter_api_key', needsKey: true  },
+  local:      { label: 'Локально (OCR)', key: null,             needsKey: false },
 }
+
+// Local OCR pseudo-models — represent recognition mode + language combo.
+const LOCAL_MODELS = [
+  { id: 'tesseract-rus-eng', provider: 'local', label: 'Tesseract · Рус + Eng' },
+  { id: 'tesseract-eng',     provider: 'local', label: 'Tesseract · Eng' },
+  { id: 'tesseract-digits',  provider: 'local', label: 'Tesseract · только цифры' },
+]
 const GEMINI_MODELS_FALLBACK = [
   { id: 'gemini-2.0-flash',      provider: 'gemini', label: 'Gemini 2.0 Flash' },
   { id: 'gemini-2.0-flash-lite', provider: 'gemini', label: 'Gemini 2.0 Flash Lite' },
@@ -102,9 +117,10 @@ function loadGeminiModels(apiKey, done) {
 function modelsForProvider(p) {
   if (p === 'gemini')     return geminiModels
   if (p === 'openrouter') return openrouterModels
+  if (p === 'local')      return LOCAL_MODELS
   return []
 }
-function getAllModelsFlat() { return [...geminiModels, ...openrouterModels] }
+function getAllModelsFlat() { return [...geminiModels, ...openrouterModels, ...LOCAL_MODELS] }
 
 let selectedProvider = 'gemini'
 let selectedModelId  = geminiModels[0].id
@@ -131,8 +147,9 @@ function resetToSelected() { activeProvider = selectedProvider; activeModelId = 
 
 function setProvider(provider) {
   const cfg = loadConfig()
-  if (!cfg[PROVIDERS[provider].key]) {
-    dialog.showMessageBoxSync({ type: 'info', title: 'numsum', message: `Добавь API-ключ для ${PROVIDERS[provider].label}` })
+  const p = PROVIDERS[provider]
+  if (p.needsKey && !cfg[p.key]) {
+    dialog.showMessageBoxSync({ type: 'info', title: 'numsum', message: `Добавь API-ключ для ${p.label}` })
     return
   }
   selectedProvider = provider; activeProvider = provider
@@ -432,6 +449,13 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {}) // keep tray alive
 
+app.on('before-quit', async () => {
+  if (_ocrWorker) {
+    try { await _ocrWorker.terminate() } catch {}
+    _ocrWorker = null
+  }
+})
+
 // ── Tray menu ──────────────────────────────────────────────
 function buildMenu() {
   const cfg = loadConfig()
@@ -451,11 +475,17 @@ function buildMenu() {
       checked: selectedProvider==='gemini', enabled: hasGemini, click:()=>setProvider('gemini') },
     { label: hasOR ? 'OpenRouter Free' : 'OpenRouter Free (нет ключа)', type:'radio',
       checked: selectedProvider==='openrouter', enabled: hasOR, click:()=>setProvider('openrouter') },
+    { label: 'Локально (OCR, без интернета)', type:'radio',
+      checked: selectedProvider==='local', click:()=>setProvider('local') },
   ]
 
   let modelItems = []
   if (selectedProvider === 'gemini') {
     modelItems = geminiModels.map(m => ({
+      label: m.label, type:'radio', checked: m.id===selectedModelId, click:()=>setModel(m.id)
+    }))
+  } else if (selectedProvider === 'local') {
+    modelItems = LOCAL_MODELS.map(m => ({
       label: m.label, type:'radio', checked: m.id===selectedModelId, click:()=>setModel(m.id)
     }))
   } else {
@@ -503,10 +533,12 @@ function capture() {
   const model = getActiveModel()
   if (!model) { dialog.showMessageBoxSync({type:'warning',title:'numsum',message:'Нет активной модели'}); return }
 
-  const apiKey = activeProvider==='openrouter' ? cfg.openrouter_api_key : (cfg.gemini_api_key||cfg.api_key)
-  if (!apiKey) {
-    dialog.showMessageBoxSync({type:'warning',title:'numsum',
-      message:`Сначала укажи ${PROVIDERS[activeProvider]?.label} API-ключ`}); return
+  if (PROVIDERS[activeProvider]?.needsKey) {
+    const apiKey = activeProvider==='openrouter' ? cfg.openrouter_api_key : (cfg.gemini_api_key||cfg.api_key)
+    if (!apiKey) {
+      dialog.showMessageBoxSync({type:'warning',title:'numsum',
+        message:`Сначала укажи ${PROVIDERS[activeProvider]?.label} API-ключ`}); return
+    }
   }
 
   capturing = true
@@ -517,7 +549,7 @@ function capture() {
       try { fs.unlinkSync(tmpPath) } catch {}
       capturing = false; return
     }
-    tray.setTitle('…')
+    tray.setTitle(activeProvider === 'local' ? '…OCR' : '…')
     callModel(tmpPath, (error, data) => {
       try { fs.unlinkSync(tmpPath) } catch {}
       tray.setTitle('Σ')
@@ -549,12 +581,86 @@ function callModel(imagePath, callback) {
   const cfg = loadConfig()
   const model = getActiveModel()
   if (!model) { callback('Нет доступных моделей'); return }
+
+  if (activeProvider === 'local') {
+    callLocalOCR(imagePath, model.id, callback); return
+  }
+
   const apiKey = activeProvider==='openrouter' ? cfg.openrouter_api_key : (cfg.gemini_api_key||cfg.api_key)
   if (!apiKey) {
     if (tryNextModel()) { buildMenu(); return callModel(imagePath, callback) }
     callback('Нет API-ключа'); return
   }
   activeProvider==='openrouter' ? callOpenRouter(apiKey,imagePath,callback) : callGemini(apiKey,imagePath,callback)
+}
+
+// ── Local OCR (Tesseract) ─────────────────────────────────
+// Worker is reused between captures for speed.
+let _ocrWorker = null
+let _ocrWorkerKey = null    // current "lang|digitsOnly" config
+let _ocrInitPromise = null
+
+async function getOCRWorker(modelId) {
+  const digitsOnly = modelId === 'tesseract-digits'
+  const lang = (modelId === 'tesseract-eng' || digitsOnly) ? 'eng' : 'rus+eng'
+  const key = `${lang}|${digitsOnly}`
+
+  if (_ocrWorker && _ocrWorkerKey === key) return _ocrWorker
+
+  if (_ocrWorker) {
+    try { await _ocrWorker.terminate() } catch {}
+    _ocrWorker = null
+  }
+
+  if (_ocrInitPromise) await _ocrInitPromise
+
+  const tess = getTesseract()
+  log(`Tesseract: init worker (${lang}, digitsOnly=${digitsOnly})`)
+
+  _ocrInitPromise = (async () => {
+    const w = await tess.createWorker(lang, 1, {
+      logger: m => { if (m.status && m.progress != null) log(`Tesseract: ${m.status} ${(m.progress*100|0)}%`) }
+    })
+    if (digitsOnly) {
+      await w.setParameters({ tessedit_char_whitelist: '0123456789.,- ' })
+    }
+    return w
+  })()
+
+  _ocrWorker = await _ocrInitPromise
+  _ocrWorkerKey = key
+  _ocrInitPromise = null
+  return _ocrWorker
+}
+
+function extractNumbers(rawText) {
+  if (!rawText) return []
+  // Normalize: collapse spaces between digits ("1 234,56" -> "1234,56")
+  const normalized = rawText.replace(/(\d)\s+(?=\d{3}(?:\D|$))/g, '$1')
+  const matches = normalized.match(/-?\d+(?:[.,]\d+)?/g) || []
+  return matches
+    .map(s => parseFloat(s.replace(',', '.')))
+    .filter(n => !isNaN(n) && isFinite(n))
+}
+
+function callLocalOCR(imagePath, modelId, callback) {
+  log(`Local OCR: ${modelId} on ${imagePath}`)
+  ;(async () => {
+    try {
+      const worker = await getOCRWorker(modelId)
+      const t0 = Date.now()
+      const { data } = await worker.recognize(imagePath)
+      const dt = Date.now() - t0
+      const text = data?.text || ''
+      log(`Local OCR done in ${dt}ms (${text.length} chars): ${text.slice(0, 200).replace(/\n/g, ' ')}`)
+      const numbers = extractNumbers(text)
+      const sum = numbers.reduce((a, b) => a + b, 0)
+      callback(null, { numbers, sum, note: `OCR ${dt}ms` })
+    } catch (e) {
+      log(`Local OCR error: ${e.message}`)
+      callback(`OCR: ${e.message}`)
+    }
+  })()
 }
 
 function isQuotaError(msg,code){

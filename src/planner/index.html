@@ -45,7 +45,7 @@
 
   /* left panel */
   .left-panel {
-    width: 240px; flex-shrink: 0; background: #fff;
+    width: 260px; flex-shrink: 0; background: #fff;
     border-right: 1px solid #e0e0e5;
     display: flex; flex-direction: column; overflow: hidden;
   }
@@ -77,6 +77,26 @@
     text-transform: uppercase; letter-spacing: .5px;
   }
 
+  /* mode segmented control */
+  .seg {
+    display: flex; background: #f0f0f5; border-radius: 8px; padding: 2px; gap: 2px;
+  }
+  .seg button {
+    flex: 1; padding: 6px 4px; border: none; background: transparent;
+    font-size: 12px; font-weight: 600; color: #666; cursor: pointer;
+    border-radius: 6px; transition: all .12s;
+  }
+  .seg button:hover:not(.active) { color: #333; }
+  .seg button.active { background: #fff; color: #1d1d1f; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+
+  /* sliders for local params */
+  .params { display: none; flex-direction: column; gap: 10px; padding: 8px 2px 0; }
+  .params.visible { display: flex; }
+  .param-row { display: flex; flex-direction: column; gap: 4px; }
+  .param-row label { font-size: 11px; color: #555; display: flex; justify-content: space-between; }
+  .param-row label span { color: #007aff; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .param-row input[type=range] { width: 100%; height: 18px; accent-color: #007aff; }
+
   /* active model display */
   .active-model-row { display: flex; flex-direction: column; gap: 2px; }
   .active-model-label { font-size: 12px; font-weight: 600; color: #1d1d1f; }
@@ -106,6 +126,7 @@
   .room-item.selected { border-color: #007aff; background: #f0f5ff; }
   .room-dot { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; background: #c9ffd4; border: 1px solid rgba(60,160,80,0.4); }
   .room-label { flex: 1; font-weight: 500; color: #1d1d1f; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .room-area { font-size: 10px; color: #888; font-variant-numeric: tabular-nums; }
   .room-save {
     width: 20px; height: 20px; background: transparent; border: none;
     border-radius: 4px; font-size: 11px; cursor: pointer; opacity: .5; transition: all .12s;
@@ -179,7 +200,7 @@
   <div class="sum-placeholder">
     <div class="icon">Σ</div>
     <p>Используй иконку в строке меню для выделения области и подсчёта суммы</p>
-    <div class="hint">Нажми Σ в меню → «Выделить область»</div>
+    <div class="hint">Σ в меню → «Выделить область»<br>Провайдер: API (Gemini/OpenRouter) или Локально (OCR)</div>
   </div>
 </div>
 
@@ -207,9 +228,36 @@
 
         <hr>
 
-        <!-- Active model (from tray) -->
-        <div class="section-label">Модель</div>
-        <div class="active-model-row">
+        <!-- Mode toggle -->
+        <div class="section-label">Режим распознавания</div>
+        <div class="seg">
+          <button id="modeLocal" class="active" onclick="setMode('local')">Локально (CV)</button>
+          <button id="modeAi"                  onclick="setMode('ai')">ИИ (API)</button>
+        </div>
+
+        <!-- Local CV params -->
+        <div class="params visible" id="localParams">
+          <div class="param-row">
+            <label>Чувствительность стен <span id="vThr">авто</span></label>
+            <input type="range" id="paramThreshold" min="0" max="255" value="0">
+          </div>
+          <div class="param-row">
+            <label>Утолщение стен <span id="vDil">1 px</span></label>
+            <input type="range" id="paramDilate" min="0" max="5" value="1">
+          </div>
+          <div class="param-row">
+            <label>Мин. площадь помещения <span id="vMin">0.30%</span></label>
+            <input type="range" id="paramMinArea" min="1" max="50" value="3">
+          </div>
+          <div class="param-row">
+            <label>Сглаживание полигонов <span id="vEps">3 px</span></label>
+            <input type="range" id="paramEpsilon" min="0" max="20" value="3">
+          </div>
+        </div>
+
+        <!-- AI model display (only in AI mode) -->
+        <div class="active-model-row" id="aiInfo" style="display:none">
+          <span class="section-label">Модель</span>
           <span id="activeModelLabel" class="active-model-label">…</span>
           <span class="active-model-hint">Меняется в меню Σ</span>
         </div>
@@ -246,7 +294,7 @@
 
       <div class="progress-overlay" id="progressOverlay">
         <div class="spinner"></div>
-        <div class="progress-text" id="progressText">Отправляем план…</div>
+        <div class="progress-text" id="progressText">Анализ…</div>
         <div class="progress-step"  id="progressStep"></div>
       </div>
 

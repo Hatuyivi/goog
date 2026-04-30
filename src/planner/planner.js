@@ -1,5 +1,7 @@
 // planner.js — renderer process
-// Модель берётся из трея (как в модуле суммы) — без отдельного выбора
+// Two recognition modes:
+//   • Local CV  — pure-JS image processing in renderer (no internet)
+//   • AI (API)  — sends image to Gemini/OpenRouter via main process
 
 const { ipcRenderer } = require('electron')
 const fs   = require('fs')
@@ -9,10 +11,11 @@ const path = require('path')
 let currentImageB64  = null
 let currentMime      = 'image/jpeg'
 let currentImageEl   = null
-let currentImageBW   = null   // offscreen canvas ч/б версии
+let currentImageBW   = null   // offscreen B&W canvas (for export)
 let rooms            = []
 let selectedRoomId   = null
 let currentView      = 'all'
+let mode             = 'local'  // 'local' | 'ai'
 
 const ROOM_COLOR   = '#c9ffd4'
 const ROOM_ALPHA   = 0.55
@@ -40,6 +43,22 @@ const viewAllBtn        = document.getElementById('viewAll')
 const viewSelBtn        = document.getElementById('viewSelected')
 const canvasPlaceholder = document.getElementById('canvasPlaceholder')
 const activeModelLabel  = document.getElementById('activeModelLabel')
+const aiInfo            = document.getElementById('aiInfo')
+const localParams       = document.getElementById('localParams')
+
+const paramThreshold = document.getElementById('paramThreshold')
+const paramDilate    = document.getElementById('paramDilate')
+const paramMinArea   = document.getElementById('paramMinArea')
+const paramEpsilon   = document.getElementById('paramEpsilon')
+const vThr = document.getElementById('vThr')
+const vDil = document.getElementById('vDil')
+const vMin = document.getElementById('vMin')
+const vEps = document.getElementById('vEps')
+
+paramThreshold.oninput = () => vThr.textContent = paramThreshold.value === '0' ? 'авто' : paramThreshold.value
+paramDilate   .oninput = () => vDil.textContent = `${paramDilate.value} px`
+paramMinArea  .oninput = () => vMin.textContent = `${(Number(paramMinArea.value)/10).toFixed(2)}%`
+paramEpsilon  .oninput = () => vEps.textContent = `${paramEpsilon.value} px`
 
 // ── Init ───────────────────────────────────────────────────
 async function init() {
@@ -50,10 +69,24 @@ async function init() {
 async function updateModelLabel() {
   const model = await ipcRenderer.invoke('get-active-model')
   if (activeModelLabel) {
-    activeModelLabel.textContent = model
-      ? `${model.provider === 'openrouter' ? 'OpenRouter' : 'Gemini'} · ${model.label}`
-      : 'Нет модели — выбери в меню Σ'
+    if (!model) {
+      activeModelLabel.textContent = 'Нет модели — выбери в меню Σ'
+    } else {
+      const provLabel = model.provider === 'openrouter' ? 'OpenRouter'
+                      : model.provider === 'local'      ? 'Локально'
+                      : 'Gemini'
+      activeModelLabel.textContent = `${provLabel} · ${model.label}`
+    }
   }
+}
+
+// ── Mode toggle ────────────────────────────────────────────
+function setMode(m) {
+  mode = m
+  document.getElementById('modeLocal').classList.toggle('active', m === 'local')
+  document.getElementById('modeAi').classList.toggle('active',    m === 'ai')
+  localParams.classList.toggle('visible', m === 'local')
+  aiInfo.style.display = m === 'ai' ? '' : 'none'
 }
 
 // ── Tab switch ─────────────────────────────────────────────
@@ -106,7 +139,7 @@ function loadFile(filePath) {
   } catch(e) { alert('Ошибка загрузки: ' + e.message) }
 }
 
-// Offscreen ч/б canvas
+// Offscreen B&W canvas (used for export visuals)
 function makeBWCanvas(img) {
   const off = document.createElement('canvas')
   off.width = img.naturalWidth; off.height = img.naturalHeight
@@ -155,7 +188,6 @@ function drawPlan() {
   const sx = canvas.width  / currentImageEl.naturalWidth
   const sy = canvas.height / currentImageEl.naturalHeight
 
-  // Фон: ч/б если есть помещения, цветной — если ещё не распознавали
   if (rooms.length && currentImageBW) {
     ctx.drawImage(currentImageBW, 0, 0, canvas.width, canvas.height)
   } else {
@@ -184,6 +216,18 @@ function drawPlan() {
     ctx.strokeStyle = isSelected ? 'rgba(30,120,60,0.95)' : STROKE_COLOR
     ctx.lineWidth   = isSelected ? 3 : STROKE_WIDTH
     ctx.stroke()
+
+    // label
+    const cx = pts.reduce((s,p)=>s+p[0],0) / pts.length
+    const cy = pts.reduce((s,p)=>s+p[1],0) / pts.length
+    const fontSize = Math.max(11, Math.min(16, Math.round(canvas.width / 80)))
+    ctx.font = `600 ${fontSize}px -apple-system, sans-serif`
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+    const tw = ctx.measureText(room.label).width + 10
+    ctx.fillStyle = 'rgba(255,255,255,0.92)'
+    ctx.fillRect(cx - tw/2, cy - fontSize*0.7, tw, fontSize*1.4)
+    ctx.fillStyle = '#1d1d1f'
+    ctx.fillText(room.label, cx, cy)
   })
 
   ctx.globalAlpha = 1
@@ -243,9 +287,11 @@ function buildRoomList() {
   rooms.forEach(room => {
     const item = document.createElement('div')
     item.className = 'room-item'; item.dataset.id = room.id
+    const areaText = room.areaPx ? `${(room.areaPx/1000).toFixed(1)}k px²` : ''
     item.innerHTML = `
       <div class="room-dot"></div>
       <span class="room-label" title="${room.label}">${room.label}</span>
+      <span class="room-area">${areaText}</span>
       <button class="room-save" title="Сохранить PNG" onclick="saveRoom('${room.id}',event)">💾</button>
     `
     item.addEventListener('click', () => selectRoom(room.id))
@@ -253,45 +299,302 @@ function buildRoomList() {
   })
 }
 
-// ── Analyse ────────────────────────────────────────────────
+// ── Analyse (dispatcher) ───────────────────────────────────
 async function analysePlan() {
   if (!currentImageB64) return
-
   analyseBtn.disabled = true
-  const model = await ipcRenderer.invoke('get-active-model')
-  showProgress(
-    'Отправляем план в Vision API…',
-    model ? `${model.provider === 'openrouter' ? 'OpenRouter' : 'Gemini'} · ${model.label}` : '…'
-  )
-
   try {
-    setProgressStep('ИИ анализирует план…')
-
-    const result = await ipcRenderer.invoke('planner-analyse', {
-      b64:  currentImageB64,
-      mime: currentMime,
-      imgW: currentImageEl.naturalWidth,
-      imgH: currentImageEl.naturalHeight,
-    })
-
-    if (result.error) throw new Error(result.error)
-
-    rooms = result.rooms
-    if (!rooms.length) throw new Error('Помещения не найдены. Попробуй другую модель в меню Σ или более чёткий план.')
-
-    setProgressStep('Строим полигоны…')
-    buildRoomList()
-    drawPlan()
-    saveBar.classList.add('visible')
-    viewAllBtn.style.display = ''; viewSelBtn.style.display = ''
-    viewLabel.textContent = `Найдено: ${rooms.length} помещений — кликни для выбора`
-
+    if (mode === 'local') await analyseLocal()
+    else                  await analyseAI()
   } catch(e) {
     alert('Ошибка: ' + e.message)
   } finally {
     hideProgress()
     analyseBtn.disabled = false
   }
+}
+
+async function analyseAI() {
+  const model = await ipcRenderer.invoke('get-active-model')
+  showProgress('Отправляем план в Vision API…',
+    model ? `${model.provider === 'openrouter' ? 'OpenRouter' : (model.provider === 'local' ? 'Локально' : 'Gemini')} · ${model.label}` : '…')
+  setProgressStep('ИИ анализирует план…')
+
+  const result = await ipcRenderer.invoke('planner-analyse', {
+    b64:  currentImageB64,
+    mime: currentMime,
+    imgW: currentImageEl.naturalWidth,
+    imgH: currentImageEl.naturalHeight,
+  })
+  if (result.error) throw new Error(result.error)
+  rooms = result.rooms
+  if (!rooms.length) throw new Error('Помещения не найдены. Попробуй другую модель в меню Σ или более чёткий план.')
+
+  finishAnalysis()
+}
+
+async function analyseLocal() {
+  showProgress('Локальный анализ…', 'Подготовка изображения')
+  await tick()
+
+  const tManual = Number(paramThreshold.value)         // 0 = auto (Otsu)
+  const dilateK = Number(paramDilate.value)            // 0..5
+  const minPct  = Number(paramMinArea.value) / 1000    // /10 -> percent then /100 -> fraction
+  const epsilon = Number(paramEpsilon.value)           // px in display scale
+
+  setProgressStep('Поиск стен и помещений…')
+  await tick()
+
+  rooms = await detectRoomsLocal(currentImageEl, {
+    threshold: tManual || null,
+    dilateK,
+    minAreaFrac: minPct,
+    maxAreaFrac: 0.5,
+    epsilon,
+  })
+  if (!rooms.length) throw new Error('Помещения не найдены. Попробуй уменьшить «Мин. площадь» или включить «Утолщение стен».')
+
+  finishAnalysis()
+}
+
+function finishAnalysis() {
+  buildRoomList()
+  drawPlan()
+  saveBar.classList.add('visible')
+  viewAllBtn.style.display = ''; viewSelBtn.style.display = ''
+  viewLabel.textContent = `Найдено: ${rooms.length} помещений — кликни для выбора`
+}
+
+function tick() { return new Promise(r => setTimeout(r, 0)) }
+
+// ── Local CV pipeline ──────────────────────────────────────
+async function detectRoomsLocal(imageEl, opts) {
+  const W0 = imageEl.naturalWidth, H0 = imageEl.naturalHeight
+
+  // Downscale for speed (cap longest side)
+  const MAX_DIM = 1400
+  const scale = Math.min(1, MAX_DIM / Math.max(W0, H0))
+  const W = Math.round(W0 * scale), H = Math.round(H0 * scale)
+
+  const work = document.createElement('canvas')
+  work.width = W; work.height = H
+  const wctx = work.getContext('2d')
+  wctx.drawImage(imageEl, 0, 0, W, H)
+  const px = wctx.getImageData(0, 0, W, H).data
+
+  // Grayscale
+  const gray = new Uint8Array(W * H)
+  for (let i = 0, j = 0; i < px.length; i += 4, j++) {
+    gray[j] = (px[i] * 0.299 + px[i+1] * 0.587 + px[i+2] * 0.114) | 0
+  }
+
+  // Threshold (Otsu unless manual)
+  const T = opts.threshold != null ? opts.threshold : otsu(gray)
+
+  // Binary: 1 = interior (light), 0 = wall (dark)
+  let bin = new Uint8Array(W * H)
+  for (let i = 0; i < gray.length; i++) bin[i] = gray[i] > T ? 1 : 0
+
+  // Erode interior to thicken walls and close small gaps
+  for (let i = 0; i < opts.dilateK; i++) bin = erode4(bin, W, H)
+
+  // Connected components on interior (1s) — 4-connectivity
+  const labels = new Int32Array(W * H)
+  const regions = []
+  let nextLabel = 1
+  const stack = new Int32Array(W * H)
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const idx = y * W + x
+      if (bin[idx] !== 1 || labels[idx] !== 0) continue
+
+      let minX = x, maxX = x, minY = y, maxY = y, area = 0
+      let touchesBorder = false
+      let sp = 0
+      stack[sp++] = idx
+      labels[idx] = nextLabel
+
+      while (sp > 0) {
+        const p = stack[--sp]
+        const py = (p / W) | 0
+        const pxx = p - py * W
+        area++
+        if (pxx < minX) minX = pxx
+        if (pxx > maxX) maxX = pxx
+        if (py  < minY) minY = py
+        if (py  > maxY) maxY = py
+        if (pxx === 0 || py === 0 || pxx === W - 1 || py === H - 1) touchesBorder = true
+
+        if (pxx > 0)     { const n = p - 1; if (bin[n] === 1 && labels[n] === 0) { labels[n] = nextLabel; stack[sp++] = n } }
+        if (pxx < W - 1) { const n = p + 1; if (bin[n] === 1 && labels[n] === 0) { labels[n] = nextLabel; stack[sp++] = n } }
+        if (py  > 0)     { const n = p - W; if (bin[n] === 1 && labels[n] === 0) { labels[n] = nextLabel; stack[sp++] = n } }
+        if (py  < H - 1) { const n = p + W; if (bin[n] === 1 && labels[n] === 0) { labels[n] = nextLabel; stack[sp++] = n } }
+      }
+
+      regions.push({ label: nextLabel, minX, maxX, minY, maxY, area, touchesBorder })
+      nextLabel++
+    }
+  }
+
+  const total = W * H
+  const minArea = total * opts.minAreaFrac
+  const maxArea = total * opts.maxAreaFrac
+
+  let candidates = regions.filter(r => {
+    if (r.touchesBorder) return false
+    if (r.area < minArea || r.area > maxArea) return false
+    // Filter out thin "ring" artifacts where the region wraps around the
+    // building outline. A real room fills most of its bounding box.
+    const bboxArea = (r.maxX - r.minX + 1) * (r.maxY - r.minY + 1)
+    if (bboxArea > 0 && r.area / bboxArea < 0.35) return false
+    return true
+  })
+
+  // Sort: largest first, then top-to-bottom, left-to-right (centroid)
+  candidates.sort((a, b) => {
+    const cyA = (a.minY + a.maxY) / 2, cyB = (b.minY + b.maxY) / 2
+    if (Math.abs(cyA - cyB) > 30) return cyA - cyB
+    return ((a.minX + a.maxX) / 2) - ((b.minX + b.maxX) / 2)
+  })
+
+  const inv = 1 / scale
+  await tick()
+
+  const rooms = []
+  for (let i = 0; i < candidates.length; i++) {
+    const r = candidates[i]
+    const poly = traceContour(labels, r.label, W, H, r)
+    if (poly.length < 4) continue
+    const simp = rdp(poly, opts.epsilon || 2)
+    if (simp.length < 3) continue
+
+    rooms.push({
+      id:      `r${i + 1}`,
+      label:   `Помещение ${i + 1}`,
+      areaPx:  Math.round(r.area * inv * inv),
+      polygon: simp.map(([x, y]) => [Math.round(x * inv), Math.round(y * inv)]),
+    })
+  }
+  return rooms
+}
+
+// Otsu threshold
+function otsu(gray) {
+  const hist = new Uint32Array(256)
+  for (let i = 0; i < gray.length; i++) hist[gray[i]]++
+  const total = gray.length
+  let sum = 0
+  for (let i = 0; i < 256; i++) sum += i * hist[i]
+  let sumB = 0, wB = 0, max = 0, threshold = 127
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t]
+    if (wB === 0) continue
+    const wF = total - wB
+    if (wF === 0) break
+    sumB += t * hist[t]
+    const mB = sumB / wB
+    const mF = (sum - sumB) / wF
+    const between = wB * wF * (mB - mF) * (mB - mF)
+    if (between > max) { max = between; threshold = t }
+  }
+  return threshold
+}
+
+// 4-connected erosion of value=1 (interior)
+function erode4(bin, W, H) {
+  const out = new Uint8Array(bin.length)
+  for (let y = 1; y < H - 1; y++) {
+    const off = y * W
+    for (let x = 1; x < W - 1; x++) {
+      const i = off + x
+      out[i] = (bin[i] && bin[i-1] && bin[i+1] && bin[i-W] && bin[i+W]) ? 1 : 0
+    }
+  }
+  return out
+}
+
+// Moore-neighbor boundary tracing on a labeled region.
+// Returns ordered list of [x,y] pixel coords forming a closed contour.
+function traceContour(labels, label, W, H, region) {
+  // Find topmost-leftmost pixel of region
+  let sx = -1, sy = -1
+  outer: for (let y = region.minY; y <= region.maxY; y++) {
+    for (let x = region.minX; x <= region.maxX; x++) {
+      if (labels[y * W + x] === label) { sx = x; sy = y; break outer }
+    }
+  }
+  if (sx < 0) return []
+
+  const isLabel = (x, y) =>
+    x >= 0 && x < W && y >= 0 && y < H && labels[y * W + x] === label
+
+  // 8-neighbor offsets, clockwise starting from East
+  const dx = [ 1, 1, 0,-1,-1,-1, 0, 1]
+  const dy = [ 0, 1, 1, 1, 0,-1,-1,-1]
+
+  const poly = [[sx, sy]]
+  let cx = sx, cy = sy
+  // Came from West (since topmost-leftmost has nothing W or N)
+  let backDir = 4
+
+  const maxSteps = (region.maxX - region.minX + region.maxY - region.minY + 4) * 8
+  for (let step = 0; step < maxSteps; step++) {
+    let found = false
+    // Search 8 directions clockwise starting from (backDir + 1)
+    for (let i = 1; i <= 8; i++) {
+      const d = (backDir + i) % 8
+      const nx = cx + dx[d], ny = cy + dy[d]
+      if (isLabel(nx, ny)) {
+        cx = nx; cy = ny
+        // New backtrack direction = opposite of approach direction
+        backDir = (d + 4) % 8
+        poly.push([cx, cy])
+        found = true
+        break
+      }
+    }
+    if (!found) break  // isolated pixel
+    if (cx === sx && cy === sy && poly.length > 2) break
+  }
+  return poly
+}
+
+// Ramer-Douglas-Peucker polygon simplification (iterative-safe)
+function rdp(points, eps) {
+  if (points.length < 3 || eps <= 0) return points.slice()
+  const keep = new Uint8Array(points.length)
+  keep[0] = 1; keep[points.length - 1] = 1
+
+  const stack = [[0, points.length - 1]]
+  while (stack.length) {
+    const [a, b] = stack.pop()
+    if (b - a < 2) continue
+    let maxD = 0, idx = -1
+    const [x1, y1] = points[a], [x2, y2] = points[b]
+    const dxAB = x2 - x1, dyAB = y2 - y1
+    const denom = dxAB * dxAB + dyAB * dyAB
+    for (let i = a + 1; i < b; i++) {
+      const [px, py] = points[i]
+      let d
+      if (denom === 0) {
+        d = Math.hypot(px - x1, py - y1)
+      } else {
+        const t = ((px - x1) * dxAB + (py - y1) * dyAB) / denom
+        const tx = x1 + t * dxAB, ty = y1 + t * dyAB
+        d = Math.hypot(px - tx, py - ty)
+      }
+      if (d > maxD) { maxD = d; idx = i }
+    }
+    if (maxD > eps && idx > 0) {
+      keep[idx] = 1
+      stack.push([a, idx])
+      stack.push([idx, b])
+    }
+  }
+  const out = []
+  for (let i = 0; i < points.length; i++) if (keep[i]) out.push(points[i])
+  return out
 }
 
 // ── Save ───────────────────────────────────────────────────
@@ -356,6 +659,16 @@ function makeCombinedCanvas() {
     c.closePath()
     c.globalAlpha = ROOM_ALPHA; c.fillStyle = ROOM_COLOR; c.fill()
     c.globalAlpha = 1; c.strokeStyle = STROKE_COLOR; c.lineWidth = STROKE_WIDTH; c.stroke()
+    const cx = room.polygon.reduce((s,p)=>s+p[0],0) / room.polygon.length
+    const cy = room.polygon.reduce((s,p)=>s+p[1],0) / room.polygon.length
+    const fs = Math.max(12, Math.round(w / 80))
+    c.font = `600 ${fs}px -apple-system, sans-serif`
+    c.textAlign = 'center'; c.textBaseline = 'middle'
+    const tw = c.measureText(room.label).width + 12
+    c.fillStyle = 'rgba(255,255,255,0.92)'
+    c.fillRect(cx-tw/2, cy-fs*0.7, tw, fs*1.4)
+    c.fillStyle = '#1d1d1f'
+    c.fillText(room.label, cx, cy)
   })
   return off
 }
