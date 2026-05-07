@@ -1287,7 +1287,6 @@ function tick() { return new Promise(r => setTimeout(r, 0)) }
 async function detectRoomsLocal(imageEl, opts) {
   const W0 = imageEl.naturalWidth, H0 = imageEl.naturalHeight
 
-  // Downscale for speed — but keep enough detail for small rooms
   const MAX_DIM = 2000
   const scale = Math.min(1, MAX_DIM / Math.max(W0, H0))
   const W = Math.round(W0 * scale), H = Math.round(H0 * scale)
@@ -1304,44 +1303,28 @@ async function detectRoomsLocal(imageEl, opts) {
     gray[j] = (px[i] * 0.299 + px[i+1] * 0.587 + px[i+2] * 0.114) | 0
   }
 
-  // ── Multi-level threshold ──────────────────────────────
-  // Run two passes: global Otsu + a slightly lower threshold to catch
-  // rooms whose walls are lighter (partial walls, dashed lines).
   const T_global = opts.threshold != null ? opts.threshold : otsu(gray)
-  // Second threshold slightly lower catches semi-dark boundaries
-  const T_loose  = Math.max(T_global - 30, 80)
 
-  // Binary pass 1: strict (main structure)
-  const binStrict = new Uint8Array(W * H)
-  for (let i = 0; i < gray.length; i++) binStrict[i] = gray[i] > T_global ? 1 : 0
+  // ── Detect if this is a blueprint/architectural drawing ──
+  // Blueprint = thin dark walls on white/light background (>60% bright pixels)
+  let brightCount = 0
+  for (let i = 0; i < gray.length; i++) if (gray[i] > 180) brightCount++
+  const isBlueprintStyle = brightCount / gray.length > 0.55
 
-  // Binary pass 2: loose (small rooms inside thick walls)
-  const binLoose = new Uint8Array(W * H)
-  for (let i = 0; i < gray.length; i++) binLoose[i] = gray[i] > T_loose ? 1 : 0
-
-  // Erode to thicken walls on both
-  let bin1 = binStrict, bin2 = binLoose
-  for (let i = 0; i < opts.dilateK; i++) { bin1 = erode4(bin1, W, H); bin2 = erode4(bin2, W, H) }
-  // (no extra erode on loose — it already shares dilateK passes; extra pass destroys small rooms)
-
-  // ── Connected components ────────────────────────────────
-  function floodFill(bin) {
+  // ── Shared flood-fill ──────────────────────────────────
+  function floodFillRegions(bin) {
     const labels = new Int32Array(W * H)
     const regions = []
     let nextLabel = 1
     const stack = new Int32Array(W * H)
-
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
         const idx = y * W + x
         if (bin[idx] !== 1 || labels[idx] !== 0) continue
-
         let minX = x, maxX = x, minY = y, maxY = y, area = 0
-        let touchesBorder = false
         let sp = 0
         stack[sp++] = idx
         labels[idx] = nextLabel
-
         while (sp > 0) {
           const p = stack[--sp]
           const py = (p / W) | 0
@@ -1349,44 +1332,164 @@ async function detectRoomsLocal(imageEl, opts) {
           area++
           if (pxx < minX) minX = pxx; if (pxx > maxX) maxX = pxx
           if (py  < minY) minY = py;  if (py  > maxY) maxY = py
-          if (pxx === 0 || py === 0 || pxx === W - 1 || py === H - 1) touchesBorder = true
           if (pxx > 0)     { const n = p-1; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
           if (pxx < W - 1) { const n = p+1; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
           if (py  > 0)     { const n = p-W; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
           if (py  < H - 1) { const n = p+W; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
         }
-        regions.push({ label: nextLabel, minX, maxX, minY, maxY, area, touchesBorder })
+        regions.push({ label: nextLabel, minX, maxX, minY, maxY, area })
         nextLabel++
       }
     }
     return { labels, regions }
   }
 
-  const { labels: labels1, regions: regions1 } = floodFill(bin1)
-  const { labels: labels2, regions: regions2 } = floodFill(bin2)
+  // 4-connected dilation of value=1
+  function dilate4(bin) {
+    const out = new Uint8Array(bin.length)
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x
+        if (bin[i] || (x>0 && bin[i-1]) || (x<W-1 && bin[i+1]) ||
+            (y>0 && bin[i-W]) || (y<H-1 && bin[i+W])) out[i] = 1
+      }
+    }
+    return out
+  }
+
+  if (isBlueprintStyle) {
+    // Wall threshold: pixels darker than T_wall are walls
+    // Use a fixed dark threshold tuned for CAD/rendered plans rather than Otsu
+    // Otsu on light plans tends to produce very high threshold (200+) or very low (100-)
+    // We want to catch all clearly-dark pixels: walls, window hatching, text
+    const T_wall = opts.threshold != null ? opts.threshold : Math.min(T_global + 20, 200)
+
+    // Mark walls (dark pixels)
+    const walls = new Uint8Array(W * H)
+    for (let i = 0; i < gray.length; i++) walls[i] = gray[i] < T_wall ? 1 : 0
+
+    // ── Remove small noise (text dots, hatching) ───────────
+    // Label dark components; keep only those big enough to be real walls
+    // Estimate wall thickness from horizontal dark-run lengths
+    const runs = []
+    const rowStep = Math.max(1, (H / 60) | 0)
+    for (let y = rowStep; y < H - rowStep; y += rowStep) {
+      let rl = 0
+      for (let x = 0; x < W; x++) {
+        if (walls[y * W + x]) { rl++ }
+        else if (rl > 0) { if (rl <= 40) runs.push(rl); rl = 0 }
+      }
+    }
+    runs.sort((a, b) => a - b)
+    const wallThick = runs.length ? (runs[Math.floor(runs.length * 0.70)] || 4) : 4
+    const minWallArea = Math.max(3, (wallThick * wallThick * 0.3) | 0)
+
+    // Label dark blobs and remove tiny ones (noise/text dots)
+    const wallLabels = new Int32Array(W * H)
+    const wallStack  = new Int32Array(W * H)
+    let wLabel = 0
+    const blobAreas = []
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const idx = y * W + x
+        if (walls[idx] !== 1 || wallLabels[idx] !== 0) continue
+        wLabel++
+        let area = 0, sp = 0
+        wallStack[sp++] = idx; wallLabels[idx] = wLabel
+        while (sp > 0) {
+          const p = wallStack[--sp]; area++
+          const py = (p / W) | 0, px2 = p - py * W
+          if (px2 > 0)     { const n=p-1; if (walls[n]&&!wallLabels[n]) { wallLabels[n]=wLabel; wallStack[sp++]=n } }
+          if (px2 < W - 1) { const n=p+1; if (walls[n]&&!wallLabels[n]) { wallLabels[n]=wLabel; wallStack[sp++]=n } }
+          if (py  > 0)     { const n=p-W; if (walls[n]&&!wallLabels[n]) { wallLabels[n]=wLabel; wallStack[sp++]=n } }
+          if (py  < H - 1) { const n=p+W; if (walls[n]&&!wallLabels[n]) { wallLabels[n]=wLabel; wallStack[sp++]=n } }
+        }
+        blobAreas.push({ label: wLabel, area })
+      }
+    }
+    const bigWalls = new Set(blobAreas.filter(b => b.area >= minWallArea).map(b => b.label))
+    const wallsClean = new Uint8Array(W * H)
+    for (let i = 0; i < wallLabels.length; i++) {
+      if (wallLabels[i] && bigWalls.has(wallLabels[i])) wallsClean[i] = 1
+    }
+
+    // Dilate walls to close hairline gaps (1 base + user dilateK capped at 3)
+    const dilPasses = 1 + Math.min(3, opts.dilateK)
+    let wallsFat = wallsClean
+    for (let i = 0; i < dilPasses; i++) wallsFat = dilate4(wallsFat)
+
+    // Free pixels = not wall
+    const free = new Uint8Array(W * H)
+    for (let i = 0; i < wallsFat.length; i++) free[i] = wallsFat[i] === 0 ? 1 : 0
+
+    const { labels, regions } = floodFillRegions(free)
+    await tick()
+
+    const total   = W * H
+    const minArea = total * opts.minAreaFrac
+    const maxArea = total * 0.68
+
+    const candidates = regions.filter(r => {
+      if (r.area < minArea || r.area > maxArea) return false
+      const tL = r.minX <= 3, tR = r.maxX >= W - 4
+      const tT = r.minY <= 3, tB = r.maxY >= H - 4
+      if ((tL?1:0)+(tR?1:0)+(tT?1:0)+(tB?1:0) >= 2) return false
+      const bw = r.maxX - r.minX + 1, bh = r.maxY - r.minY + 1
+      if (bw / bh > 25 || bh / bw > 25) return false
+      return true
+    })
+
+    candidates.sort((a, b) => {
+      const cyA = (a.minY + a.maxY) / 2, cyB = (b.minY + b.maxY) / 2
+      if (Math.abs(cyA - cyB) > 20) return cyA - cyB
+      return ((a.minX + a.maxX) / 2) - ((b.minX + b.maxX) / 2)
+    })
+
+    await tick()
+
+    const inv = 1 / scale
+    const rooms = []
+    for (let i = 0; i < candidates.length; i++) {
+      const r = candidates[i]
+      const poly = traceContour(labels, r.label, W, H, r)
+      if (poly.length < 4) continue
+      const simp = rdp(poly, (opts.epsilon || 2) * scale)
+      if (simp.length < 3) continue
+      rooms.push({
+        id:      `r${i + 1}`,
+        label:   `Помещение ${i + 1}`,
+        areaPx:  Math.round(r.area * inv * inv),
+        polygon: simp.map(([x, y]) => [Math.round(x * inv), Math.round(y * inv)]),
+      })
+    }
+    return rooms
+  }
+
+  // ── Legacy path: dark background / colored plans ──────────
+  const T_loose = Math.max(T_global - 30, 80)
+
+  const binStrict = new Uint8Array(W * H)
+  for (let i = 0; i < gray.length; i++) binStrict[i] = gray[i] > T_global ? 1 : 0
+  const binLoose = new Uint8Array(W * H)
+  for (let i = 0; i < gray.length; i++) binLoose[i] = gray[i] > T_loose ? 1 : 0
+
+  let bin1 = binStrict, bin2 = binLoose
+  for (let i = 0; i < opts.dilateK; i++) { bin1 = erode4(bin1, W, H); bin2 = erode4(bin2, W, H) }
+
+  const { labels: labels1, regions: regions1 } = floodFillRegions(bin1)
+  const { labels: labels2, regions: regions2 } = floodFillRegions(bin2)
 
   await tick()
 
-  // ── Candidate filtering ─────────────────────────────────
-  const total = W * H
-  const minArea    = total * opts.minAreaFrac
-  // No fixed maxArea ceiling — instead filter by bboxFill ratio
-  // This lets us catch small rooms while still rejecting background.
-  // Only reject regions that are overwhelmingly large (>70% of image)
-  const maxArea    = total * 0.70
+  const total   = W * H
+  const minArea = total * opts.minAreaFrac
+  const maxArea = total * 0.70
 
   function filterRegions(regions, fillRatioMin) {
     return regions.filter(r => {
-      // Reject only if bounding box spans most of the image edge (background)
-      // A room can legally touch one border edge (plan drawn to image edge)
-      const spanX = r.maxX - r.minX, spanY = r.maxY - r.minY
-      const touchesLeft   = r.minX <= 1
-      const touchesRight  = r.maxX >= W - 2
-      const touchesTop    = r.minY <= 1
-      const touchesBottom = r.maxY >= H - 2
-      const borderSides   = (touchesLeft ? 1 : 0) + (touchesRight ? 1 : 0) +
-                            (touchesTop  ? 1 : 0) + (touchesBottom ? 1 : 0)
-      if (borderSides >= 2) return false   // true background or outer frame
+      const tL = r.minX <= 1, tR = r.maxX >= W - 2
+      const tT = r.minY <= 1, tB = r.maxY >= H - 2
+      if ((tL?1:0)+(tR?1:0)+(tT?1:0)+(tB?1:0) >= 2) return false
       if (r.area < minArea || r.area > maxArea) return false
       const bboxArea = (r.maxX - r.minX + 1) * (r.maxY - r.minY + 1)
       if (bboxArea > 0 && r.area / bboxArea < fillRatioMin) return false
@@ -1394,15 +1497,10 @@ async function detectRoomsLocal(imageEl, opts) {
     })
   }
 
-  // Strict pass: 0.18 allows L/U-shaped rooms; background blobs have ratio ~0.05
   const cand1 = filterRegions(regions1, 0.18)
-  // Loose pass: allow slightly lower fill ratio for small rooms
   const cand2 = filterRegions(regions2, 0.12)
 
-  // ── Merge and deduplicate ───────────────────────────────
-  // Prefer strict candidates; add loose ones that don't overlap with any strict.
-  // Two regions "overlap" if their centroids are within ~30px or bboxes >50% IoU.
-  function bbox(r) { return { x1: r.minX, y1: r.minY, x2: r.maxX, y2: r.maxY } }
+  function bboxR(r) { return { x1: r.minX, y1: r.minY, x2: r.maxX, y2: r.maxY } }
   function iou(a, b) {
     const ix1 = Math.max(a.x1, b.x1), iy1 = Math.max(a.y1, b.y1)
     const ix2 = Math.min(a.x2, b.x2), iy2 = Math.min(a.y2, b.y2)
@@ -1413,14 +1511,11 @@ async function detectRoomsLocal(imageEl, opts) {
   }
 
   const merged = [...cand1]
-  const strictBoxes = cand1.map(bbox)
+  const strictBoxes = cand1.map(bboxR)
   for (const r of cand2) {
-    const rb = bbox(r)
-    const overlaps = strictBoxes.some(sb => iou(sb, rb) > 0.4)
-    if (!overlaps) merged.push(r)
+    if (!strictBoxes.some(sb => iou(sb, bboxR(r)) > 0.4)) merged.push(r)
   }
 
-  // ── Sort top-to-bottom, left-to-right ──────────────────
   merged.sort((a, b) => {
     const cyA = (a.minY + a.maxY) / 2, cyB = (b.minY + b.maxY) / 2
     if (Math.abs(cyA - cyB) > 20) return cyA - cyB
@@ -1429,21 +1524,16 @@ async function detectRoomsLocal(imageEl, opts) {
 
   await tick()
 
-  // ── Build polygons ──────────────────────────────────────
   const inv = 1 / scale
   const rooms = []
-
   for (let i = 0; i < merged.length; i++) {
     const r = merged[i]
-    // Use the label map that produced this candidate
     const isFromLoose = !cand1.includes(r)
     const labelsMap   = isFromLoose ? labels2 : labels1
-
     const poly = traceContour(labelsMap, r.label, W, H, r)
     if (poly.length < 4) continue
-    const simp = rdp(poly, (opts.epsilon || 2) * scale)  // scale epsilon to working resolution
+    const simp = rdp(poly, (opts.epsilon || 2) * scale)
     if (simp.length < 3) continue
-
     rooms.push({
       id:      `r${i + 1}`,
       label:   `Помещение ${i + 1}`,
@@ -1513,7 +1603,7 @@ function traceContour(labels, label, W, H, region) {
   // Came from West (since topmost-leftmost has nothing W or N)
   let backDir = 4
 
-  const maxSteps = region.area * 4 + 64  // upper bound: each pixel visited at most 4 times
+  const maxSteps = (region.maxX - region.minX + region.maxY - region.minY + 4) * 8
   for (let step = 0; step < maxSteps; step++) {
     let found = false
     // Search 8 directions clockwise starting from (backDir + 1)
