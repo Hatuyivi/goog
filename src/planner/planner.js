@@ -1524,8 +1524,8 @@ async function detectRoomsLocal(imageEl, opts) {
 
   await tick()
 
-  const inv = 1 / scale
-  const rooms = []
+  const invL = 1 / scale
+  const roomsL = []
   for (let i = 0; i < merged.length; i++) {
     const r = merged[i]
     const isFromLoose = !cand1.includes(r)
@@ -1534,14 +1534,14 @@ async function detectRoomsLocal(imageEl, opts) {
     if (poly.length < 4) continue
     const simp = rdp(poly, (opts.epsilon || 2) * scale)
     if (simp.length < 3) continue
-    rooms.push({
+    roomsL.push({
       id:      `r${i + 1}`,
       label:   `Помещение ${i + 1}`,
-      areaPx:  Math.round(r.area * inv * inv),
-      polygon: simp.map(([x, y]) => [Math.round(x * inv), Math.round(y * inv)]),
+      areaPx:  Math.round(r.area * invL * invL),
+      polygon: simp.map(([x, y]) => [Math.round(x * invL), Math.round(y * invL)]),
     })
   }
-  return rooms
+  return roomsL
 }
 
 // Otsu threshold
