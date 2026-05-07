@@ -25,22 +25,18 @@ let hoverState       = null     // { roomId, ptIdx, edgeIdx } — what cursor is
 let hasUnsavedEdits  = false
 let trainingCount    = 0        // cached count of saved training samples
 
-// ── Collider state ─────────────────────────────────────────
-// Colliders are user-drawn exclusion zones. They are never included
-// in training data and are only used to mask out false-positive rooms.
-let colliders        = []       // [{id, polygon}]  — rectangles drawn by user
-let colliderDraw     = null     // {x0,y0,x1,y1} — rect being drawn right now
-let selectedColliderIds = new Set()  // ids of colliders checked for export
+// ── Room drawing state ──────────────────────────────────────
+// Users can draw rectangular rooms manually on the canvas.
+let roomDraw         = null     // {x0,y0,x1,y1} — rect being drawn right now
+let drawnRoomCount   = 0        // counter for auto-labelling drawn rooms
 
 const ROOM_COLOR   = '#c9ffd4'
 const ROOM_ALPHA   = 0.55
 const STROKE_COLOR = 'rgba(60,160,80,0.75)'
 const STROKE_WIDTH = 2
 
-const COLLIDER_COLOR  = 'rgba(255,80,80,0.18)'
-const COLLIDER_STROKE = 'rgba(200,40,40,0.7)'
-const COLLIDER_DRAW_COLOR  = 'rgba(255,80,80,0.10)'
-const COLLIDER_DRAW_STROKE = 'rgba(200,40,40,0.5)'
+const DRAW_ROOM_COLOR  = 'rgba(100,160,255,0.12)'
+const DRAW_ROOM_STROKE = 'rgba(0,100,220,0.55)'
 
 // ── DOM ────────────────────────────────────────────────────
 const canvas            = document.getElementById('planCanvas')
@@ -68,7 +64,6 @@ const localParams       = document.getElementById('localParams')
 const editToolbar       = document.getElementById('editToolbar')
 const saveEditsBtn      = document.getElementById('saveEditsBtn')
 const trainingBadge     = document.getElementById('trainingBadge')
-const colliderBadge     = document.getElementById('colliderBadge')
 
 const paramThreshold = document.getElementById('paramThreshold')
 const paramDilate    = document.getElementById('paramDilate')
@@ -212,12 +207,11 @@ function clearPlan() {
 function clearResults() {
   rooms = []; originalRooms = []; selectedRoomId = null
   hasUnsavedEdits = false; dragState = null; hoverState = null
-  colliders = []; colliderDraw = null; selectedColliderIds = new Set()
+  roomDraw = null; drawnRoomCount = 0
   saveBar.classList.remove('visible')
   editToolbar.classList.remove('visible')
   roomsTitle.style.display = 'none'; roomsDivider.style.display = 'none'
   roomsList.innerHTML = ''; roomsList.appendChild(roomsEmpty); roomsEmpty.style.display = 'block'
-  buildColliderList()
   if (currentImageEl) drawPlan()
 }
 
@@ -305,43 +299,17 @@ function drawPlan() {
 
   ctx.globalAlpha = 1
 
-  // Draw colliders (exclusion zones) — always visible, never in training
-  const csx = canvas.width  / currentImageEl.naturalWidth
-  const csy = canvas.height / currentImageEl.naturalHeight
-  for (const col of colliders) {
-    if (!col.polygon || col.polygon.length < 3) continue
-    const pts = col.polygon.map(([x, y]) => [x * csx, y * csy])
-    const isSelected = selectedColliderIds.has(col.id)
-    ctx.beginPath()
-    ctx.moveTo(pts[0][0], pts[0][1])
-    pts.slice(1).forEach(([x, y]) => ctx.lineTo(x, y))
-    ctx.closePath()
+  // Draw in-progress room rectangle (draw mode)
+  if (roomDraw) {
+    const csx = canvas.width  / currentImageEl.naturalWidth
+    const csy = canvas.height / currentImageEl.naturalHeight
+    const x0 = roomDraw.x0 * csx, y0 = roomDraw.y0 * csy
+    const x1 = roomDraw.x1 * csx, y1 = roomDraw.y1 * csy
     ctx.globalAlpha = 1
-    ctx.fillStyle = isSelected ? 'rgba(200,50,47,0.22)' : COLLIDER_COLOR
-    ctx.fill()
-    ctx.setLineDash([5, 4])
-    ctx.strokeStyle = isSelected ? 'rgba(200,50,47,0.9)' : COLLIDER_STROKE
-    ctx.lineWidth = isSelected ? 2 : 1.5
-    ctx.stroke()
-    ctx.setLineDash([])
-    // Label
-    const lcx = pts.reduce((s,p)=>s+p[0],0) / pts.length
-    const lcy = pts.reduce((s,p)=>s+p[1],0) / pts.length
-    ctx.font = `700 ${isSelected ? '12' : '11'}px -apple-system, sans-serif`
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
-    ctx.fillStyle = isSelected ? 'rgba(180,30,30,0.95)' : 'rgba(200,40,40,0.85)'
-    ctx.fillText(isSelected ? '⊘ ✓' : '⊘', lcx, lcy)
-  }
-
-  // Draw in-progress collider rect
-  if (colliderDraw) {
-    const x0 = colliderDraw.x0 * csx, y0 = colliderDraw.y0 * csy
-    const x1 = colliderDraw.x1 * csx, y1 = colliderDraw.y1 * csy
-    ctx.globalAlpha = 1
-    ctx.fillStyle = COLLIDER_DRAW_COLOR
+    ctx.fillStyle = DRAW_ROOM_COLOR
     ctx.fillRect(Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0))
     ctx.setLineDash([5, 4])
-    ctx.strokeStyle = COLLIDER_DRAW_STROKE
+    ctx.strokeStyle = DRAW_ROOM_STROKE
     ctx.lineWidth = 1.5
     ctx.strokeRect(Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0))
     ctx.setLineDash([])
@@ -575,21 +543,7 @@ async function analyseLocal() {
 }
 
 function finishAnalysis() {
-  // Apply collider masking: remove rooms whose centroid lies inside any collider.
-  // Colliders are NOT saved to training data — they are purely a display/filter tool.
-  if (colliders.length) {
-    const before = rooms.length
-    rooms = rooms.filter(room => {
-      if (!room.polygon?.length) return true
-      const cx = room.polygon.reduce((s,p)=>s+p[0],0) / room.polygon.length
-      const cy = room.polygon.reduce((s,p)=>s+p[1],0) / room.polygon.length
-      return !colliders.some(col => pointInPolygon(cx, cy, col.polygon))
-    })
-    const masked = before - rooms.length
-    if (masked > 0) console.log(`Collider masking: removed ${masked} rooms`)
-  }
-
-  // Snapshot for training diff (colliders intentionally excluded)
+  // Snapshot for training diff
   originalRooms = rooms.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) }))
   hasUnsavedEdits = false
   buildRoomList()
@@ -601,7 +555,6 @@ function finishAnalysis() {
   saveEditsBtn.style.display = 'none'
   setEditMode('view')
   updateTrainingBadge()
-  updateColliderBadge()
 }
 
 // ── Edit mode ──────────────────────────────────────────────
@@ -610,11 +563,11 @@ function setEditMode(m) {
   document.getElementById('emodeView').classList.toggle('active',     m === 'view')
   document.getElementById('emodeEdit').classList.toggle('active',     m === 'edit')
   document.getElementById('emodeDelete').classList.toggle('active',   m === 'delete')
-  document.getElementById('emodeCollider').classList.toggle('active', m === 'collider')
+  document.getElementById('emodeDraw').classList.toggle('active',     m === 'collider')
   canvas.className = m !== 'view' ? `mode-${m}` : ''
   hoverState = null
   dragState  = null
-  colliderDraw = null
+  roomDraw   = null
   drawPlan()
 }
 
@@ -717,10 +670,10 @@ canvas.addEventListener('mousedown', e => {
   if (!currentImageEl) return
   const [cx, cy] = getCanvasXY(e)
 
-  // ── Collider drawing ───────────────────────────────────
+  // ── Room drawing ───────────────────────────────────────
   if (editMode === 'collider') {
     const [ix, iy] = canvasToImage(cx, cy)
-    colliderDraw = { x0: ix, y0: iy, x1: ix, y1: iy }
+    roomDraw = { x0: ix, y0: iy, x1: ix, y1: iy }
     e.preventDefault()
     return
   }
@@ -758,24 +711,9 @@ canvas.addEventListener('mousedown', e => {
     return
   }
 
-  // view mode: Ctrl+click toggles collider selection; plain click selects room
+  // view mode: click selects room
   const sx = canvas.width  / currentImageEl.naturalWidth
   const sy = canvas.height / currentImageEl.naturalHeight
-
-  // Check colliders first (Ctrl key toggles selection)
-  if (e.ctrlKey || e.metaKey) {
-    for (const col of [...colliders].reverse()) {
-      if (!col.polygon) continue
-      const pts = col.polygon.map(([x,y]) => [x*sx, y*sy])
-      if (pointInPolygon(cx, cy, pts)) {
-        if (selectedColliderIds.has(col.id)) selectedColliderIds.delete(col.id)
-        else selectedColliderIds.add(col.id)
-        buildColliderList()
-        drawPlan()
-        return
-      }
-    }
-  }
 
   for (const room of [...rooms].reverse()) {
     if (!room.polygon) continue
@@ -791,12 +729,12 @@ canvas.addEventListener('mousemove', e => {
   if (!currentImageEl) return
   const [cx, cy] = getCanvasXY(e)
 
-  // ── Collider drag ──────────────────────────────────────
+  // ── Room draw drag ─────────────────────────────────────
   if (editMode === 'collider') {
     canvas.style.cursor = 'crosshair'
-    if (colliderDraw) {
+    if (roomDraw) {
       const [ix, iy] = canvasToImage(cx, cy)
-      colliderDraw.x1 = ix; colliderDraw.y1 = iy
+      roomDraw.x1 = ix; roomDraw.y1 = iy
       drawPlan()
     }
     return
@@ -839,20 +777,26 @@ canvas.addEventListener('mousemove', e => {
 })
 
 canvas.addEventListener('mouseup', e => {
-  // ── Finish collider rect ───────────────────────────────
-  if (editMode === 'collider' && colliderDraw) {
-    const { x0, y0, x1, y1 } = colliderDraw
-    colliderDraw = null
+  // ── Finish room draw ───────────────────────────────────
+  if (editMode === 'collider' && roomDraw) {
+    const { x0, y0, x1, y1 } = roomDraw
+    roomDraw = null
     const minW = Math.abs(x1 - x0), minH = Math.abs(y1 - y0)
     if (minW > 5 && minH > 5) {
-      // Store as 4-point polygon (clockwise from top-left)
       const lx = Math.min(x0, x1), ly = Math.min(y0, y1)
       const rx = Math.max(x0, x1), ry = Math.max(y0, y1)
-      colliders.push({
-        id: `col${Date.now()}`,
+      drawnRoomCount++
+      const newRoom = {
+        id:      `drawn${Date.now()}`,
+        label:   `Помещение ${rooms.length + 1}`,
+        areaPx:  Math.round(minW * minH),
         polygon: [[lx,ly],[rx,ly],[rx,ry],[lx,ry]],
-      })
-      updateColliderBadge()
+        drawn:   true,
+      }
+      rooms.push(newRoom)
+      markEdited()
+      buildRoomList()
+      selectRoom(newRoom.id)
     }
     drawPlan()
     return
@@ -866,8 +810,8 @@ canvas.addEventListener('mouseup', e => {
 })
 
 canvas.addEventListener('mouseleave', () => {
-  if (editMode === 'collider' && colliderDraw) {
-    colliderDraw = null; drawPlan()
+  if (editMode === 'collider' && roomDraw) {
+    roomDraw = null; drawPlan()
   }
   if (dragState) { markEdited(); dragState = null }
   hoverState = null
@@ -892,199 +836,6 @@ async function updateTrainingBadge() {
   trainingCount = data.length
   trainingBadge.textContent = `✦ ${trainingCount} образц${trainingCount === 1 ? '' : trainingCount < 5 ? 'а' : 'ов'}`
   trainingBadge.classList.toggle('visible', trainingCount > 0)
-}
-
-function updateColliderBadge() {
-  if (!colliderBadge) return
-  colliderBadge.textContent = `⊘ ${colliders.length} колл.`
-  colliderBadge.classList.toggle('visible', colliders.length > 0)
-  const clearBtn = document.getElementById('colliderClearBtn')
-  if (clearBtn) clearBtn.style.display = colliders.length > 0 ? '' : 'none'
-  buildColliderList()
-}
-
-function clearColliders() {
-  colliders = []; colliderDraw = null; selectedColliderIds = new Set()
-  updateColliderBadge()
-  buildColliderList()
-  drawPlan()
-}
-
-// ── Collider list (in left panel) ─────────────────────────
-function buildColliderList() {
-  const section = document.getElementById('collidersSection')
-  const list    = document.getElementById('collidersList')
-  const exportBtn = document.getElementById('exportWithCollidersBtn')
-  if (!section || !list) return
-
-  if (!colliders.length) {
-    section.style.display = 'none'
-    if (exportBtn) exportBtn.style.display = 'none'
-    return
-  }
-
-  section.style.display = 'block'
-  if (exportBtn) exportBtn.style.display = selectedColliderIds.size > 0 ? '' : 'none'
-
-  list.innerHTML = ''
-  colliders.forEach((col, idx) => {
-    // Compute bounding box size for display
-    const xs = col.polygon.map(p => p[0]), ys = col.polygon.map(p => p[1])
-    const w  = Math.round(Math.max(...xs) - Math.min(...xs))
-    const h  = Math.round(Math.max(...ys) - Math.min(...ys))
-
-    const item = document.createElement('div')
-    item.className = 'collider-item' + (selectedColliderIds.has(col.id) ? ' selected' : '')
-    item.dataset.id = col.id
-
-    const cb = document.createElement('input')
-    cb.type = 'checkbox'
-    cb.checked = selectedColliderIds.has(col.id)
-    cb.addEventListener('change', () => {
-      if (cb.checked) selectedColliderIds.add(col.id)
-      else selectedColliderIds.delete(col.id)
-      buildColliderList()   // re-render to update selected state & export button
-    })
-    // Also toggle via clicking row (but not on the checkbox itself)
-    item.addEventListener('click', e => {
-      if (e.target === cb) return
-      cb.checked = !cb.checked
-      cb.dispatchEvent(new Event('change'))
-    })
-
-    const icon  = document.createElement('span'); icon.className = 'col-icon'; icon.textContent = '⊘'
-    const label = document.createElement('span'); label.className = 'col-label'; label.textContent = `Зона ${idx + 1}`
-    const size  = document.createElement('span'); size.className  = 'col-size';  size.textContent  = `${w}×${h}`
-
-    item.appendChild(cb); item.appendChild(icon); item.appendChild(label); item.appendChild(size)
-    list.appendChild(item)
-  })
-}
-
-function selectAllColliders() {
-  colliders.forEach(c => selectedColliderIds.add(c.id))
-  buildColliderList()
-}
-function deselectAllColliders() {
-  selectedColliderIds.clear()
-  buildColliderList()
-}
-
-// ── Export 4:3 with selected colliders ────────────────────
-// Output: JPEG, 4:3 landscape, ≤ 5 MB.
-// The floor plan is centered / letterboxed into the 4:3 frame.
-// Selected colliders are drawn as red dashed rectangles.
-async function exportWithColliders() {
-  if (!currentImageEl) { alert('Сначала загрузи план'); return }
-  if (!selectedColliderIds.size) { alert('Выбери хотя бы один коллайдер в списке слева'); return }
-
-  const savePath = await ipcRenderer.invoke('save-dialog', 'план_экспорт.jpg')
-  if (!savePath) return
-
-  // ── Target canvas: 4:3 at source resolution ────────────
-  const srcW = currentImageEl.naturalWidth
-  const srcH = currentImageEl.naturalHeight
-
-  // Pick output resolution: fit source image into 4:3 with letterbox, cap at 4000px wide
-  const TARGET_RATIO = 4 / 3
-  let outW, outH
-  if (srcW / srcH >= TARGET_RATIO) {
-    // Source is wider than 4:3 → pad top/bottom
-    outW = Math.min(srcW, 4000)
-    outH = Math.round(outW / TARGET_RATIO)
-  } else {
-    // Source is taller → pad left/right
-    outH = Math.min(srcH, Math.round(4000 / TARGET_RATIO))
-    outW = Math.round(outH * TARGET_RATIO)
-  }
-
-  // Scale to fit source into output
-  const scale  = Math.min(outW / srcW, outH / srcH)
-  const drawW  = Math.round(srcW * scale)
-  const drawH  = Math.round(srcH * scale)
-  const drawX  = Math.round((outW - drawW) / 2)
-  const drawY  = Math.round((outH - drawH) / 2)
-
-  const off = document.createElement('canvas')
-  off.width = outW; off.height = outH
-  const c = off.getContext('2d')
-
-  // White background
-  c.fillStyle = '#ffffff'
-  c.fillRect(0, 0, outW, outH)
-
-  // Draw floor plan (B&W if available)
-  c.drawImage(currentImageBW || currentImageEl, drawX, drawY, drawW, drawH)
-
-  // Draw ALL recognised rooms (lightly, same style as combined export)
-  rooms.forEach(room => {
-    if (!room.polygon?.length) return
-    c.beginPath()
-    c.moveTo(drawX + room.polygon[0][0]*scale, drawY + room.polygon[0][1]*scale)
-    room.polygon.slice(1).forEach(([x,y]) => c.lineTo(drawX + x*scale, drawY + y*scale))
-    c.closePath()
-    c.globalAlpha = ROOM_ALPHA; c.fillStyle = ROOM_COLOR; c.fill()
-    c.globalAlpha = 1; c.strokeStyle = STROKE_COLOR; c.lineWidth = Math.max(1, STROKE_WIDTH * scale); c.stroke()
-    const cx = drawX + room.polygon.reduce((s,p)=>s+p[0],0) / room.polygon.length * scale
-    const cy = drawY + room.polygon.reduce((s,p)=>s+p[1],0) / room.polygon.length * scale
-    const fs = Math.max(10, Math.min(18, Math.round(outW / 80)))
-    c.font = `600 ${fs}px -apple-system, sans-serif`
-    c.textAlign = 'center'; c.textBaseline = 'middle'
-    const tw = c.measureText(room.label).width + 10
-    c.fillStyle = 'rgba(255,255,255,0.92)'; c.fillRect(cx-tw/2, cy-fs*0.7, tw, fs*1.4)
-    c.fillStyle = '#1d1d1f'; c.fillText(room.label, cx, cy)
-  })
-
-  // Draw selected colliders prominently
-  const selectedCols = colliders.filter(col => selectedColliderIds.has(col.id))
-  selectedCols.forEach((col, idx) => {
-    const pts = col.polygon.map(([x,y]) => [drawX + x*scale, drawY + y*scale])
-    c.beginPath()
-    c.moveTo(pts[0][0], pts[0][1])
-    pts.slice(1).forEach(([x,y]) => c.lineTo(x, y))
-    c.closePath()
-    c.globalAlpha = 0.22; c.fillStyle = '#ff3030'; c.fill()
-    c.globalAlpha = 1
-    c.setLineDash([6, 5])
-    c.strokeStyle = '#c8322f'; c.lineWidth = Math.max(1.5, 2 * scale); c.stroke()
-    c.setLineDash([])
-    // Label: «Зона N»
-    const lcx = pts.reduce((s,p)=>s+p[0],0) / pts.length
-    const lcy = pts.reduce((s,p)=>s+p[1],0) / pts.length
-    const lfs = Math.max(11, Math.min(16, Math.round(outW / 90)))
-    c.font = `700 ${lfs}px -apple-system, sans-serif`
-    c.textAlign = 'center'; c.textBaseline = 'middle'
-    const ltw = c.measureText(`⊘ Зона ${idx+1}`).width + 12
-    c.fillStyle = 'rgba(255,240,240,0.88)'; c.fillRect(lcx-ltw/2, lcy-lfs*0.8, ltw, lfs*1.6)
-    c.fillStyle = '#c8322f'; c.fillText(`⊘ Зона ${idx+1}`, lcx, lcy)
-  })
-
-  c.globalAlpha = 1
-
-  // ── Encode JPEG ≤ 5 MB ─────────────────────────────────
-  const MAX_BYTES = 5 * 1024 * 1024
-  let quality = 0.92
-  let dataUrl, buf
-  // Binary search for quality that fits under 5 MB
-  let lo = 0.40, hi = 0.95
-  for (let iter = 0; iter < 10; iter++) {
-    quality = (lo + hi) / 2
-    dataUrl  = off.toDataURL('image/jpeg', quality)
-    buf      = Buffer.from(dataUrl.split(',')[1], 'base64')
-    if (buf.length <= MAX_BYTES) { lo = quality }
-    else                         { hi = quality }
-    if (hi - lo < 0.01) break
-  }
-  // Final encode at lo (largest quality that fits)
-  dataUrl = off.toDataURL('image/jpeg', lo)
-  buf     = Buffer.from(dataUrl.split(',')[1], 'base64')
-
-  // Ensure .jpg extension
-  const base = savePath.replace(/\.(png|PNG|jpg|JPG|jpeg|JPEG)$/, '')
-  const finalPath = base + '.jpg'
-  fs.writeFileSync(finalPath, buf)
-
-  alert(`Экспортировано: ${selectedCols.length} коллайдер(а)\nРазмер: ${outW}×${outH} px (4:3)\nФайл: ${(buf.length/1024/1024).toFixed(2)} МБ (quality=${(lo*100).toFixed(0)}%)`)
 }
 
 function imageHash() {

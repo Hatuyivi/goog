@@ -161,20 +161,6 @@
   #planCanvas.mode-delete { cursor: not-allowed; }
   #planCanvas.mode-collider { cursor: crosshair; }
 
-  /* collider list */
-  .colliders-list { display: flex; flex-direction: column; gap: 4px; }
-  .collider-item {
-    display: flex; align-items: center; gap: 6px; padding: 5px 8px;
-    border-radius: 7px; font-size: 11px; background: #fff0f0;
-    border: 1.5px solid transparent; cursor: pointer; transition: all .12s;
-  }
-  .collider-item:hover { background: #ffe0e0; }
-  .collider-item.selected { border-color: #c8322f; background: #ffe8e8; }
-  .collider-item input[type=checkbox] { accent-color: #c8322f; flex-shrink: 0; cursor: pointer; }
-  .collider-item .col-icon { font-size: 13px; flex-shrink: 0; }
-  .collider-item .col-label { flex: 1; color: #c8322f; font-weight: 600; }
-  .collider-item .col-size { font-size: 10px; color: #aaa; font-variant-numeric: tabular-nums; }
-
   .edit-toolbar {
     display: none; align-items: center; padding: 0 10px; gap: 6px;
     height: 34px; background: #f5f5f7; border-top: 1px solid #e0e0e5; flex-shrink: 0;
@@ -189,20 +175,13 @@
   .emode-btn:hover:not(.active) { background: #d8d8dd; }
   .emode-btn.active { background: #007aff; color: #fff; }
   .emode-btn.danger.active { background: #ff3b30; color: #fff; }
-  .emode-btn.collider.active { background: #c8322f; color: #fff; }
-  .emode-btn.collider-clear { color: #c8322f; }
+  .emode-btn.collider.active { background: #007aff; color: #fff; }
   .training-badge {
     margin-left: auto; font-size: 10px; color: #34c759; font-weight: 600;
     background: #f0fff4; border: 1px solid #c3f0cd; border-radius: 5px;
     padding: 2px 7px; display: none;
   }
   .training-badge.visible { display: block; }
-  .collider-badge {
-    font-size: 10px; color: #c8322f; font-weight: 600;
-    background: #fff0f0; border: 1px solid #f0c0c0; border-radius: 5px;
-    padding: 2px 7px; display: none;
-  }
-  .collider-badge.visible { display: block; }
   .canvas-placeholder { display: flex; flex-direction: column; align-items: center; gap: 10px; color: #aaa; }
   .canvas-placeholder .big-icon { font-size: 56px; }
   .canvas-placeholder p { font-size: 13px; }
@@ -321,16 +300,6 @@
           <div class="rooms-empty" id="roomsEmpty">Загрузи план и нажми «Распознать»</div>
         </div>
 
-        <!-- Colliders list (shown when colliders exist) -->
-        <div id="collidersSection" style="display:none">
-          <hr style="margin: 4px 0; border-color: #f0c0c0;">
-          <div class="section-label" style="color:#c8322f; margin-bottom:4px;">⊘ Коллайдеры</div>
-          <div class="colliders-list" id="collidersList"></div>
-          <div style="display:flex; gap:5px; margin-top:5px;">
-            <button class="btn btn-secondary" style="font-size:11px; padding:4px 0;" onclick="selectAllColliders()">Выбрать все</button>
-            <button class="btn btn-secondary" style="font-size:11px; padding:4px 0;" onclick="deselectAllColliders()">Снять всё</button>
-          </div>
-        </div>
 
       </div>
     </div>
@@ -349,12 +318,10 @@
         <button class="emode-btn active" id="emodeView"     onclick="setEditMode('view')">👁 Просмотр</button>
         <button class="emode-btn"        id="emodeEdit"     onclick="setEditMode('edit')">✏️ Редактировать</button>
         <button class="emode-btn danger" id="emodeDelete"   onclick="setEditMode('delete')">🗑 Удалить</button>
-        <button class="emode-btn collider" id="emodeCollider" onclick="setEditMode('collider')" title="Нарисуй зону исключения — помещения внутри неё будут скрыты. Коллайдеры не попадают в обучающие данные.">⊘ Коллайдер</button>
+        <button class="emode-btn collider" id="emodeDraw" onclick="setEditMode('collider')" title="Нарисуй прямоугольное помещение на плане">✚ Помещение</button>
         <div class="et-sep"></div>
         <button class="emode-btn" onclick="saveEdits()" id="saveEditsBtn" style="display:none">💾 Сохранить правки</button>
-        <button class="emode-btn collider-clear" id="colliderClearBtn" onclick="clearColliders()" title="Удалить все коллайдеры" style="display:none">✕ Сбросить ⊘</button>
         <span class="training-badge" id="trainingBadge">✦ обучено</span>
-        <span class="collider-badge" id="colliderBadge"></span>
       </div>
 
       <div class="canvas-wrap">
@@ -375,7 +342,6 @@
         <div class="stats">Помещений: <strong id="roomCount">0</strong></div>
         <button class="btn btn-secondary" onclick="saveSelected()">💾 Выбранное</button>
         <button class="btn btn-primary"   onclick="saveAll()">💾 Все</button>
-        <button class="btn btn-export"    id="exportWithCollidersBtn" onclick="exportWithColliders()" style="display:none" title="Экспорт плана 4:3 с выбранными коллайдерами, до 5 МБ">📐 Экспорт 4:3</button>
       </div>
     </div>
 
