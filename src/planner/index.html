@@ -153,12 +153,25 @@
   .view-btn.active { background: #007aff; color: #fff; }
   .view-btn:hover:not(.active) { background: #d8d8dd; }
 
+  /* zoom controls */
+  .zoom-group { display: flex; align-items: center; gap: 3px; margin-left: 6px; border-left: 1px solid #e0e0e5; padding-left: 8px; }
+  .zoom-btn {
+    width: 26px; height: 26px; border: none; border-radius: 5px; background: #e8e8ed;
+    color: #555; font-size: 15px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: all .12s; padding: 0; line-height: 1;
+  }
+  .zoom-btn:hover { background: #007aff; color: #fff; }
+  .zoom-label { font-size: 11px; font-weight: 600; color: #555; min-width: 36px; text-align: center; font-variant-numeric: tabular-nums; }
+
   .canvas-wrap {
-    flex: 1; overflow: auto; display: flex; align-items: center; justify-content: center; padding: 16px;
+    flex: 1; overflow: hidden; display: flex; align-items: center; justify-content: center; padding: 16px;
+    position: relative; cursor: default;
   }
   #planCanvas {
     border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,.15);
     max-width: 100%; max-height: 100%; display: none; cursor: default;
+    transition: transform 0.05s ease-out;
+    will-change: transform;
   }
   #planCanvas.mode-edit   { cursor: crosshair; }
   #planCanvas.mode-delete { cursor: not-allowed; }
@@ -408,6 +421,13 @@
         <span class="view-label" id="viewLabel">Загрузи план слева</span>
         <button class="view-btn active" id="viewAll"      onclick="setView('all')"      style="display:none">Все</button>
         <button class="view-btn"        id="viewSelected" onclick="setView('selected')" style="display:none">Выбранное</button>
+        <!-- Zoom controls -->
+        <div class="zoom-group">
+          <button class="zoom-btn" onclick="zoomOut()" title="Отдалить (Ctrl −)">−</button>
+          <span class="zoom-label" id="zoomLabel">100%</span>
+          <button class="zoom-btn" onclick="zoomIn()"  title="Приблизить (Ctrl +)">+</button>
+          <button class="zoom-btn" onclick="resetZoom()" title="Сбросить масштаб (Ctrl 0)" style="font-size:11px;width:auto;padding:0 7px;">⊙</button>
+        </div>
       </div>
 
       <!-- Edit mode toolbar (visible after recognition) -->
@@ -420,6 +440,7 @@
         <button class="emode-btn eraser"   id="emodeEraser" onclick="setEditMode('eraser')" title="Белый ластик — стирает фон (колесо мыши меняет размер)">◯ Ластик <span id="eraserSizeVal">30</span>px</button>
         <div class="et-sep"></div>
         <button class="emode-btn" onclick="undo()" id="undoBtn" disabled title="Отменить последнее действие (Ctrl+Z)">↩ Шаг назад</button>
+        <button class="emode-btn" style="background:#e8e8ed;color:#555;" onclick="togglePolygons()" id="togglePolygonsBtn" title="Показать / скрыть полигоны помещений">🔲 Скрыть полигоны</button>
         <button class="emode-btn" onclick="saveEdits()" id="saveEditsBtn" style="display:none">💾 Сохранить правки</button>
         <span class="training-badge" id="trainingBadge">✦ обучено</span>
       </div>

@@ -29,12 +29,23 @@ let trainingCount    = 0        // cached count of saved training samples
 // ── Undo history ───────────────────────────────────────────
 const MAX_UNDO       = 30
 let undoStack        = []       // each entry: deep copy of rooms array
+let showPolygons     = true     // toggle polygon visibility in app
 
 // ── Eraser state ───────────────────────────────────────────
 let eraserStrokes    = []       // array of strokes; each stroke = array of {x,y,r} in image coords
 let eraserActive     = false    // currently drawing eraser stroke
 let eraserCurrentStroke = []
 let eraserSize       = 30       // radius in image px
+
+// ── Zoom / Pan state ───────────────────────────────────────
+let zoomLevel        = 1.0      // current zoom multiplier (1 = fit view)
+let panX             = 0        // pan offset in screen px
+let panY             = 0        // pan offset in screen px
+let isPanning        = false    // is user currently panning (middle-btn drag)
+let panStart         = null     // {x, y, panX, panY}
+const ZOOM_MIN       = 0.5
+const ZOOM_MAX       = 8.0
+const ZOOM_STEP      = 0.15
 
 // ── Room drawing state ──────────────────────────────────────
 // Users can draw rectangular rooms manually on the canvas.
@@ -179,6 +190,7 @@ function loadFile(filePath) {
       canvas.style.display = 'block'
       canvasPlaceholder.style.display = 'none'
       viewLabel.textContent = 'Нажми «Распознать помещения»'
+      resetZoom()
     }
     img.src = `data:${currentMime};base64,${currentImageB64}`
   } catch(e) { alert('Ошибка загрузки: ' + e.message) }
@@ -411,6 +423,7 @@ function drawPlan() {
   }
 
   rooms.forEach(room => {
+    if (!showPolygons) return
     if (!room.polygon || room.polygon.length < 3) return
     const isSelected = room.id === selectedRoomId
     const show = currentView === 'all' || isSelected
@@ -447,7 +460,7 @@ function drawPlan() {
   })
 
   // Draw vertices in edit mode
-  if (editMode === 'edit') {
+  if (editMode === 'edit' && showPolygons) {
     for (const room of rooms) {
       if (!room.polygon) continue
       if (currentView === 'selected' && room.id !== selectedRoomId) continue
@@ -874,15 +887,50 @@ function deepCopyRooms(src) {
   return src.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) }))
 }
 
+function snapshotBW() {
+  if (!currentImageBW) return null
+  const snap = document.createElement('canvas')
+  snap.width = currentImageBW.width
+  snap.height = currentImageBW.height
+  snap.getContext('2d').drawImage(currentImageBW, 0, 0)
+  return snap
+}
+
 function pushUndo() {
-  undoStack.push(deepCopyRooms(rooms))
+  // Deep-copy eraserStrokes: each stroke is an array of {x,y,r} objects
+  const eraserSnap = eraserStrokes.map(stroke => stroke.map(pt => ({ ...pt })))
+  undoStack.push({ rooms: deepCopyRooms(rooms), bw: snapshotBW(), eraserStrokes: eraserSnap })
   if (undoStack.length > MAX_UNDO) undoStack.shift()
   if (undoBtn) undoBtn.disabled = false
 }
 
+function togglePolygons() {
+  showPolygons = !showPolygons
+  const btn = document.getElementById('togglePolygonsBtn')
+  if (btn) {
+    if (showPolygons) {
+      btn.textContent = '🔲 Скрыть полигоны'
+      btn.style.background = '#e8e8ed'
+      btn.style.color = '#555'
+    } else {
+      btn.textContent = '🔳 Показать полигоны'
+      btn.style.background = '#ff9500'
+      btn.style.color = '#fff'
+    }
+  }
+  drawPlan()
+}
+
 function undo() {
-  if (!undoStack.length) return
-  rooms = undoStack.pop()
+  const entry = undoStack.pop()
+  rooms = entry.rooms
+  // Restore eraser strokes snapshot so rebuildBWCanvas won't re-apply removed strokes
+  if (entry.eraserStrokes !== undefined) {
+    eraserStrokes = entry.eraserStrokes
+  }
+  if (entry.bw && currentImageBW) {
+    currentImageBW.getContext('2d').drawImage(entry.bw, 0, 0)
+  }
   if (undoBtn) undoBtn.disabled = undoStack.length === 0
   buildRoomList()
   drawPlan()
@@ -931,12 +979,52 @@ function getCanvasXY(e) {
   ]
 }
 
+// ── Zoom helpers ───────────────────────────────────────────
+function applyZoomTransform() {
+  canvas.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`
+  canvas.style.transformOrigin = '50% 50%'
+  updateZoomLabel()
+}
+
+function updateZoomLabel() {
+  const lbl = document.getElementById('zoomLabel')
+  if (lbl) lbl.textContent = Math.round(zoomLevel * 100) + '%'
+}
+
+function zoomBy(delta, originX, originY) {
+  // originX/Y are screen coords relative to canvas-wrap centre
+  const wrap = document.querySelector('.canvas-wrap')
+  const wRect = wrap.getBoundingClientRect()
+  // point in canvas space before zoom
+  const ox = originX !== undefined ? originX - wRect.left - wRect.width / 2 : 0
+  const oy = originY !== undefined ? originY - wRect.top  - wRect.height / 2 : 0
+
+  const oldZoom = zoomLevel
+  zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel * (1 + delta)))
+
+  // Adjust pan so the point under cursor stays fixed
+  const ratio = zoomLevel / oldZoom
+  panX = ox + (panX - ox) * ratio
+  panY = oy + (panY - oy) * ratio
+
+  applyZoomTransform()
+}
+
+function resetZoom() {
+  zoomLevel = 1.0; panX = 0; panY = 0
+  applyZoomTransform()
+}
+
+function zoomIn()  { zoomBy(ZOOM_STEP) }
+function zoomOut() { zoomBy(-ZOOM_STEP) }
+
 canvas.addEventListener('mousedown', e => {
   if (!currentImageEl) return
   const [cx, cy] = getCanvasXY(e)
 
   // ── Eraser ─────────────────────────────────────────────
   if (editMode === 'eraser') {
+    pushUndo()
     eraserActive = true
     eraserCurrentStroke = []
     eraserStrokes.push(eraserCurrentStroke)
@@ -1531,8 +1619,10 @@ function makeRoomCanvas(room) {
     c.moveTo(room.polygon[0][0], room.polygon[0][1])
     room.polygon.slice(1).forEach(([x,y]) => c.lineTo(x, y))
     c.closePath()
-    c.globalAlpha = ROOM_ALPHA; c.fillStyle = ROOM_COLOR; c.fill()
-    c.globalAlpha = 1; c.strokeStyle = 'rgba(30,120,60,0.9)'; c.lineWidth = 3; c.stroke()
+    c.globalAlpha = ROOM_ALPHA; c.fillStyle = ROOM_COLOR
+    c.strokeStyle = 'transparent'; c.lineWidth = 0
+    c.fill()
+    c.globalAlpha = 1
   }
   return off
 }
@@ -1543,6 +1633,7 @@ function makeMultiRoomCanvas(roomList) {
   const off = document.createElement('canvas'); off.width = w; off.height = h
   const c = off.getContext('2d')
   c.drawImage(currentImageBW || currentImageEl, 0, 0)
+  c.strokeStyle = 'transparent'; c.lineWidth = 0
   roomList.forEach(room => {
     if (!room.polygon?.length) return
     c.beginPath()
@@ -1550,8 +1641,8 @@ function makeMultiRoomCanvas(roomList) {
     room.polygon.slice(1).forEach(([x,y]) => c.lineTo(x, y))
     c.closePath()
     c.globalAlpha = ROOM_ALPHA; c.fillStyle = ROOM_COLOR; c.fill()
-    c.globalAlpha = 1; c.strokeStyle = STROKE_COLOR; c.lineWidth = STROKE_WIDTH; c.stroke()
   })
+  c.globalAlpha = 1
   return off
 }
 
@@ -1560,6 +1651,7 @@ function makeCombinedCanvas() {
   const off = document.createElement('canvas'); off.width = w; off.height = h
   const c = off.getContext('2d')
   c.drawImage(currentImageBW || currentImageEl, 0, 0)
+  c.strokeStyle = 'transparent'; c.lineWidth = 0
   rooms.forEach(room => {
     if (!room.polygon?.length) return
     c.beginPath()
@@ -1567,8 +1659,8 @@ function makeCombinedCanvas() {
     room.polygon.slice(1).forEach(([x,y]) => c.lineTo(x,y))
     c.closePath()
     c.globalAlpha = ROOM_ALPHA; c.fillStyle = ROOM_COLOR; c.fill()
-    c.globalAlpha = 1; c.strokeStyle = STROKE_COLOR; c.lineWidth = STROKE_WIDTH; c.stroke()
   })
+  c.globalAlpha = 1
   return off
 }
 
@@ -1591,19 +1683,75 @@ function showProgress(text, step) {
 function setProgressStep(s) { progressStep.textContent = s }
 function hideProgress() { progressOverlay.classList.remove('visible') }
 
-// ── Eraser wheel: change size ──────────────────────────────
-canvas.addEventListener('wheel', e => {
-  if (editMode !== 'eraser') return
+// ── Mouse wheel: zoom canvas or change eraser size ─────────
+document.querySelector('.canvas-wrap').addEventListener('wheel', e => {
   e.preventDefault()
-  eraserSize = Math.max(5, Math.min(150, eraserSize - Math.sign(e.deltaY) * 3))
-  const sizeEl = document.getElementById('eraserSizeVal')
-  if (sizeEl) sizeEl.textContent = eraserSize
-  const sizeEl2 = document.getElementById('eraserSizeVal2')
-  if (sizeEl2) sizeEl2.textContent = eraserSize
-  const slider = document.getElementById('eraserSizeSlider')
-  if (slider) slider.value = eraserSize
-  drawPlan()
+  if (editMode === 'eraser') {
+    // In eraser mode: wheel changes eraser size
+    eraserSize = Math.max(5, Math.min(150, eraserSize - Math.sign(e.deltaY) * 3))
+    const sizeEl = document.getElementById('eraserSizeVal')
+    if (sizeEl) sizeEl.textContent = eraserSize
+    const sizeEl2 = document.getElementById('eraserSizeVal2')
+    if (sizeEl2) sizeEl2.textContent = eraserSize
+    const slider = document.getElementById('eraserSizeSlider')
+    if (slider) slider.value = eraserSize
+    drawPlan()
+  } else {
+    // Normal mode: wheel zooms, centred on cursor
+    const delta = e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP
+    zoomBy(delta, e.clientX, e.clientY)
+  }
 }, { passive: false })
+
+// ── Touch pinch-to-zoom ────────────────────────────────────
+let _lastPinchDist = null
+document.querySelector('.canvas-wrap').addEventListener('touchstart', e => {
+  if (e.touches.length === 2) { _lastPinchDist = null }
+}, { passive: true })
+document.querySelector('.canvas-wrap').addEventListener('touchmove', e => {
+  if (e.touches.length !== 2) return
+  e.preventDefault()
+  const dx = e.touches[0].clientX - e.touches[1].clientX
+  const dy = e.touches[0].clientY - e.touches[1].clientY
+  const dist = Math.sqrt(dx*dx + dy*dy)
+  if (_lastPinchDist !== null) {
+    const ratio = dist / _lastPinchDist
+    const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2
+    const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2
+    const delta = ratio - 1
+    zoomBy(delta, cx, cy)
+  }
+  _lastPinchDist = dist
+}, { passive: false })
+document.querySelector('.canvas-wrap').addEventListener('touchend', () => { _lastPinchDist = null })
+
+// Trackpad pinch via gesturechange (Safari/Electron WebKit)
+document.querySelector('.canvas-wrap').addEventListener('gesturestart', e => e.preventDefault(), { passive: false })
+document.querySelector('.canvas-wrap').addEventListener('gesturechange', e => {
+  e.preventDefault()
+  const delta = (e.scale - 1) * 0.08
+  zoomBy(delta)
+}, { passive: false })
+document.querySelector('.canvas-wrap').addEventListener('mousedown', e => {
+  if (e.button === 1 || (e.button === 0 && e.altKey)) {
+    e.preventDefault()
+    isPanning = true
+    panStart = { x: e.clientX, y: e.clientY, panX, panY }
+    document.querySelector('.canvas-wrap').style.cursor = 'grab'
+  }
+})
+window.addEventListener('mousemove', e => {
+  if (!isPanning || !panStart) return
+  panX = panStart.panX + (e.clientX - panStart.x)
+  panY = panStart.panY + (e.clientY - panStart.y)
+  applyZoomTransform()
+})
+window.addEventListener('mouseup', e => {
+  if (isPanning) {
+    isPanning = false; panStart = null
+    document.querySelector('.canvas-wrap').style.cursor = ''
+  }
+})
 
 // Clear all eraser strokes and rebuild BW canvas
 function clearEraserStrokes() {
@@ -1625,6 +1773,12 @@ function applyBasicAdj(key, val) {
 document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
     if (undoStack.length) { e.preventDefault(); undo() }
+  }
+  // Zoom shortcuts: Ctrl/Cmd + = / + / - / 0
+  if (e.ctrlKey || e.metaKey) {
+    if (e.key === '=' || e.key === '+') { e.preventDefault(); zoomIn() }
+    if (e.key === '-')                  { e.preventDefault(); zoomOut() }
+    if (e.key === '0')                  { e.preventDefault(); resetZoom() }
   }
 })
 init()
