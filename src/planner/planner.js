@@ -30,6 +30,7 @@ let trainingCount    = 0        // cached count of saved training samples
 const MAX_UNDO       = 30
 let undoStack        = []       // each entry: deep copy of rooms array
 let showPolygons     = true     // toggle polygon visibility in app
+let showBWBackground = false    // show B&W processed image as background (vs original)
 
 // ── Eraser state ───────────────────────────────────────────
 let eraserStrokes    = []       // array of strokes; each stroke = array of {x,y,r} in image coords
@@ -415,12 +416,12 @@ function drawPlan() {
   const sx = canvas.width  / currentImageEl.naturalWidth
   const sy = canvas.height / currentImageEl.naturalHeight
 
-  if (rooms.length && currentImageBW) {
-    ctx.drawImage(currentImageBW, 0, 0, canvas.width, canvas.height)
-  } else {
-    ctx.drawImage(currentImageEl, 0, 0, canvas.width, canvas.height)
-    return
-  }
+  // After analysis: show original colour image as background, BW only if user toggled it
+  const bgImage = (rooms.length && currentImageBW && showBWBackground)
+    ? currentImageBW
+    : currentImageEl
+  ctx.drawImage(bgImage, 0, 0, canvas.width, canvas.height)
+  if (!rooms.length) return
 
   rooms.forEach(room => {
     if (!showPolygons) return
@@ -727,6 +728,34 @@ function computeLocalLearning(trainingData) {
   }
 }
 
+
+// ── МОП-фильтр: учится на удалённых помещениях с низкой компактностью ─────
+function computeMopFilter(trainingData) {
+  const localSamples = trainingData.filter(s => !s.mode || s.mode === 'local')
+  if (!localSamples.length) return null
+  const deletedCompactness = [], keptCompactness = [], keptAspect = []
+  for (const sample of localSamples) {
+    const deletedSet = new Set(sample.deletedIds || [])
+    const allRooms = [...(sample.original || []), ...(sample.edited || [])]
+    for (const r of allRooms) {
+      const c = r.compactness, a = r.aspect
+      if (typeof c !== 'number') continue
+      if (deletedSet.has(r.id)) { deletedCompactness.push(c) }
+      else { keptCompactness.push(c); if (typeof a === 'number') keptAspect.push(a) }
+    }
+  }
+  if (!keptCompactness.length) return null
+  keptCompactness.sort((a, b) => a - b)
+  const minKeptC = keptCompactness[Math.floor(keptCompactness.length * 0.10)]
+  const avgDel = deletedCompactness.length ? deletedCompactness.reduce((s,v)=>s+v,0)/deletedCompactness.length : null
+  const hasSignal = avgDel !== null && avgDel < minKeptC * 0.85
+  const compactnessThresh = Math.max(0.05, Math.min(0.32, minKeptC * 0.72))
+  keptAspect.sort((a, b) => a - b)
+  const maxKeptAspect = keptAspect.length ? keptAspect[Math.min(keptAspect.length-1, Math.floor(keptAspect.length*0.95))] : 5
+  const aspectThresh = Math.max(3.5, Math.min(9, maxKeptAspect * 1.35))
+  return { compactnessThresh, aspectThresh, hasSignal, sampleCount: localSamples.length }
+}
+
 async function analyseLocal() {
   showProgress('Локальный анализ…', 'Загрузка данных обучения')
   await tick()
@@ -783,14 +812,56 @@ async function analyseLocal() {
 
   if (!rooms.length) throw new Error('Помещения не найдены. Попробуй уменьшить «Мин. площадь» или включить «Утолщение стен».')
 
+  // ── Функция 3: МОП-фильтр ─────────────────────────────
+  // Убирает коридоры/холлы/лестничные клетки (места общего пользования).
+  // Базовые пороги применяются всегда; уточняются по обучению.
+  const mopFilter = computeMopFilter(trainingData)
+  let mopFilteredCount = 0
+
+  // Базовый хардкод-порог: compactness < 0.08 — явный МОП (очень вытянутый)
+  // Обучение сдвигает порог вверх если пользователь удаляет более «квадратные» МОПы
+  const BASE_COMPACT_THRESH = 0.08
+  const BASE_ASPECT_THRESH  = 6.0
+
+  const compactThresh = mopFilter && mopFilter.hasSignal
+    ? Math.max(BASE_COMPACT_THRESH, mopFilter.compactnessThresh)
+    : BASE_COMPACT_THRESH
+  const aspectThresh = mopFilter && mopFilter.hasSignal
+    ? Math.max(BASE_ASPECT_THRESH, mopFilter.aspectThresh)
+    : BASE_ASPECT_THRESH
+
+  {
+    const before = rooms.length
+    rooms = rooms.filter(r => {
+      const c = r.compactness, a = r.aspect
+      // Нет данных — не трогаем (нарисованные вручную комнаты)
+      if (typeof c !== 'number' || typeof a !== 'number') return true
+      // Вытянутый коридор по aspect (независимо от compactness)
+      if (a > aspectThresh) return false
+      // Очень низкая компактность — МОП
+      if (c < compactThresh) return false
+      return true
+    })
+    mopFilteredCount = before - rooms.length
+  }
+
+  // Merge any overlapping auto-detected rooms
+  const beforeMerge = rooms.length
+  rooms = mergeOverlappingRooms(rooms)
+  // Re-number labels if any were merged
+  if (rooms.length < beforeMerge) {
+    rooms.forEach((r, i) => { r.id = `r${i+1}`; r.label = `Помещение ${i+1}` })
+  }
+
   finishAnalysis()
 
   // Показываем информацию об активном обучении в строке статуса
-  if (learned) {
-    const accNote    = learned.filterAccuracy !== null ? `, точность ${learned.filterAccuracy}%` : ''
+  if (learned || mopFilteredCount > 0) {
+    const accNote    = learned && learned.filterAccuracy !== null ? `, точность ${learned.filterAccuracy}%` : ''
     const filterNote = filteredCount > 0 ? ` · −${filteredCount} отф.` : ''
-    const addedNote  = learned.addedCount  > 0 ? ` · +${learned.addedCount} доб.` : ''
-    viewLabel.textContent += ` · ✦ обучение: ${learned.sampleCount} образц.${filterNote}${addedNote}${accNote}`
+    const addedNote  = learned && learned.addedCount > 0 ? ` · +${learned.addedCount} доб.` : ''
+    const mopNote    = mopFilteredCount > 0 ? ` · −${mopFilteredCount} МОП` : ''
+    viewLabel.textContent += ` · ✦ обучение: ${(learned || mopFilter)?.sampleCount || 0} образц.${filterNote}${mopNote}${addedNote}${accNote}`
   }
 }
 
@@ -921,6 +992,15 @@ function togglePolygons() {
   drawPlan()
 }
 
+
+function toggleBWBackground() {
+  showBWBackground = !showBWBackground
+  const btn = document.getElementById('toggleBWBtn')
+  if (btn) {
+    btn.textContent = showBWBackground ? '🎨 Цветной фон' : '⬛ Ч/Б фон'
+  }
+  drawPlan()
+}
 function undo() {
   const entry = undoStack.pop()
   rooms = entry.rooms
@@ -1196,9 +1276,21 @@ canvas.addEventListener('mouseup', e => {
         drawn:   true,
       }
       rooms.push(newRoom)
+
+      // Merge with any existing rooms that overlap the newly drawn one
+      const beforeLen = rooms.length
+      rooms = mergeOverlappingRooms(rooms)
+      let mergedRoomId = newRoom.id
+      if (rooms.length < beforeLen) {
+        // Some merges happened — find the room that now contains our new polygon area
+        rooms.forEach((r, i) => { r.id = r.id || `r${i+1}`; r.label = r.label || `Помещение ${i+1}` })
+        // The last room in result that isn't from original set = merged result
+        mergedRoomId = rooms[rooms.length - 1].id
+      }
+
       markEdited()
       buildRoomList()
-      selectRoom(newRoom.id)
+      selectRoom(mergedRoomId)
     }
     drawPlan()
     return
@@ -1295,13 +1387,113 @@ async function detectRoomsLocal(imageEl, opts) {
   work.width = W; work.height = H
   const wctx = work.getContext('2d')
   wctx.drawImage(imageEl, 0, 0, W, H)
-  const px = wctx.getImageData(0, 0, W, H).data
+  const rawPx = wctx.getImageData(0, 0, W, H)
+  const px = rawPx.data
 
-  // Grayscale
+  // ── Detect if image is colourful (needs special BW conversion) ────────────
+  // Check average saturation to decide if colour-aware processing helps
+  let totalSat = 0
+  for (let i = 0; i < px.length; i += 4) {
+    const r = px[i], g = px[i+1], b = px[i+2]
+    const cMax = Math.max(r, g, b), cMin = Math.min(r, g, b)
+    totalSat += cMax > 0 ? (cMax - cMin) / cMax : 0
+  }
+  const avgSat = totalSat / (px.length / 4)
+  const isColourful = avgSat > 0.18  // coloured floor plan rooms
+
+  // ── Build enhanced grayscale for detection ────────────────────────────────
+  // For colourful plans: use luminance + colour-contrast boosting so that
+  // coloured room fills become distinct from dark wall lines.
+  // Strategy: walls are typically dark/desaturated; room fills are bright/saturated.
+  // We push saturated bright pixels toward white and keep dark pixels dark.
   const gray = new Uint8Array(W * H)
   for (let i = 0, j = 0; i < px.length; i += 4, j++) {
-    gray[j] = (px[i] * 0.299 + px[i+1] * 0.587 + px[i+2] * 0.114) | 0
+    const r = px[i], g = px[i+1], b = px[i+2]
+    if (isColourful) {
+      const cMax = Math.max(r, g, b), cMin = Math.min(r, g, b)
+      const lum = (0.299 * r + 0.587 * g + 0.114 * b)
+      const sat = cMax > 0 ? (cMax - cMin) / cMax : 0
+      // Bright saturated pixels (room fill) → push toward white
+      // Dark or desaturated pixels (walls, text) → keep dark
+      const boost = sat * (lum / 255) * 120
+      gray[j] = Math.min(255, (lum + boost) | 0)
+    } else {
+      gray[j] = (r * 0.299 + g * 0.587 + b * 0.114) | 0
+    }
   }
+
+  // ── CLAHE-lite: per-tile histogram equalisation ───────────────────────────
+  // Improves contrast in locally dark/bright regions of scanned plans.
+  // Divide image into tiles, equalise each, bilinear-blend at tile borders.
+  ;(function applyCLAHE() {
+    const TILE_COLS = 8, TILE_ROWS = 8
+    const CLIP = 3.0  // contrast limit (normalised)
+    const tw = Math.ceil(W / TILE_COLS), th = Math.ceil(H / TILE_ROWS)
+
+    // Build CDF LUT for each tile
+    const luts = []
+    for (let tr = 0; tr < TILE_ROWS; tr++) {
+      luts[tr] = []
+      for (let tc = 0; tc < TILE_COLS; tc++) {
+        const hist = new Uint32Array(256)
+        const x0 = tc * tw, y0 = tr * th
+        const x1 = Math.min(x0 + tw, W), y1 = Math.min(y0 + th, H)
+        let count = 0
+        for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+          hist[gray[y * W + x]]++; count++
+        }
+        // Clip histogram
+        if (count > 0) {
+          const clipLimit = Math.max(1, Math.round(CLIP * count / 256))
+          let excess = 0
+          for (let v = 0; v < 256; v++) {
+            if (hist[v] > clipLimit) { excess += hist[v] - clipLimit; hist[v] = clipLimit }
+          }
+          const add = (excess / 256) | 0
+          for (let v = 0; v < 256; v++) hist[v] += add
+        }
+        // Build CDF → LUT
+        const lut = new Uint8Array(256)
+        let cdf = 0, cdfMin = -1
+        for (let v = 0; v < 256; v++) {
+          cdf += hist[v]
+          if (cdfMin < 0 && hist[v] > 0) cdfMin = cdf
+          lut[v] = count > cdfMin
+            ? Math.round((cdf - cdfMin) / (count - cdfMin) * 255)
+            : v
+        }
+        luts[tr][tc] = lut
+      }
+    }
+
+    // Apply with bilinear interpolation between tile LUTs
+    const out = new Uint8Array(gray.length)
+    for (let y = 0; y < H; y++) {
+      // Tile row fractional position (centre of tile)
+      const fyRaw = (y - th / 2) / th
+      const tr0 = Math.max(0, Math.min(TILE_ROWS - 2, Math.floor(fyRaw)))
+      const tr1 = tr0 + 1
+      const fy  = Math.max(0, Math.min(1, fyRaw - tr0))
+
+      for (let x = 0; x < W; x++) {
+        const fxRaw = (x - tw / 2) / tw
+        const tc0 = Math.max(0, Math.min(TILE_COLS - 2, Math.floor(fxRaw)))
+        const tc1 = tc0 + 1
+        const fx  = Math.max(0, Math.min(1, fxRaw - tc0))
+
+        const v = gray[y * W + x]
+        const v00 = luts[tr0][tc0][v], v01 = luts[tr0][tc1][v]
+        const v10 = luts[tr1][tc0][v], v11 = luts[tr1][tc1][v]
+        out[y * W + x] = (
+          v00 * (1 - fx) * (1 - fy) +
+          v01 *      fx  * (1 - fy) +
+          v10 * (1 - fx) *      fy  +
+          v11 *      fx  *      fy
+        ) | 0
+      }
+    }
+    for (let i = 0; i < gray.length; i++) gray[i] = out[i]
+  })()
 
   const T_global = opts.threshold != null ? opts.threshold : otsu(gray)
 
@@ -1455,11 +1647,22 @@ async function detectRoomsLocal(imageEl, opts) {
       if (poly.length < 4) continue
       const simp = rdp(poly, (opts.epsilon || 2) * scale)
       if (simp.length < 3) continue
+      // Compactness = 4π·Area / Perimeter² (circle=1, corridor→0)
+      let perim = 0
+      for (let k = 0; k < simp.length; k++) {
+        const [x1, y1] = simp[k], [x2, y2] = simp[(k + 1) % simp.length]
+        perim += Math.hypot(x2 - x1, y2 - y1)
+      }
+      const compactness = perim > 0 ? (4 * Math.PI * r.area) / (perim * perim) : 1
+      const bboxW = r.maxX - r.minX + 1, bboxH = r.maxY - r.minY + 1
+      const aspect = Math.max(bboxW, bboxH) / Math.max(1, Math.min(bboxW, bboxH))
       rooms.push({
-        id:      `r${i + 1}`,
-        label:   `Помещение ${i + 1}`,
-        areaPx:  Math.round(r.area * inv * inv),
-        polygon: simp.map(([x, y]) => [Math.round(x * inv), Math.round(y * inv)]),
+        id:          `r${i + 1}`,
+        label:       `Помещение ${i + 1}`,
+        areaPx:      Math.round(r.area * inv * inv),
+        compactness: Math.round(compactness * 100) / 100,
+        aspect,
+        polygon:     simp.map(([x, y]) => [Math.round(x * inv), Math.round(y * inv)]),
       })
     }
     return rooms
@@ -1534,11 +1737,21 @@ async function detectRoomsLocal(imageEl, opts) {
     if (poly.length < 4) continue
     const simp = rdp(poly, (opts.epsilon || 2) * scale)
     if (simp.length < 3) continue
+    let perimL = 0
+    for (let k = 0; k < simp.length; k++) {
+      const [x1, y1] = simp[k], [x2, y2] = simp[(k + 1) % simp.length]
+      perimL += Math.hypot(x2 - x1, y2 - y1)
+    }
+    const compactnessL = perimL > 0 ? (4 * Math.PI * r.area) / (perimL * perimL) : 1
+    const bboxWL = r.maxX - r.minX + 1, bboxHL = r.maxY - r.minY + 1
+    const aspectL = Math.max(bboxWL, bboxHL) / Math.max(1, Math.min(bboxWL, bboxHL))
     roomsL.push({
-      id:      `r${i + 1}`,
-      label:   `Помещение ${i + 1}`,
-      areaPx:  Math.round(r.area * invL * invL),
-      polygon: simp.map(([x, y]) => [Math.round(x * invL), Math.round(y * invL)]),
+      id:          `r${i + 1}`,
+      label:       `Помещение ${i + 1}`,
+      areaPx:      Math.round(r.area * invL * invL),
+      compactness: Math.round(compactnessL * 100) / 100,
+      aspect:      aspectL,
+      polygon:     simp.map(([x, y]) => [Math.round(x * invL), Math.round(y * invL)]),
     })
   }
   return roomsL
@@ -1660,6 +1873,132 @@ function rdp(points, eps) {
   const out = []
   for (let i = 0; i < points.length; i++) if (keep[i]) out.push(points[i])
   return out
+}
+
+// ── Polygon overlap & union helpers ───────────────────────
+
+// Sutherland–Hodgman clip of subjectPolygon against one edge [edgeA→edgeB]
+function clipPolygonByEdge(poly, ax, ay, bx, by) {
+  if (!poly.length) return []
+  const out = []
+  const dx = bx - ax, dy = by - ay
+  function inside(px, py) { return dx * (py - ay) - dy * (px - ax) >= 0 }
+  function intersect(px, py, qx, qy) {
+    const t_num = (ax - px) * (ay - qy) - (ay - py) * (ax - qx)
+    const t_den = (px - qx) * (ay - by) - (py - qy) * (ax - bx)
+    if (t_den === 0) return [px, py]
+    const t = t_num / t_den
+    return [px + t * (qx - px), py + t * (qy - py)]
+  }
+  for (let i = 0; i < poly.length; i++) {
+    const [cx, cy] = poly[i]
+    const [px, py] = poly[(i + poly.length - 1) % poly.length]
+    const cIn = inside(cx, cy), pIn = inside(px, py)
+    if (cIn) {
+      if (!pIn) out.push(intersect(px, py, cx, cy))
+      out.push([cx, cy])
+    } else if (pIn) {
+      out.push(intersect(px, py, cx, cy))
+    }
+  }
+  return out
+}
+
+// Sutherland–Hodgman intersection of two convex-ish polygons
+// Returns the overlapping polygon or []
+function intersectPolygons(p, q) {
+  let clipped = p.slice()
+  for (let i = 0; i < q.length; i++) {
+    if (!clipped.length) return []
+    const [ax, ay] = q[i]
+    const [bx, by] = q[(i + 1) % q.length]
+    clipped = clipPolygonByEdge(clipped, ax, ay, bx, by)
+  }
+  return clipped
+}
+
+function polygonArea(pts) {
+  let a = 0
+  for (let i = 0; i < pts.length; i++) {
+    const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % pts.length]
+    a += x1 * y2 - x2 * y1
+  }
+  return Math.abs(a) / 2
+}
+
+// Axis-aligned bounding boxes overlap?
+function bboxOverlap(a, b) {
+  const axMin = Math.min(...a.map(p => p[0])), axMax = Math.max(...a.map(p => p[0]))
+  const ayMin = Math.min(...a.map(p => p[1])), ayMax = Math.max(...a.map(p => p[1]))
+  const bxMin = Math.min(...b.map(p => p[0])), bxMax = Math.max(...b.map(p => p[0]))
+  const byMin = Math.min(...b.map(p => p[1])), byMax = Math.max(...b.map(p => p[1]))
+  return axMin < bxMax && axMax > bxMin && ayMin < byMax && ayMax > byMin
+}
+
+// Union of two polygons: returns convex hull of all vertices of both
+// (works well for rooms which are mostly rectangular/convex)
+function unionPolygonsConvexHull(a, b) {
+  const pts = [...a, ...b]
+  // Convex hull (Graham scan)
+  pts.sort((p, q) => p[0] !== q[0] ? p[0] - q[0] : p[1] - q[1])
+  const cross = (O, A, B) => (A[0]-O[0])*(B[1]-O[1]) - (A[1]-O[1])*(B[0]-O[0])
+  const lower = [], upper = []
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length-2], lower[lower.length-1], p) <= 0) lower.pop()
+    lower.push(p)
+  }
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i]
+    while (upper.length >= 2 && cross(upper[upper.length-2], upper[upper.length-1], p) <= 0) upper.pop()
+    upper.push(p)
+  }
+  upper.pop(); lower.pop()
+  return [...lower, ...upper]
+}
+
+// Merge rooms whose polygons overlap significantly (IoU or containment > threshold)
+// Returns new rooms array with overlapping rooms unified
+function mergeOverlappingRooms(roomList) {
+  const rects = roomList.map(r => r.polygon)
+  const n = roomList.length
+  const merged = new Uint8Array(n)  // which indices have been consumed
+  const result = []
+
+  for (let i = 0; i < n; i++) {
+    if (merged[i]) continue
+    let poly = rects[i].slice()
+    let area = polygonArea(poly)
+    let label = roomList[i].label
+    let totalArea = roomList[i].areaPx || area
+
+    for (let j = i + 1; j < n; j++) {
+      if (merged[j]) continue
+      if (!bboxOverlap(poly, rects[j])) continue
+
+      const inter = intersectPolygons(poly, rects[j])
+      if (!inter.length) continue
+
+      const interArea = polygonArea(inter)
+      const areaJ = polygonArea(rects[j])
+      const minArea = Math.min(area, areaJ)
+
+      // Merge if overlap is > 10% of the smaller polygon
+      if (interArea / minArea > 0.10) {
+        poly = unionPolygonsConvexHull(poly, rects[j])
+        area = polygonArea(poly)
+        totalArea = Math.round(area)
+        merged[j] = 1
+      }
+    }
+
+    result.push({
+      ...roomList[i],
+      polygon: poly.map(p => [Math.round(p[0]), Math.round(p[1])]),
+      areaPx:  totalArea,
+      label,
+    })
+  }
+  return result
 }
 
 // ── Save ───────────────────────────────────────────────────
