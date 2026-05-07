@@ -32,7 +32,7 @@ let roomDraw         = null     // {x0,y0,x1,y1} — rect being drawn right now
 let drawnRoomCount   = 0        // counter for auto-labelling drawn rooms
 
 const ROOM_COLOR   = '#c9ffd4'
-const ROOM_ALPHA   = 0.55
+const ROOM_ALPHA   = 0.40
 const STROKE_COLOR = 'rgba(60,160,80,0.75)'
 const STROKE_WIDTH = 2
 
@@ -1223,13 +1223,13 @@ async function saveSelected() {
 
 async function saveChecked() {
   if (!selectedRoomIds.size) { alert('Отметь помещения галочками или Ctrl+кликом'); return }
-  const dir = await ipcRenderer.invoke('save-dir-dialog')
-  if (!dir) return
   const checkedRooms = rooms.filter(r => selectedRoomIds.has(r.id))
-  checkedRooms.forEach((room, idx) => {
-    writeCanvas(makeRoomCanvas(room), path.join(dir, `${String(idx+1).padStart(2,'0')}_${sanitizeFilename(room.label)}.jpg`))
-  })
-  alert(`Сохранено ${checkedRooms.length} файлов в:\n${dir}`)
+  const firstName = sanitizeFilename(checkedRooms[0].label)
+  const defaultName = checkedRooms.length === 1 ? `${firstName}.jpg` : `помещения_экспорт.jpg`
+  const savePath = await ipcRenderer.invoke('save-dialog', defaultName)
+  if (!savePath) return
+  writeCanvas(makeMultiRoomCanvas(checkedRooms), savePath)
+  alert(`Сохранено: ${checkedRooms.length} помещений в одном файле`)
 }
 
 async function saveAll() {
@@ -1242,6 +1242,8 @@ async function saveAll() {
   alert(`Сохранено ${rooms.length + 1} файлов в:\n${dir}`)
 }
 
+// Export canvas helpers — no labels drawn on export images
+
 function makeRoomCanvas(room) {
   const w = currentImageEl.naturalWidth, h = currentImageEl.naturalHeight
   const off = document.createElement('canvas'); off.width = w; off.height = h
@@ -1252,17 +1254,27 @@ function makeRoomCanvas(room) {
     c.moveTo(room.polygon[0][0], room.polygon[0][1])
     room.polygon.slice(1).forEach(([x,y]) => c.lineTo(x, y))
     c.closePath()
-    c.globalAlpha = 0.75; c.fillStyle = ROOM_COLOR; c.fill()
+    c.globalAlpha = ROOM_ALPHA; c.fillStyle = ROOM_COLOR; c.fill()
     c.globalAlpha = 1; c.strokeStyle = 'rgba(30,120,60,0.9)'; c.lineWidth = 3; c.stroke()
-    const cx = room.polygon.reduce((s,p)=>s+p[0],0) / room.polygon.length
-    const cy = room.polygon.reduce((s,p)=>s+p[1],0) / room.polygon.length
-    const fs = Math.max(14, Math.round(w / 60))
-    c.font = `bold ${fs}px -apple-system, sans-serif`
-    c.textAlign = 'center'; c.textBaseline = 'middle'
-    const tw = c.measureText(room.label).width + 16
-    c.fillStyle = 'rgba(255,255,255,0.9)'; c.fillRect(cx-tw/2, cy-fs*0.75, tw, fs*1.5)
-    c.fillStyle = '#1d1d1f'; c.fillText(room.label, cx, cy)
   }
+  return off
+}
+
+// Multiple rooms on a single plan — used by saveChecked
+function makeMultiRoomCanvas(roomList) {
+  const w = currentImageEl.naturalWidth, h = currentImageEl.naturalHeight
+  const off = document.createElement('canvas'); off.width = w; off.height = h
+  const c = off.getContext('2d')
+  c.drawImage(currentImageBW || currentImageEl, 0, 0)
+  roomList.forEach(room => {
+    if (!room.polygon?.length) return
+    c.beginPath()
+    c.moveTo(room.polygon[0][0], room.polygon[0][1])
+    room.polygon.slice(1).forEach(([x,y]) => c.lineTo(x, y))
+    c.closePath()
+    c.globalAlpha = ROOM_ALPHA; c.fillStyle = ROOM_COLOR; c.fill()
+    c.globalAlpha = 1; c.strokeStyle = STROKE_COLOR; c.lineWidth = STROKE_WIDTH; c.stroke()
+  })
   return off
 }
 
@@ -1279,16 +1291,6 @@ function makeCombinedCanvas() {
     c.closePath()
     c.globalAlpha = ROOM_ALPHA; c.fillStyle = ROOM_COLOR; c.fill()
     c.globalAlpha = 1; c.strokeStyle = STROKE_COLOR; c.lineWidth = STROKE_WIDTH; c.stroke()
-    const cx = room.polygon.reduce((s,p)=>s+p[0],0) / room.polygon.length
-    const cy = room.polygon.reduce((s,p)=>s+p[1],0) / room.polygon.length
-    const fs = Math.max(12, Math.round(w / 80))
-    c.font = `600 ${fs}px -apple-system, sans-serif`
-    c.textAlign = 'center'; c.textBaseline = 'middle'
-    const tw = c.measureText(room.label).width + 12
-    c.fillStyle = 'rgba(255,255,255,0.92)'
-    c.fillRect(cx-tw/2, cy-fs*0.7, tw, fs*1.4)
-    c.fillStyle = '#1d1d1f'
-    c.fillText(room.label, cx, cy)
   })
   return off
 }
