@@ -841,20 +841,36 @@ function extractNumbersFromWords(words, minConfidence = 60) {
       const tok = w.text.trim()
       if (!tok) { i++; continue }
 
-      // Try to merge with next token if it looks like a thousand-group
-      // e.g. "1" + "234" → "1234", "1 234" + "567" → "1234567"
+      // Try to merge with next token if it looks like a space-separated thousands group.
+      // e.g. "1 000" → 1000, "1 234 567" → 1234567, "12 345" → 12345
+      // A "typographic space" gap is ≤ ~1× the word's bounding-box height.
+      // Wider gaps (e.g. tabular columns) are treated as separate numbers.
       let merged = tok
       let j = i + 1
       while (j < lineWords.length) {
-        const nextTok = lineWords[j].text.trim()
-        const gap = (lineWords[j].bbox?.x0 || 0) - (lineWords[j-1].bbox?.x1 || 0)
-        // Merge only if: next token is purely digits, exactly 3 digits, gap is small (<30px)
-        if (/^\d{3}$/.test(nextTok) && gap < 30 && /^\d+$/.test(merged.replace(/[.,]/g, ''))) {
-          merged += nextTok
-          j++
-        } else {
-          break
+        const nextTok    = lineWords[j].text.trim()
+        const prevWord   = lineWords[j - 1]
+        const gap        = (lineWords[j].bbox?.x0 || 0) - (prevWord.bbox?.x1 || 0)
+        const wordH      = ((prevWord.bbox?.y1 || 0) - (prevWord.bbox?.y0 || 0)) || 20
+        // Gap must be non-negative and no wider than ~1.5× the character height
+        const isSpaceGap = gap >= 0 && gap <= wordH * 1.5
+        // The accumulator so far must be pure digits (no decimal point yet)
+        const accIsDigits = /^\d+$/.test(merged)
+        // The next chunk must be 1–3 pure digits
+        const nextIsDigits = /^\d{1,3}$/.test(nextTok)
+
+        if (nextIsDigits && isSpaceGap && accIsDigits) {
+          // Only merge 1- or 2-digit chunks if we've already started merging
+          // (avoids treating "12 5" as 125 when the "5" is truly a separate number)
+          const isThreeDigit   = nextTok.length === 3
+          const alreadyMerging = j > i + 1
+          if (isThreeDigit || alreadyMerging) {
+            merged += nextTok
+            j++
+            continue
+          }
         }
+        break
       }
 
       const n = tokenToNumber(merged)
