@@ -14,7 +14,8 @@ let currentImageEl   = null
 let currentImageBW   = null   // offscreen B&W canvas (for export)
 let rooms            = []
 let originalRooms    = []     // snapshot at recognition time — for training diff
-let selectedRoomId   = null
+let selectedRoomId   = null   // single highlighted room (click)
+let selectedRoomIds  = new Set()  // rooms checked for export (checkboxes / ctrl+click)
 let currentView      = 'all'
 let mode             = 'local'  // 'local' | 'ai'
 
@@ -205,7 +206,7 @@ function clearPlan() {
 }
 
 function clearResults() {
-  rooms = []; originalRooms = []; selectedRoomId = null
+  rooms = []; originalRooms = []; selectedRoomId = null; selectedRoomIds = new Set()
   hasUnsavedEdits = false; dragState = null; hoverState = null
   roomDraw = null; drawnRoomCount = 0
   saveBar.classList.remove('visible')
@@ -243,13 +244,14 @@ function drawPlan() {
     pts.slice(1).forEach(([x, y]) => ctx.lineTo(x, y))
     ctx.closePath()
 
+    const isChecked = selectedRoomIds.has(room.id)
     ctx.globalAlpha = isSelected ? 0.78 : ROOM_ALPHA
-    ctx.fillStyle   = ROOM_COLOR
+    ctx.fillStyle   = isChecked ? '#c8e6ff' : ROOM_COLOR
     ctx.fill()
 
     ctx.globalAlpha = 1
-    ctx.strokeStyle = isSelected ? 'rgba(30,120,60,0.95)' : STROKE_COLOR
-    ctx.lineWidth   = isSelected ? 3 : STROKE_WIDTH
+    ctx.strokeStyle = isSelected ? 'rgba(30,120,60,0.95)' : isChecked ? 'rgba(0,100,220,0.85)' : STROKE_COLOR
+    ctx.lineWidth   = isSelected ? 3 : isChecked ? 2.5 : STROKE_WIDTH
     ctx.stroke()
 
     // label
@@ -329,7 +331,19 @@ canvas.addEventListener('click', e => {
   for (const room of rooms) {
     if (!room.polygon) continue
     if (pointInPolygon(mx, my, room.polygon.map(([x, y]) => [x * sx, y * sy]))) {
-      selectRoom(room.id); return
+      if (e.ctrlKey || e.metaKey) {
+        // Ctrl+click toggles export checkbox
+        if (selectedRoomIds.has(room.id)) selectedRoomIds.delete(room.id)
+        else selectedRoomIds.add(room.id)
+        // sync checkbox in list
+        const cb = document.querySelector(`.room-item[data-id="${room.id}"] .room-check`)
+        if (cb) cb.checked = selectedRoomIds.has(room.id)
+        updateExportBtn()
+        drawPlan()
+      } else {
+        selectRoom(room.id)
+      }
+      return
     }
   }
   selectedRoomId = null
@@ -372,17 +386,48 @@ function buildRoomList() {
 
   rooms.forEach(room => {
     const item = document.createElement('div')
-    item.className = 'room-item'; item.dataset.id = room.id
-    const areaText = room.areaPx ? `${(room.areaPx/1000).toFixed(1)}k px²` : ''
-    item.innerHTML = `
-      <div class="room-dot"></div>
-      <span class="room-label" title="${room.label}">${room.label}</span>
-      <span class="room-area">${areaText}</span>
-      <button class="room-save" title="Сохранить PNG" onclick="saveRoom('${room.id}',event)">💾</button>
-    `
+    item.className = 'room-item' + (room.id === selectedRoomId ? ' selected' : '')
+    item.dataset.id = room.id
+
+    const cb = document.createElement('input')
+    cb.type = 'checkbox'
+    cb.className = 'room-check'
+    cb.checked = selectedRoomIds.has(room.id)
+    cb.title = 'Отметить для экспорта'
+    cb.addEventListener('change', e => {
+      e.stopPropagation()
+      if (cb.checked) selectedRoomIds.add(room.id)
+      else selectedRoomIds.delete(room.id)
+      updateExportBtn()
+      drawPlan()
+    })
+
+    const dot   = document.createElement('div');  dot.className = 'room-dot'
+    const label = document.createElement('span'); label.className = 'room-label'; label.title = room.label; label.textContent = room.label
+    const area  = document.createElement('span'); area.className  = 'room-area'
+    if (room.areaPx) area.textContent = `${(room.areaPx/1000).toFixed(1)}k px²`
+
+    const saveBtn = document.createElement('button')
+    saveBtn.className = 'room-save'; saveBtn.title = 'Сохранить JPEG'
+    saveBtn.textContent = '💾'
+    saveBtn.addEventListener('click', e => { e.stopPropagation(); saveRoom(room.id) })
+
+    item.appendChild(cb); item.appendChild(dot); item.appendChild(label)
+    item.appendChild(area); item.appendChild(saveBtn)
+
     item.addEventListener('click', () => selectRoom(room.id))
     roomsList.appendChild(item)
   })
+
+  updateExportBtn()
+}
+
+function updateExportBtn() {
+  const btn = document.getElementById('exportCheckedBtn')
+  if (!btn) return
+  const n = selectedRoomIds.size
+  btn.style.display = n > 0 ? '' : 'none'
+  btn.textContent = `📐 Экспорт (${n})`
 }
 
 // ── Analyse (dispatcher) ───────────────────────────────────
@@ -1156,11 +1201,17 @@ function rdp(points, eps) {
 }
 
 // ── Save ───────────────────────────────────────────────────
+const JPEG_QUALITY = 0.92
+
+function canvasToJpegBuf(off) {
+  return Buffer.from(off.toDataURL('image/jpeg', JPEG_QUALITY).split(',')[1], 'base64')
+}
+
 async function saveRoom(id, e) {
   e && e.stopPropagation()
   const room = rooms.find(r => r.id === id)
   if (!room) return
-  const savePath = await ipcRenderer.invoke('save-dialog', `${sanitizeFilename(room.label)}.png`)
+  const savePath = await ipcRenderer.invoke('save-dialog', `${sanitizeFilename(room.label)}.jpg`)
   if (!savePath) return
   writeCanvas(makeRoomCanvas(room), savePath)
 }
@@ -1170,12 +1221,23 @@ async function saveSelected() {
   await saveRoom(selectedRoomId)
 }
 
+async function saveChecked() {
+  if (!selectedRoomIds.size) { alert('Отметь помещения галочками или Ctrl+кликом'); return }
+  const dir = await ipcRenderer.invoke('save-dir-dialog')
+  if (!dir) return
+  const checkedRooms = rooms.filter(r => selectedRoomIds.has(r.id))
+  checkedRooms.forEach((room, idx) => {
+    writeCanvas(makeRoomCanvas(room), path.join(dir, `${String(idx+1).padStart(2,'0')}_${sanitizeFilename(room.label)}.jpg`))
+  })
+  alert(`Сохранено ${checkedRooms.length} файлов в:\n${dir}`)
+}
+
 async function saveAll() {
   const dir = await ipcRenderer.invoke('save-dir-dialog')
   if (!dir) return
-  writeCanvas(makeCombinedCanvas(), path.join(dir, '00_все_помещения.png'))
+  writeCanvas(makeCombinedCanvas(), path.join(dir, '00_все_помещения.jpg'))
   rooms.forEach((room, idx) => {
-    writeCanvas(makeRoomCanvas(room), path.join(dir, `${String(idx+1).padStart(2,'0')}_${sanitizeFilename(room.label)}.png`))
+    writeCanvas(makeRoomCanvas(room), path.join(dir, `${String(idx+1).padStart(2,'0')}_${sanitizeFilename(room.label)}.jpg`))
   })
   alert(`Сохранено ${rooms.length + 1} файлов в:\n${dir}`)
 }
@@ -1232,8 +1294,10 @@ function makeCombinedCanvas() {
 }
 
 function writeCanvas(off, filePath) {
-  const buf = Buffer.from(off.toDataURL('image/png').split(',')[1], 'base64')
-  fs.writeFileSync(filePath, buf)
+  // Ensure filePath has .jpg extension
+  const jpgPath = filePath.replace(/\.(png|PNG)$/, '.jpg')
+  const buf = canvasToJpegBuf(off)
+  fs.writeFileSync(jpgPath, buf)
 }
 
 function sanitizeFilename(name) {

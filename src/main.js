@@ -278,7 +278,7 @@ ipcMain.handle('get-cloudflare-models', () => modelCache.cloudflare.models)
 ipcMain.handle('save-dialog', async (e, defaultName) => {
   const result = await dialog.showSaveDialog(mainWindow, {
     defaultPath: path.join(os.homedir(), 'Desktop', defaultName),
-    filters: [{ name: 'PNG Image', extensions: ['png'] }],
+    filters: [{ name: 'JPEG Image', extensions: ['jpg', 'jpeg'] }],
   })
   return result.filePath || null
 })
