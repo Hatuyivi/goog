@@ -190,25 +190,62 @@ let bwMix = { red: 40, orange: 33, yellow: 17, green: -20, aqua: -8, blue: -10, 
 // Основные (Camera Raw style)
 let basicAdj = { exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0, texture: 0, clarity: 0, dehaze: 0, vibrance: 0, saturation: 0 }
 
+// Raw pixel cache — populated once on image load, never mutated
+let _rawPixels   = null   // Uint8ClampedArray original RGBA
+let _rawWidth    = 0
+let _rawHeight   = 0
+
+// rAF debounce handle
+let _rebuildRaf  = null
+
 // Offscreen B&W canvas (used for export visuals)
 function makeBWCanvas(img) {
   const off = document.createElement('canvas')
   off.width = img.naturalWidth; off.height = img.naturalHeight
   const c = off.getContext('2d')
   c.drawImage(img, 0, 0)
+
+  // Cache raw pixels once
   const imageData = c.getImageData(0, 0, off.width, off.height)
+  _rawPixels = new Uint8ClampedArray(imageData.data)   // immutable copy
+  _rawWidth  = off.width
+  _rawHeight = off.height
+
   applyBWProcessing(imageData.data)
   c.putImageData(imageData, 0, 0)
   return off
 }
 
-// Rebuild BW canvas from original image with current settings
+// Schedule rebuild via rAF — coalesces rapid slider updates into one frame
 function rebuildBWCanvas() {
   if (!currentImageEl) return
-  currentImageBW = makeBWCanvas(currentImageEl)
-  // Re-apply eraser strokes on top
+  if (_rebuildRaf) return          // already scheduled
+  _rebuildRaf = requestAnimationFrame(() => {
+    _rebuildRaf = null
+    _doRebuildBWCanvas()
+  })
+}
+
+function _doRebuildBWCanvas() {
+  if (!currentImageEl || !_rawPixels) return
+
+  if (!currentImageBW) {
+    currentImageBW = document.createElement('canvas')
+    currentImageBW.width  = _rawWidth
+    currentImageBW.height = _rawHeight
+  }
+
+  const c = currentImageBW.getContext('2d')
+
+  // Work on a copy of raw pixels — no getImageData round-trip
+  const data = new Uint8ClampedArray(_rawPixels)
+  applyBWProcessing(data)
+
+  const imageData = new ImageData(data, _rawWidth, _rawHeight)
+  c.putImageData(imageData, 0, 0)
+
+  // Re-apply eraser strokes
   if (eraserStrokes.length) {
-    const c = currentImageBW.getContext('2d')
     c.fillStyle = '#ffffff'
     for (const stroke of eraserStrokes) {
       for (const pt of stroke) {
@@ -218,94 +255,110 @@ function rebuildBWCanvas() {
       }
     }
   }
+
   drawPlan()
 }
 
 function applyBWProcessing(d) {
-  // Step 1: Apply basic adjustments (exposure, contrast, etc.) in linear light
-  const expMult  = Math.pow(2, basicAdj.exposure * 0.04)
-  const contr    = basicAdj.contrast  / 100
-  const hi       = basicAdj.highlights / 200
-  const sh       = basicAdj.shadows    / 200
-  const wh       = basicAdj.whites     / 200
-  const bl       = basicAdj.blacks     / 200
-  const sat      = 1 + basicAdj.saturation / 100
-  const vib      = basicAdj.vibrance   / 200
-  const clar     = basicAdj.clarity    / 100
-  const deh      = basicAdj.dehaze     / 100
+  const expMult = Math.pow(2, basicAdj.exposure * 0.04)
+  const contr   = basicAdj.contrast   / 100
+  const hi      = basicAdj.highlights / 200
+  const sh      = basicAdj.shadows    / 200
+  const wh      = basicAdj.whites     / 200
+  const bl      = basicAdj.blacks     / 200
+  const sat     = 1 + basicAdj.saturation / 100
+  const vib     = basicAdj.vibrance   / 200
+  const clar    = basicAdj.clarity    / 100
+  const deh     = basicAdj.dehaze     / 100
 
-  for (let i = 0; i < d.length; i += 4) {
-    let r = d[i] / 255, g = d[i+1] / 255, b = d[i+2] / 255
+  // Pre-compute BW mix stop table once per call
+  const mx = bwMix
+  const stops = [
+    { h:   0, v: mx.red      / 200 },
+    { h:  30, v: mx.orange   / 200 },
+    { h:  60, v: mx.yellow   / 200 },
+    { h: 120, v: mx.green    / 200 },
+    { h: 180, v: mx.aqua     / 200 },
+    { h: 240, v: mx.blue     / 200 },
+    { h: 280, v: mx.lavender / 200 },
+    { h: 320, v: mx.magenta  / 200 },
+    { h: 360, v: mx.red      / 200 },
+  ]
+
+  // Pre-build a 360-entry hue→mixShift LUT
+  const hueLUT = new Float32Array(361)
+  for (let h = 0; h <= 360; h++) {
+    for (let s = 0; s < stops.length - 1; s++) {
+      if (h >= stops[s].h && h <= stops[s+1].h) {
+        const t = (h - stops[s].h) / (stops[s+1].h - stops[s].h)
+        hueLUT[h] = stops[s].v * (1 - t) + stops[s+1].v * t
+        break
+      }
+    }
+  }
+
+  const len = d.length
+  for (let i = 0; i < len; i += 4) {
+    let r = d[i] * 0.003921569   // / 255
+    let g = d[i+1] * 0.003921569
+    let b = d[i+2] * 0.003921569
 
     // Exposure
     r *= expMult; g *= expMult; b *= expMult
 
-    // Saturation & Vibrance (before BW conversion)
-    const lum = 0.299*r + 0.587*g + 0.114*b
-    const maxC = Math.max(r,g,b)
-    const satFactor = sat + vib * (1 - Math.abs(2*lum - 1))
-    r = lum + (r - lum) * satFactor
-    g = lum + (g - lum) * satFactor
-    b = lum + (b - lum) * satFactor
-
-    // Dehaze (local contrast boost via lift/gamma)
-    if (deh !== 0) {
-      r = Math.max(0, r - deh * 0.15); g = Math.max(0, g - deh * 0.15); b = Math.max(0, b - deh * 0.15)
+    // Saturation & Vibrance
+    const lum0 = 0.299*r + 0.587*g + 0.114*b
+    const satF = sat + vib * (1 - Math.abs(2*lum0 - 1))
+    if (satF !== 1) {
+      r = lum0 + (r - lum0) * satF
+      g = lum0 + (g - lum0) * satF
+      b = lum0 + (b - lum0) * satF
     }
 
-    // Camera Raw BW Mix: hue-based weighting
-    // Convert to HSL to determine dominant hue
-    const cMax = Math.max(r,g,b), cMin = Math.min(r,g,b), delta = cMax - cMin
-    let hue = 0
-    if (delta > 0.001) {
-      if (cMax === r)      hue = 60 * (((g - b) / delta) % 6)
+    // Dehaze
+    if (deh !== 0) {
+      const lift = deh * 0.15
+      r -= lift; g -= lift; b -= lift
+      if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0
+    }
+
+    // Hue & saturation for BW mix (fast path: skip if unsaturated)
+    let mixShift = 0
+    const cMax = r > g ? (r > b ? r : b) : (g > b ? g : b)
+    const cMin = r < g ? (r < b ? r : b) : (g < b ? g : b)
+    const delta = cMax - cMin
+    if (delta > 0.02 && cMax > 0.001) {
+      let hue
+      if      (cMax === r) hue = 60 * (((g - b) / delta) % 6)
       else if (cMax === g) hue = 60 * ((b - r) / delta + 2)
       else                 hue = 60 * ((r - g) / delta + 4)
       if (hue < 0) hue += 360
-    }
-    const satLevel = cMax > 0.001 ? delta / cMax : 0
-
-    // BW mix contribution
-    let mixShift = 0
-    if (satLevel > 0.05) {
-      const mx = bwMix
-      // Blend between adjacent hue stops
-      const stops = [
-        { h:   0, v: mx.red },   { h:  30, v: mx.orange }, { h:  60, v: mx.yellow },
-        { h: 120, v: mx.green },  { h: 180, v: mx.aqua },   { h: 240, v: mx.blue },
-        { h: 280, v: mx.lavender }, { h: 320, v: mx.magenta }, { h: 360, v: mx.red },
-      ]
-      for (let s = 0; s < stops.length - 1; s++) {
-        if (hue >= stops[s].h && hue < stops[s+1].h) {
-          const t = (hue - stops[s].h) / (stops[s+1].h - stops[s].h)
-          mixShift = (stops[s].v * (1-t) + stops[s+1].v * t) / 200
-          break
-        }
-      }
-      mixShift *= satLevel
+      const satLevel = delta / cMax
+      mixShift = hueLUT[Math.round(hue)] * satLevel
     }
 
-    // Convert to gray with BW mix
+    // BW conversion
     let gray = 0.299*r + 0.587*g + 0.114*b + mixShift
-    gray = Math.max(0, Math.min(1, gray))
+    if (gray < 0) gray = 0; else if (gray > 1) gray = 1
 
-    // Contrast (S-curve around 0.5)
-    if (contr !== 0) gray = gray + contr * (gray - 0.5) * (1 - Math.abs(gray - 0.5)) * 2
+    // Contrast S-curve
+    if (contr !== 0) gray += contr * (gray - 0.5) * (1 - Math.abs(gray - 0.5)) * 2
 
-    // Tone range adjustments
-    if (gray > 0.5) gray = gray + hi * (gray - 0.5) * 2
-    else            gray = gray + sh * (0.5 - gray) * 2
-    if (gray > 0.85) gray = gray + wh * (gray - 0.85) / 0.15
-    if (gray < 0.15) gray = gray - bl * (0.15 - gray) / 0.15
+    // Tone ranges
+    if (hi !== 0 && gray > 0.5)  gray += hi * (gray - 0.5) * 2
+    if (sh !== 0 && gray <= 0.5) gray += sh * (0.5 - gray) * 2
+    if (wh !== 0 && gray > 0.85) gray += wh * (gray - 0.85) / 0.15
+    if (bl !== 0 && gray < 0.15) gray -= bl * (0.15 - gray) / 0.15
 
-    // Texture (local sharpening approximation via gamma)
+    // Clarity
     if (clar !== 0) {
       const sign = gray > 0.5 ? 1 : -1
-      gray = gray + clar * sign * Math.pow(Math.abs(gray - 0.5), 0.7) * 0.3
+      gray += clar * sign * Math.pow(Math.abs(gray - 0.5), 0.7) * 0.3
     }
 
-    gray = Math.max(0, Math.min(1, gray)) * 255
-    d[i] = d[i+1] = d[i+2] = gray
+    if (gray < 0) gray = 0; else if (gray > 1) gray = 1
+    const v = gray * 255 + 0.5 | 0
+    d[i] = d[i+1] = d[i+2] = v
   }
 }
 
@@ -318,6 +371,8 @@ function resizeCanvas(img) {
 
 function clearPlan() {
   currentImageB64 = null; currentImageEl = null; currentImageBW = null
+  _rawPixels = null; _rawWidth = 0; _rawHeight = 0
+  if (_rebuildRaf) { cancelAnimationFrame(_rebuildRaf); _rebuildRaf = null }
   previewThumb.style.display = 'none'; dropzone.style.display = 'block'
   canvas.style.display = 'none'; canvasPlaceholder.style.display = 'flex'
   analyseBtn.disabled = true

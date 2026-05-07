@@ -467,8 +467,9 @@ function resetBasicAdj() {
     const el = document.querySelector(`#body-basic input[oninput*="'${k}'"]`)
     if (el) { el.value = 0; adjVal(k, el); }
   })
-  if (typeof applyBasicAdj !== 'undefined') {
-    keys.forEach(k => applyBasicAdj(k, 0))
+  if (typeof basicAdj !== 'undefined') {
+    keys.forEach(k => { basicAdj[k] = 0 })
+    if (typeof rebuildBWCanvas !== 'undefined') rebuildBWCanvas()
   }
 }
 function resetBWMix() {
@@ -476,8 +477,11 @@ function resetBWMix() {
   Object.entries(defaults).forEach(([k, v]) => {
     const el = document.querySelector(`#body-bwmix input[oninput*="'${k}'"]`)
     if (el) { el.value = v; adjVal(k, el); }
-    if (typeof applyBWMix !== 'undefined') applyBWMix(k, v)
   })
+  if (typeof bwMix !== 'undefined') {
+    Object.assign(bwMix, defaults)
+    if (typeof rebuildBWCanvas !== 'undefined') rebuildBWCanvas()
+  }
 }
 </script>
 <script src="planner.js"></script>
