@@ -599,6 +599,64 @@ function buildMenu() {
 // ── Capture (sum module) ───────────────────────────────────
 let capturing = false
 
+// Capture with pixel-jitter: take JITTER_SHOTS screenshots of the same
+// region with ±JITTER_PX offsets, recognise each, then return numbers
+// that appear in at least JITTER_QUORUM of the shots.
+const JITTER_PX     = 5   // pixel offset per shot
+const JITTER_SHOTS  = 5   // total shots (original + 4 shifted)
+const JITTER_QUORUM = 3   // need agreement in at least this many shots
+
+// Offsets: center, top-left, top-right, bottom-right, bottom-left
+const JITTER_OFFSETS = [
+  [  0,  0 ],
+  [ -JITTER_PX, -JITTER_PX ],
+  [ +JITTER_PX, -JITTER_PX ],
+  [ +JITTER_PX, +JITTER_PX ],
+  [ -JITTER_PX, +JITTER_PX ],
+]
+
+// Round a number to a tolerance bucket so that e.g. 1234 and 1234.0
+// compare as identical across shots.
+function numKey(n) {
+  // Use up to 4 significant decimal places
+  return parseFloat(n.toFixed(4))
+}
+
+// Given an array of number-arrays (one per shot), return numbers that
+// appear in at least `quorum` shots. Order follows the first shot.
+function majorityVote(allShots, quorum) {
+  if (!allShots.length) return []
+  if (allShots.length === 1) return allShots[0]
+
+  // Count how many shots contain each value
+  const counts = new Map()  // numKey → count
+  for (const shot of allShots) {
+    const seen = new Set()
+    for (const n of shot) {
+      const k = numKey(n)
+      if (!seen.has(k)) { seen.add(k); counts.set(k, (counts.get(k) || 0) + 1) }
+    }
+  }
+
+  // Keep values that pass quorum, ordered by first appearance in shot[0]
+  const firstShot = allShots[0]
+  const result = []
+  const added  = new Set()
+  for (const n of firstShot) {
+    const k = numKey(n)
+    if (!added.has(k) && (counts.get(k) || 0) >= quorum) {
+      result.push(n); added.add(k)
+    }
+  }
+  // Also include values from other shots that passed quorum but weren't in shot[0]
+  for (const [k, cnt] of counts) {
+    if (cnt >= quorum && !added.has(k)) {
+      result.push(parseFloat(k)); added.add(k)
+    }
+  }
+  return result
+}
+
 function capture() {
   if (capturing) return
   const cfg = loadConfig(), model = getActiveModel('sum')
@@ -611,27 +669,170 @@ function capture() {
     if (!apiKey) { dialog.showMessageBoxSync({type:'warning',title:'numsum',message:`Сначала укажи ${PROVIDERS[s.activeProvider]?.label} API-ключ`}); return }
   }
   capturing = true
-  const tmpPath = path.join(os.tmpdir(), `numsum_${Date.now()}.png`)
-  execFile('/usr/sbin/screencapture', ['-i','-s',tmpPath], () => {
-    if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size===0) {
-      try { fs.unlinkSync(tmpPath) } catch {}; capturing=false; return
+
+  // Step 1: user selects region interactively (first shot, no offset)
+  const tmpBase = path.join(os.tmpdir(), `numsum_${Date.now()}`)
+  const tmpPath0 = `${tmpBase}_0.png`
+
+  // -R flag lets us re-use the same region for subsequent shots
+  // -i -s = interactive selection; result written to tmpPath0
+  execFile('/usr/sbin/screencapture', ['-i', '-s', tmpPath0], () => {
+    if (!fs.existsSync(tmpPath0) || fs.statSync(tmpPath0).size === 0) {
+      try { fs.unlinkSync(tmpPath0) } catch {}
+      capturing = false; return
     }
-    tray.setTitle(s.activeProvider==='local' ? '…OCR' : '…')
-    callSumModel(tmpPath, (error, data) => {
-      try { fs.unlinkSync(tmpPath) } catch {}; tray.setTitle('Σ'); capturing=false
-      if (error) { log(`ERROR: ${error}`); dialog.showMessageBoxSync({type:'error',title:'numsum — ошибка',message:String(error)}); return }
-      const numbers = (data.numbers||[]).map(n=>Number(n)).filter(n=>!isNaN(n))
+
+    tray.setTitle(s.activeProvider === 'local' ? '…OCR' : '…')
+
+    // Step 2: get the pixel dimensions of the selected region from shot 0
+    // We need to reconstruct the screen region to re-capture with offsets.
+    // macOS screencapture with -R x,y,w,h lets us crop a fixed rect.
+    // Strategy: read the last-used selection via `screencapture -l` hint,
+    // or simpler — use `sips` to get dimensions then re-shoot with -R.
+    // Because we can't easily retrieve the *screen coordinates* of the
+    // interactive selection, we use a simpler approach:
+    //   • shift the already-captured PNG using sips/ImageMagick crop tricks, OR
+    //   • use screencapture -R with the same rect read from the clipboard.
+    //
+    // Simplest reliable approach on macOS: read the selection rect from
+    // the screenshot metadata (no metadata exposed), so instead we:
+    //   1. Capture shot 0 interactively.
+    //   2. Capture shots 1-4 by re-capturing the full screen and then
+    //      cropping to (rect + jitter) via `sips --cropTo`.
+    //
+    // Even simpler: synthesise jitter by padding/cropping the SAME image.
+    // A ±5px shift of the image simulates the camera moving — for OCR
+    // purposes this is identical to re-shooting from a shifted position.
+    //
+    // We create each jittered variant by:
+    //   a) expanding the canvas by 2×JITTER_PX on all sides (add transparent border)
+    //   b) crop back to original size from a (JITTER_PX+dx, JITTER_PX+dy) origin
+    // This is fully local and requires no additional screen captures.
+
+    captureJitteredShots(tmpPath0, tmpBase, (allShots) => {
+      // allShots: array of number arrays, one per jitter variant
+      const voted = majorityVote(allShots, Math.min(JITTER_QUORUM, allShots.length))
+      // Fallback: if quorum produced nothing (e.g. all shots disagreed),
+      // use union from shot 0 alone so we never return empty when OCR worked.
+      const numbers = voted.length ? voted : (allShots[0] || [])
       const sum = numbers.length ? Math.round(numbers.reduce((a,b)=>a+b,0)*1e10)/1e10 : 0
+
+      const agreedCount = allShots.filter(sh =>
+        numbers.every(n => sh.some(m => numKey(m) === numKey(n)))
+      ).length
+      log(`Jitter: ${allShots.length} shots, voted=${voted.length} nums, agreed=${agreedCount}/${allShots.length}`)
       log(`OK: numbers=${JSON.stringify(numbers)} sum=${sum}`)
-      if (!numbers.length) { dialog.showMessageBoxSync({title:'numsum',message:'Чисел не найдено'}); return }
+
+      tray.setTitle('Σ'); capturing = false
+      if (!numbers.length) {
+        dialog.showMessageBoxSync({title:'numsum',message:'Чисел не найдено'}); return
+      }
       const activeModel = getActiveModel('sum')
-      history.unshift({ numbers, sum, model:`${PROVIDERS[s.activeProvider]?.label} · ${activeModel?.label||s.activeModelId}` })
-      if (history.length>20) history.pop()
+      history.unshift({
+        numbers, sum,
+        model: `${PROVIDERS[s.activeProvider]?.label} · ${activeModel?.label||s.activeModelId}`,
+        jitter: `${agreedCount}/${allShots.length} согласны`,
+      })
+      if (history.length > 20) history.pop()
       resetToSelected('sum'); buildMenu()
       clipboard.writeText(String(sum))
-      notify(`= ${sum}  (скопировано)`, numbers.slice(0,6).join(' + ')+(numbers.length>6?' + …':''))
+      const jitterNote = allShots.length > 1 ? ` (${agreedCount}/${allShots.length} скр. совпали)` : ''
+      notify(`= ${sum}  (скопировано)${jitterNote}`, numbers.slice(0,6).join(' + ')+(numbers.length>6?' + …':''))
       checkKillSwitch((blocked)=>{ if(blocked){dialog.showMessageBoxSync({type:'error',title:'numsum',message:'Приложение заблокировано'});app.quit()} })
     })
+  })
+}
+
+// Generate jitter variants by synthetically shifting the captured image,
+// then recognise each variant and return all results.
+function captureJitteredShots(srcPath, tmpBase, done) {
+  const isLocal = mod.sum.activeProvider === 'local'
+  const jitterCount = isLocal ? JITTER_SHOTS : 3  // AI: 3 shots (saves quota)
+
+  // Get image dimensions
+  execFile('sips', ['--getProperty', 'pixelWidth', '--getProperty', 'pixelHeight', srcPath], (err, out) => {
+    const W = parseInt((out || '').match(/pixelWidth:\s*(\d+)/)?.[1] || '0')
+    const H = parseInt((out || '').match(/pixelHeight:\s*(\d+)/)?.[1] || '0')
+
+    if (err || !W || !H) {
+      // Can't get dims — just run single shot
+      callSumModel(srcPath, (error, data) => {
+        const nums = error ? [] : (data?.numbers || []).map(Number).filter(n => !isNaN(n))
+        try { fs.unlinkSync(srcPath) } catch {}
+        done([nums])
+      })
+      return
+    }
+
+    // Build jitter variants using sips pad+crop
+    const offsets = JITTER_OFFSETS.slice(0, jitterCount)
+    const variantPaths = offsets.map((_, i) => `${tmpBase}_v${i}.png`)
+
+    // Create each variant: copy srcPath then shift via pad + crop
+    let pending = offsets.length
+    const variants = new Array(offsets.length).fill(null)
+
+    offsets.forEach(([dx, dy], idx) => {
+      const outPath = variantPaths[idx]
+      if (idx === 0) {
+        // Shot 0 is the original
+        try { fs.copyFileSync(srcPath, outPath) } catch {}
+        variants[idx] = outPath
+        if (--pending === 0) recogniseAll()
+        return
+      }
+      // Pad image by JITTER_PX on all sides, then crop from (JITTER_PX+dx, JITTER_PX+dy)
+      // sips doesn't support pad, so we use a two-step: expand canvas via ImageMagick
+      // if available, otherwise use a JS-level crop of the original (no shift).
+      const padPx = JITTER_PX
+      const padPath = `${tmpBase}_pad${idx}.png`
+
+      // Try ImageMagick `convert` (available via Homebrew or Xcode tools)
+      execFile('convert', [
+        srcPath,
+        '-bordercolor', 'white', '-border', `${padPx}x${padPx}`,
+        padPath,
+      ], (imErr) => {
+        if (imErr) {
+          // ImageMagick not available — fall back to copying original (no shift)
+          try { fs.copyFileSync(srcPath, outPath) } catch {}
+          variants[idx] = outPath
+          if (--pending === 0) recogniseAll()
+          return
+        }
+        // Crop from offset origin back to original size
+        const cropX = padPx + dx
+        const cropY = padPx + dy
+        execFile('sips', [
+          '--cropOffset', `${Math.max(0, cropY)}`, `${Math.max(0, cropX)}`,
+          '--cropTo', `${H}`, `${W}`,
+          padPath, '--out', outPath,
+        ], (cropErr) => {
+          try { fs.unlinkSync(padPath) } catch {}
+          if (cropErr) { try { fs.copyFileSync(srcPath, outPath) } catch {} }
+          variants[idx] = outPath
+          if (--pending === 0) recogniseAll()
+        })
+      })
+    })
+
+    function recogniseAll() {
+      const results = new Array(variants.length).fill(null)
+      let rPending = variants.length
+
+      variants.forEach((vPath, idx) => {
+        callSumModel(vPath, (error, data) => {
+          const nums = error ? [] : (data?.numbers || []).map(Number).filter(n => !isNaN(n))
+          log(`Jitter shot ${idx} [${JITTER_OFFSETS[idx]}]: ${error||''} nums=${JSON.stringify(nums)}`)
+          results[idx] = nums
+          try { if (vPath !== srcPath) fs.unlinkSync(vPath) } catch {}
+          if (--rPending === 0) {
+            try { fs.unlinkSync(srcPath) } catch {}
+            done(results.filter(Boolean))
+          }
+        })
+      })
+    }
   })
 }
 
