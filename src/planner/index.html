@@ -210,6 +210,27 @@
   .save-bar .stats strong { color: #1d1d1f; }
   .save-bar .btn { width: auto; padding: 5px 12px; font-size: 12px; }
 
+  .emode-btn.eraser.active { background: #ff9500; color: #fff; }
+  #planCanvas.mode-eraser  { cursor: none; }
+
+  /* Adjustment panels */
+  .adj-section { border-top: 1px solid #e0e0e5; flex-shrink: 0; }
+  .adj-header  { display: flex; align-items: center; gap: 6px; padding: 7px 12px;
+    font-size: 12px; font-weight: 600; color: #1d1d1f; cursor: pointer; user-select: none;
+    background: #f5f5f7; }
+  .adj-header:hover { background: #ebebf0; }
+  .adj-arrow   { font-size: 9px; color: #888; transition: transform .15s; display: inline-block; }
+  .adj-arrow.open { transform: rotate(90deg); }
+  .adj-body    { padding: 6px 10px 8px; background: #fff; }
+  .adj-row     { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .adj-row label { font-size: 11px; color: #555; min-width: 120px; flex-shrink: 0; }
+  .adj-row input[type=range] { flex: 1; height: 3px; accent-color: #007aff; }
+  .adj-val     { color: #007aff; font-weight: 600; }
+  .adj-sep     { height: 1px; background: #e8e8ed; margin: 6px 0; }
+  .adj-reset   { margin-top: 6px; font-size: 11px; padding: 3px 10px; border-radius: 5px;
+    background: #e8e8ed; border: 1px solid #d0d0d5; cursor: pointer; color: #555; }
+  .adj-reset:hover { background: #d8d8dd; }
+
   /* divider */
   hr { border: none; border-top: 1px solid #e8e8ed; }
 </style>
@@ -296,6 +317,80 @@
           Распознать помещения
         </button>
 
+        <!-- ── Основные ────────────────────────────── -->
+        <div class="adj-section">
+          <div class="adj-header" onclick="toggleAdj('basic')">
+            <span class="adj-arrow" id="arrow-basic">▶</span> Основные
+          </div>
+          <div class="adj-body" id="body-basic" style="display:none">
+            <div class="adj-row"><label>Экспозиция <span class="adj-val" id="v-exposure">0</span></label>
+              <input type="range" min="-100" max="100" value="0" oninput="adjVal('exposure',this);applyBasicAdj('exposure',this.value)"></div>
+            <div class="adj-row"><label>Контрастность <span class="adj-val" id="v-contrast">0</span></label>
+              <input type="range" min="-100" max="100" value="0" oninput="adjVal('contrast',this);applyBasicAdj('contrast',this.value)"></div>
+            <div class="adj-row"><label>Светлые области <span class="adj-val" id="v-highlights">0</span></label>
+              <input type="range" min="-100" max="100" value="0" oninput="adjVal('highlights',this);applyBasicAdj('highlights',this.value)"></div>
+            <div class="adj-row"><label>Тени <span class="adj-val" id="v-shadows">0</span></label>
+              <input type="range" min="-100" max="100" value="0" oninput="adjVal('shadows',this);applyBasicAdj('shadows',this.value)"></div>
+            <div class="adj-row"><label>Белые <span class="adj-val" id="v-whites">0</span></label>
+              <input type="range" min="-100" max="100" value="0" oninput="adjVal('whites',this);applyBasicAdj('whites',this.value)"></div>
+            <div class="adj-row"><label>Затемнение <span class="adj-val" id="v-blacks">0</span></label>
+              <input type="range" min="-100" max="100" value="0" oninput="adjVal('blacks',this);applyBasicAdj('blacks',this.value)"></div>
+            <div class="adj-sep"></div>
+            <div class="adj-row"><label>Текстура <span class="adj-val" id="v-texture">0</span></label>
+              <input type="range" min="-100" max="100" value="0" oninput="adjVal('texture',this);applyBasicAdj('texture',this.value)"></div>
+            <div class="adj-row"><label>Чёткость <span class="adj-val" id="v-clarity">0</span></label>
+              <input type="range" min="-100" max="100" value="0" oninput="adjVal('clarity',this);applyBasicAdj('clarity',this.value)"></div>
+            <div class="adj-row"><label>Удалить дымку <span class="adj-val" id="v-dehaze">0</span></label>
+              <input type="range" min="-100" max="100" value="0" oninput="adjVal('dehaze',this);applyBasicAdj('dehaze',this.value)"></div>
+            <div class="adj-sep"></div>
+            <div class="adj-row"><label>Красочность <span class="adj-val" id="v-vibrance">0</span></label>
+              <input type="range" min="-100" max="100" value="0" oninput="adjVal('vibrance',this);applyBasicAdj('vibrance',this.value)"></div>
+            <div class="adj-row"><label>Насыщенность <span class="adj-val" id="v-saturation">0</span></label>
+              <input type="range" min="-100" max="100" value="0" oninput="adjVal('saturation',this);applyBasicAdj('saturation',this.value)"></div>
+            <button class="adj-reset" onclick="resetBasicAdj()">Сбросить</button>
+          </div>
+        </div>
+
+        <!-- ── Смешение ч/б ───────────────────────── -->
+        <div class="adj-section">
+          <div class="adj-header" onclick="toggleAdj('bwmix')">
+            <span class="adj-arrow" id="arrow-bwmix">▶</span> Смешение ч/б
+          </div>
+          <div class="adj-body" id="body-bwmix" style="display:none">
+            <div class="adj-row"><label>Красные <span class="adj-val" id="v-red">40</span></label>
+              <input type="range" min="-200" max="200" value="40" oninput="adjVal('red',this);applyBWMix('red',this.value)"></div>
+            <div class="adj-row"><label>Оранжевые <span class="adj-val" id="v-orange">33</span></label>
+              <input type="range" min="-200" max="200" value="33" oninput="adjVal('orange',this);applyBWMix('orange',this.value)"></div>
+            <div class="adj-row"><label>Жёлтые <span class="adj-val" id="v-yellow">17</span></label>
+              <input type="range" min="-200" max="200" value="17" oninput="adjVal('yellow',this);applyBWMix('yellow',this.value)"></div>
+            <div class="adj-row"><label>Зелёные <span class="adj-val" id="v-green">-20</span></label>
+              <input type="range" min="-200" max="200" value="-20" oninput="adjVal('green',this);applyBWMix('green',this.value)"></div>
+            <div class="adj-row"><label>Аквамариновые <span class="adj-val" id="v-aqua">-8</span></label>
+              <input type="range" min="-200" max="200" value="-8" oninput="adjVal('aqua',this);applyBWMix('aqua',this.value)"></div>
+            <div class="adj-row"><label>Синие <span class="adj-val" id="v-blue">-10</span></label>
+              <input type="range" min="-200" max="200" value="-10" oninput="adjVal('blue',this);applyBWMix('blue',this.value)"></div>
+            <div class="adj-row"><label>Лиловые <span class="adj-val" id="v-lavender">0</span></label>
+              <input type="range" min="-200" max="200" value="0" oninput="adjVal('lavender',this);applyBWMix('lavender',this.value)"></div>
+            <div class="adj-row"><label>Пурпурные <span class="adj-val" id="v-magenta">0</span></label>
+              <input type="range" min="-200" max="200" value="0" oninput="adjVal('magenta',this);applyBWMix('magenta',this.value)"></div>
+            <button class="adj-reset" onclick="resetBWMix()">Сбросить</button>
+          </div>
+        </div>
+
+        <!-- ── Ластик ─────────────────────────────── -->
+        <div class="adj-section">
+          <div class="adj-header" onclick="toggleAdj('eraser')">
+            <span class="adj-arrow" id="arrow-eraser">▶</span> Ластик фона
+          </div>
+          <div class="adj-body" id="body-eraser" style="display:none">
+            <p style="font-size:11px;color:#888;margin:0 0 6px">Белый маркер стирает лишние области на ч/б фоне. Активируй кнопку «◯ Ластик» на холсте. Колесо мыши меняет размер.</p>
+            <div class="adj-row"><label>Размер: <span id="eraserSizeVal2"></span>px</label>
+              <input type="range" id="eraserSizeSlider" min="5" max="150" value="30"
+                oninput="eraserSize=+this.value;document.getElementById('eraserSizeVal').textContent=this.value;this.previousElementSibling.querySelector('span').textContent=this.value"></div>
+            <button class="adj-reset" onclick="clearEraserStrokes()" style="background:#ff3b3022;color:#c0392b;border-color:#ff3b3055">Очистить стирания</button>
+          </div>
+        </div>
+
         <hr id="roomsDivider" style="display:none">
         <div class="section-label" id="roomsTitle" style="display:none">Помещения</div>
 
@@ -322,7 +417,9 @@
         <button class="emode-btn"        id="emodeEdit"     onclick="setEditMode('edit')">✏️ Редактировать</button>
         <button class="emode-btn danger" id="emodeDelete"   onclick="setEditMode('delete')">🗑 Удалить</button>
         <button class="emode-btn collider" id="emodeDraw" onclick="setEditMode('collider')" title="Нарисуй прямоугольное помещение на плане">✚ Помещение</button>
+        <button class="emode-btn eraser"   id="emodeEraser" onclick="setEditMode('eraser')" title="Белый ластик — стирает фон (колесо мыши меняет размер)">◯ Ластик <span id="eraserSizeVal">30</span>px</button>
         <div class="et-sep"></div>
+        <button class="emode-btn" onclick="undo()" id="undoBtn" disabled title="Отменить последнее действие (Ctrl+Z)">↩ Шаг назад</button>
         <button class="emode-btn" onclick="saveEdits()" id="saveEditsBtn" style="display:none">💾 Сохранить правки</button>
         <span class="training-badge" id="trainingBadge">✦ обучено</span>
       </div>
@@ -352,6 +449,37 @@
   </div>
 </div>
 
+<script>
+function toggleAdj(id) {
+  const body  = document.getElementById('body-' + id)
+  const arrow = document.getElementById('arrow-' + id)
+  const open  = body.style.display === 'none'
+  body.style.display = open ? '' : 'none'
+  arrow.classList.toggle('open', open)
+}
+function adjVal(key, el) {
+  const span = document.getElementById('v-' + key)
+  if (span) span.textContent = el.value
+}
+function resetBasicAdj() {
+  const keys = ['exposure','contrast','highlights','shadows','whites','blacks','texture','clarity','dehaze','vibrance','saturation']
+  keys.forEach(k => {
+    const el = document.querySelector(`#body-basic input[oninput*="'${k}'"]`)
+    if (el) { el.value = 0; adjVal(k, el); }
+  })
+  if (typeof applyBasicAdj !== 'undefined') {
+    keys.forEach(k => applyBasicAdj(k, 0))
+  }
+}
+function resetBWMix() {
+  const defaults = { red:40, orange:33, yellow:17, green:-20, aqua:-8, blue:-10, lavender:0, magenta:0 }
+  Object.entries(defaults).forEach(([k, v]) => {
+    const el = document.querySelector(`#body-bwmix input[oninput*="'${k}'"]`)
+    if (el) { el.value = v; adjVal(k, el); }
+    if (typeof applyBWMix !== 'undefined') applyBWMix(k, v)
+  })
+}
+</script>
 <script src="planner.js"></script>
 </body>
 </html>

@@ -26,6 +26,16 @@ let hoverState       = null     // { roomId, ptIdx, edgeIdx } — what cursor is
 let hasUnsavedEdits  = false
 let trainingCount    = 0        // cached count of saved training samples
 
+// ── Undo history ───────────────────────────────────────────
+const MAX_UNDO       = 30
+let undoStack        = []       // each entry: deep copy of rooms array
+
+// ── Eraser state ───────────────────────────────────────────
+let eraserStrokes    = []       // array of strokes; each stroke = array of {x,y,r} in image coords
+let eraserActive     = false    // currently drawing eraser stroke
+let eraserCurrentStroke = []
+let eraserSize       = 30       // radius in image px
+
 // ── Room drawing state ──────────────────────────────────────
 // Users can draw rectangular rooms manually on the canvas.
 let roomDraw         = null     // {x0,y0,x1,y1} — rect being drawn right now
@@ -64,6 +74,7 @@ const aiInfo            = document.getElementById('aiInfo')
 const localParams       = document.getElementById('localParams')
 const editToolbar       = document.getElementById('editToolbar')
 const saveEditsBtn      = document.getElementById('saveEditsBtn')
+const undoBtn           = document.getElementById('undoBtn')
 const trainingBadge     = document.getElementById('trainingBadge')
 
 const paramThreshold = document.getElementById('paramThreshold')
@@ -162,6 +173,7 @@ function loadFile(filePath) {
     img.onload = () => {
       currentImageEl = img
       currentImageBW = makeBWCanvas(img)
+      eraserStrokes = []
       resizeCanvas(img)
       drawPlan()
       canvas.style.display = 'block'
@@ -172,6 +184,12 @@ function loadFile(filePath) {
   } catch(e) { alert('Ошибка загрузки: ' + e.message) }
 }
 
+// ── BG adjustment state ────────────────────────────────────
+// Смешение ч/б (Camera Raw style)
+let bwMix = { red: 40, orange: 33, yellow: 17, green: -20, aqua: -8, blue: -10, lavender: 0, magenta: 0 }
+// Основные (Camera Raw style)
+let basicAdj = { exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0, texture: 0, clarity: 0, dehaze: 0, vibrance: 0, saturation: 0 }
+
 // Offscreen B&W canvas (used for export visuals)
 function makeBWCanvas(img) {
   const off = document.createElement('canvas')
@@ -179,13 +197,116 @@ function makeBWCanvas(img) {
   const c = off.getContext('2d')
   c.drawImage(img, 0, 0)
   const imageData = c.getImageData(0, 0, off.width, off.height)
-  const d = imageData.data
-  for (let i = 0; i < d.length; i += 4) {
-    const gray = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2]
-    d[i] = d[i+1] = d[i+2] = gray
-  }
+  applyBWProcessing(imageData.data)
   c.putImageData(imageData, 0, 0)
   return off
+}
+
+// Rebuild BW canvas from original image with current settings
+function rebuildBWCanvas() {
+  if (!currentImageEl) return
+  currentImageBW = makeBWCanvas(currentImageEl)
+  // Re-apply eraser strokes on top
+  if (eraserStrokes.length) {
+    const c = currentImageBW.getContext('2d')
+    c.fillStyle = '#ffffff'
+    for (const stroke of eraserStrokes) {
+      for (const pt of stroke) {
+        c.beginPath()
+        c.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2)
+        c.fill()
+      }
+    }
+  }
+  drawPlan()
+}
+
+function applyBWProcessing(d) {
+  // Step 1: Apply basic adjustments (exposure, contrast, etc.) in linear light
+  const expMult  = Math.pow(2, basicAdj.exposure * 0.04)
+  const contr    = basicAdj.contrast  / 100
+  const hi       = basicAdj.highlights / 200
+  const sh       = basicAdj.shadows    / 200
+  const wh       = basicAdj.whites     / 200
+  const bl       = basicAdj.blacks     / 200
+  const sat      = 1 + basicAdj.saturation / 100
+  const vib      = basicAdj.vibrance   / 200
+  const clar     = basicAdj.clarity    / 100
+  const deh      = basicAdj.dehaze     / 100
+
+  for (let i = 0; i < d.length; i += 4) {
+    let r = d[i] / 255, g = d[i+1] / 255, b = d[i+2] / 255
+
+    // Exposure
+    r *= expMult; g *= expMult; b *= expMult
+
+    // Saturation & Vibrance (before BW conversion)
+    const lum = 0.299*r + 0.587*g + 0.114*b
+    const maxC = Math.max(r,g,b)
+    const satFactor = sat + vib * (1 - Math.abs(2*lum - 1))
+    r = lum + (r - lum) * satFactor
+    g = lum + (g - lum) * satFactor
+    b = lum + (b - lum) * satFactor
+
+    // Dehaze (local contrast boost via lift/gamma)
+    if (deh !== 0) {
+      r = Math.max(0, r - deh * 0.15); g = Math.max(0, g - deh * 0.15); b = Math.max(0, b - deh * 0.15)
+    }
+
+    // Camera Raw BW Mix: hue-based weighting
+    // Convert to HSL to determine dominant hue
+    const cMax = Math.max(r,g,b), cMin = Math.min(r,g,b), delta = cMax - cMin
+    let hue = 0
+    if (delta > 0.001) {
+      if (cMax === r)      hue = 60 * (((g - b) / delta) % 6)
+      else if (cMax === g) hue = 60 * ((b - r) / delta + 2)
+      else                 hue = 60 * ((r - g) / delta + 4)
+      if (hue < 0) hue += 360
+    }
+    const satLevel = cMax > 0.001 ? delta / cMax : 0
+
+    // BW mix contribution
+    let mixShift = 0
+    if (satLevel > 0.05) {
+      const mx = bwMix
+      // Blend between adjacent hue stops
+      const stops = [
+        { h:   0, v: mx.red },   { h:  30, v: mx.orange }, { h:  60, v: mx.yellow },
+        { h: 120, v: mx.green },  { h: 180, v: mx.aqua },   { h: 240, v: mx.blue },
+        { h: 280, v: mx.lavender }, { h: 320, v: mx.magenta }, { h: 360, v: mx.red },
+      ]
+      for (let s = 0; s < stops.length - 1; s++) {
+        if (hue >= stops[s].h && hue < stops[s+1].h) {
+          const t = (hue - stops[s].h) / (stops[s+1].h - stops[s].h)
+          mixShift = (stops[s].v * (1-t) + stops[s+1].v * t) / 200
+          break
+        }
+      }
+      mixShift *= satLevel
+    }
+
+    // Convert to gray with BW mix
+    let gray = 0.299*r + 0.587*g + 0.114*b + mixShift
+    gray = Math.max(0, Math.min(1, gray))
+
+    // Contrast (S-curve around 0.5)
+    if (contr !== 0) gray = gray + contr * (gray - 0.5) * (1 - Math.abs(gray - 0.5)) * 2
+
+    // Tone range adjustments
+    if (gray > 0.5) gray = gray + hi * (gray - 0.5) * 2
+    else            gray = gray + sh * (0.5 - gray) * 2
+    if (gray > 0.85) gray = gray + wh * (gray - 0.85) / 0.15
+    if (gray < 0.15) gray = gray - bl * (0.15 - gray) / 0.15
+
+    // Texture (local sharpening approximation via gamma)
+    if (clar !== 0) {
+      const sign = gray > 0.5 ? 1 : -1
+      gray = gray + clar * sign * Math.pow(Math.abs(gray - 0.5), 0.7) * 0.3
+    }
+
+    gray = Math.max(0, Math.min(1, gray)) * 255
+    d[i] = d[i+1] = d[i+2] = gray
+  }
 }
 
 function resizeCanvas(img) {
@@ -209,6 +330,9 @@ function clearResults() {
   rooms = []; originalRooms = []; selectedRoomId = null; selectedRoomIds = new Set()
   hasUnsavedEdits = false; dragState = null; hoverState = null
   roomDraw = null; drawnRoomCount = 0
+  undoStack = []
+  if (undoBtn) undoBtn.disabled = true
+  eraserStrokes = []; eraserActive = false
   saveBar.classList.remove('visible')
   editToolbar.classList.remove('visible')
   roomsTitle.style.display = 'none'; roomsDivider.style.display = 'none'
@@ -480,6 +604,7 @@ function computeLocalLearning(trainingData) {
 
   const keptFracs    = []   // нормализованные площади оставленных комнат
   const deletedFracs = []   // нормализованные площади удалённых комнат
+  const addedFracs   = []   // нормализованные площади добавленных пользователем комнат
 
   for (const sample of localSamples) {
     // imageHash формат: "WxH_<первые 80 символов b64>"
@@ -489,11 +614,23 @@ function computeLocalLearning(trainingData) {
     if (!imgArea) continue
 
     const deletedSet = new Set(sample.deletedIds || [])
+    const addedSet   = new Set(sample.addedIds   || [])
+
     for (const r of (sample.original || [])) {
       if (typeof r.areaPx !== 'number') continue
       const frac = r.areaPx / imgArea
       if (deletedSet.has(r.id)) deletedFracs.push(frac)
       else                       keptFracs.push(frac)
+    }
+
+    // Добавленные пользователем помещения — явный позитивный сигнал:
+    // пользователь счёл нужным нарисовать именно такой размер → расширяем диапазон
+    for (const r of (sample.edited || [])) {
+      if (!addedSet.has(r.id)) continue
+      if (typeof r.areaPx !== 'number') continue
+      const frac = r.areaPx / imgArea
+      addedFracs.push(frac)
+      keptFracs.push(frac)   // тоже входит в «правильный» диапазон
     }
   }
 
@@ -515,6 +652,7 @@ function computeLocalLearning(trainingData) {
     sampleCount: localSamples.length,
     keptCount:   keptFracs.length,
     deletedCount: deletedFracs.length,
+    addedCount:  addedFracs.length,
     filterAccuracy: deletedFracs.length
       ? Math.round(truePositives / deletedFracs.length * 100)
       : null,
@@ -583,7 +721,8 @@ async function analyseLocal() {
   if (learned) {
     const accNote    = learned.filterAccuracy !== null ? `, точность ${learned.filterAccuracy}%` : ''
     const filterNote = filteredCount > 0 ? ` · −${filteredCount} отф.` : ''
-    viewLabel.textContent += ` · ✦ обучение: ${learned.sampleCount} образц.${filterNote}${accNote}`
+    const addedNote  = learned.addedCount  > 0 ? ` · +${learned.addedCount} доб.` : ''
+    viewLabel.textContent += ` · ✦ обучение: ${learned.sampleCount} образц.${filterNote}${addedNote}${accNote}`
   }
 }
 
@@ -591,6 +730,8 @@ function finishAnalysis() {
   // Snapshot for training diff
   originalRooms = rooms.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) }))
   hasUnsavedEdits = false
+  undoStack = []
+  if (undoBtn) undoBtn.disabled = true
   buildRoomList()
   drawPlan()
   saveBar.classList.add('visible')
@@ -609,7 +750,8 @@ function setEditMode(m) {
   document.getElementById('emodeEdit').classList.toggle('active',     m === 'edit')
   document.getElementById('emodeDelete').classList.toggle('active',   m === 'delete')
   document.getElementById('emodeDraw').classList.toggle('active',     m === 'collider')
-  canvas.className = m !== 'view' ? `mode-${m}` : ''
+  document.getElementById('emodeEraser')?.classList.toggle('active',  m === 'eraser')
+  canvas.className = m === 'eraser' ? 'mode-eraser' : m !== 'view' ? `mode-${m}` : ''
   hoverState = null
   dragState  = null
   roomDraw   = null
@@ -673,12 +815,33 @@ function hitTest(cx, cy) {
 }
 
 // ── Polygon editing ────────────────────────────────────────
+function deepCopyRooms(src) {
+  return src.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) }))
+}
+
+function pushUndo() {
+  undoStack.push(deepCopyRooms(rooms))
+  if (undoStack.length > MAX_UNDO) undoStack.shift()
+  if (undoBtn) undoBtn.disabled = false
+}
+
+function undo() {
+  if (!undoStack.length) return
+  rooms = undoStack.pop()
+  if (undoBtn) undoBtn.disabled = undoStack.length === 0
+  buildRoomList()
+  drawPlan()
+  hasUnsavedEdits = undoStack.length > 0
+  saveEditsBtn.style.display = hasUnsavedEdits ? '' : 'none'
+}
+
 function markEdited() {
   hasUnsavedEdits = true
   saveEditsBtn.style.display = ''
 }
 
 function deleteRoom(id) {
+  pushUndo()
   rooms = rooms.filter(r => r.id !== id)
   if (selectedRoomId === id) selectedRoomId = null
   buildRoomList()
@@ -687,6 +850,7 @@ function deleteRoom(id) {
 }
 
 function addVertexOnEdge(roomId, edgeIdx, cx, cy) {
+  pushUndo()
   const room = rooms.find(r => r.id === roomId)
   if (!room) return
   const [ix, iy] = canvasToImage(cx, cy)
@@ -698,6 +862,7 @@ function addVertexOnEdge(roomId, edgeIdx, cx, cy) {
 function removeVertex(roomId, ptIdx) {
   const room = rooms.find(r => r.id === roomId)
   if (!room || room.polygon.length <= 3) return  // keep minimum 3 pts
+  pushUndo()
   room.polygon.splice(ptIdx, 1)
   markEdited()
 }
@@ -714,6 +879,22 @@ function getCanvasXY(e) {
 canvas.addEventListener('mousedown', e => {
   if (!currentImageEl) return
   const [cx, cy] = getCanvasXY(e)
+
+  // ── Eraser ─────────────────────────────────────────────
+  if (editMode === 'eraser') {
+    eraserActive = true
+    eraserCurrentStroke = []
+    eraserStrokes.push(eraserCurrentStroke)
+    const [ix, iy] = canvasToImage(cx, cy)
+    const r = eraserSize * currentImageEl.naturalWidth / canvas.width
+    eraserCurrentStroke.push({ x: ix, y: iy, r })
+    const bwCtx = currentImageBW.getContext('2d')
+    bwCtx.fillStyle = '#ffffff'
+    bwCtx.beginPath(); bwCtx.arc(ix, iy, r, 0, Math.PI * 2); bwCtx.fill()
+    drawPlan()
+    e.preventDefault()
+    return
+  }
 
   // ── Room drawing ───────────────────────────────────────
   if (editMode === 'collider') {
@@ -742,6 +923,7 @@ canvas.addEventListener('mousedown', e => {
     if (!hit) return
     if (hit.ptIdx !== undefined) {
       // Start dragging vertex
+      pushUndo()
       dragState = { roomId: hit.roomId, ptIdx: hit.ptIdx }
       selectRoom(hit.roomId)
       e.preventDefault()
@@ -773,6 +955,30 @@ canvas.addEventListener('mousedown', e => {
 canvas.addEventListener('mousemove', e => {
   if (!currentImageEl) return
   const [cx, cy] = getCanvasXY(e)
+
+  // ── Eraser drag ────────────────────────────────────────
+  if (editMode === 'eraser') {
+    canvas.style.cursor = 'none'
+    drawPlan()  // redraw to show eraser cursor preview
+    if (eraserActive && currentImageBW) {
+      const [ix, iy] = canvasToImage(cx, cy)
+      const r = eraserSize * currentImageEl.naturalWidth / canvas.width
+      eraserCurrentStroke.push({ x: ix, y: iy, r })
+      const bwCtx = currentImageBW.getContext('2d')
+      bwCtx.fillStyle = '#ffffff'
+      bwCtx.beginPath(); bwCtx.arc(ix, iy, r, 0, Math.PI * 2); bwCtx.fill()
+      drawPlan()
+    }
+    // Draw eraser cursor ring
+    const r = eraserSize
+    ctx.save()
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 1.5
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke()
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke()
+    ctx.restore()
+    return
+  }
 
   // ── Room draw drag ─────────────────────────────────────
   if (editMode === 'collider') {
@@ -822,6 +1028,13 @@ canvas.addEventListener('mousemove', e => {
 })
 
 canvas.addEventListener('mouseup', e => {
+  // ── Finish eraser stroke ───────────────────────────────
+  if (editMode === 'eraser') {
+    eraserActive = false
+    eraserCurrentStroke = []
+    return
+  }
+
   // ── Finish room draw ───────────────────────────────────
   if (editMode === 'collider' && roomDraw) {
     const { x0, y0, x1, y1 } = roomDraw
@@ -831,6 +1044,7 @@ canvas.addEventListener('mouseup', e => {
       const lx = Math.min(x0, x1), ly = Math.min(y0, y1)
       const rx = Math.max(x0, x1), ry = Math.max(y0, y1)
       drawnRoomCount++
+      pushUndo()
       const newRoom = {
         id:      `drawn${Date.now()}`,
         label:   `Помещение ${rooms.length + 1}`,
@@ -895,6 +1109,11 @@ async function saveEdits() {
     .filter(o => !rooms.find(r => r.id === o.id))
     .map(o => o.id)
 
+  // Track rooms added by the user (not in original set)
+  const addedIds = rooms
+    .filter(r => !originalRooms.find(o => o.id === r.id))
+    .map(r => r.id)
+
   const sample = {
     imageHash:  hash,
     savedAt:    new Date().toISOString(),
@@ -902,10 +1121,13 @@ async function saveEdits() {
     original:   originalRooms,
     edited:     rooms.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) })),
     deletedIds,
+    addedIds,
   }
 
   const count = await ipcRenderer.invoke('save-training-sample', sample)
   hasUnsavedEdits = false
+  undoStack = []
+  if (undoBtn) undoBtn.disabled = true
   saveEditsBtn.style.display = 'none'
   trainingCount = count
   await updateTrainingBadge()
@@ -1314,6 +1536,41 @@ function showProgress(text, step) {
 function setProgressStep(s) { progressStep.textContent = s }
 function hideProgress() { progressOverlay.classList.remove('visible') }
 
+// ── Eraser wheel: change size ──────────────────────────────
+canvas.addEventListener('wheel', e => {
+  if (editMode !== 'eraser') return
+  e.preventDefault()
+  eraserSize = Math.max(5, Math.min(150, eraserSize - Math.sign(e.deltaY) * 3))
+  const sizeEl = document.getElementById('eraserSizeVal')
+  if (sizeEl) sizeEl.textContent = eraserSize
+  const sizeEl2 = document.getElementById('eraserSizeVal2')
+  if (sizeEl2) sizeEl2.textContent = eraserSize
+  const slider = document.getElementById('eraserSizeSlider')
+  if (slider) slider.value = eraserSize
+  drawPlan()
+}, { passive: false })
+
+// Clear all eraser strokes and rebuild BW canvas
+function clearEraserStrokes() {
+  eraserStrokes = []
+  rebuildBWCanvas()
+}
+
+// Apply bg panel changes
+function applyBWMix(key, val) {
+  bwMix[key] = Number(val)
+  rebuildBWCanvas()
+}
+function applyBasicAdj(key, val) {
+  basicAdj[key] = Number(val)
+  rebuildBWCanvas()
+}
+
 // ── Boot ───────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+    if (undoStack.length) { e.preventDefault(); undo() }
+  }
+})
 init()
 updateTrainingBadge()
