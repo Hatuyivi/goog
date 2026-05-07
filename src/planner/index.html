@@ -153,8 +153,31 @@
   }
   #planCanvas {
     border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,.15);
-    max-width: 100%; max-height: 100%; display: none; cursor: crosshair;
+    max-width: 100%; max-height: 100%; display: none; cursor: default;
   }
+  #planCanvas.mode-edit   { cursor: crosshair; }
+  #planCanvas.mode-delete { cursor: not-allowed; }
+
+  .edit-toolbar {
+    display: none; align-items: center; padding: 0 10px; gap: 6px;
+    height: 34px; background: #f5f5f7; border-top: 1px solid #e0e0e5; flex-shrink: 0;
+  }
+  .edit-toolbar.visible { display: flex; }
+  .edit-toolbar .et-label { font-size: 11px; color: #888; margin-right: 4px; }
+  .edit-toolbar .et-sep { width: 1px; height: 18px; background: #ddd; margin: 0 4px; }
+  .emode-btn {
+    padding: 3px 10px; border-radius: 5px; font-size: 11px; font-weight: 600;
+    border: none; cursor: pointer; background: #e8e8ed; color: #555; transition: all .12s;
+  }
+  .emode-btn:hover:not(.active) { background: #d8d8dd; }
+  .emode-btn.active { background: #007aff; color: #fff; }
+  .emode-btn.danger.active { background: #ff3b30; color: #fff; }
+  .training-badge {
+    margin-left: auto; font-size: 10px; color: #34c759; font-weight: 600;
+    background: #f0fff4; border: 1px solid #c3f0cd; border-radius: 5px;
+    padding: 2px 7px; display: none;
+  }
+  .training-badge.visible { display: block; }
   .canvas-placeholder { display: flex; flex-direction: column; align-items: center; gap: 10px; color: #aaa; }
   .canvas-placeholder .big-icon { font-size: 56px; }
   .canvas-placeholder p { font-size: 13px; }
@@ -247,7 +270,7 @@
           </div>
           <div class="param-row">
             <label>Мин. площадь помещения <span id="vMin">0.30%</span></label>
-            <input type="range" id="paramMinArea" min="1" max="50" value="3">
+            <input type="range" id="paramMinArea" min="1" max="50" value="1">
           </div>
           <div class="param-row">
             <label>Сглаживание полигонов <span id="vEps">3 px</span></label>
@@ -282,6 +305,17 @@
         <span class="view-label" id="viewLabel">Загрузи план слева</span>
         <button class="view-btn active" id="viewAll"      onclick="setView('all')"      style="display:none">Все</button>
         <button class="view-btn"        id="viewSelected" onclick="setView('selected')" style="display:none">Выбранное</button>
+      </div>
+
+      <!-- Edit mode toolbar (visible after recognition) -->
+      <div class="edit-toolbar" id="editToolbar">
+        <span class="et-label">Редактор:</span>
+        <button class="emode-btn active" id="emodeView"   onclick="setEditMode('view')">👁 Просмотр</button>
+        <button class="emode-btn"        id="emodeEdit"   onclick="setEditMode('edit')">✏️ Редактировать</button>
+        <button class="emode-btn danger" id="emodeDelete" onclick="setEditMode('delete')">🗑 Удалить</button>
+        <div class="et-sep"></div>
+        <button class="emode-btn" onclick="saveEdits()" id="saveEditsBtn" style="display:none">💾 Сохранить правки</button>
+        <span class="training-badge" id="trainingBadge">✦ обучено</span>
       </div>
 
       <div class="canvas-wrap">

@@ -399,80 +399,8 @@ async function analyseAI() {
   finishAnalysis()
 }
 
-// ── Local CV learning ──────────────────────────────────────
-// Анализирует накопленные правки пользователя и возвращает
-// диапазоны нормализованной площади (доля от площади изображения),
-// которые стоит сохранять или отбрасывать.
-function computeLocalLearning(trainingData) {
-  // Берём только локальные образцы (обратная совместимость: mode отсутствует → тоже считаем local)
-  const localSamples = trainingData.filter(s => !s.mode || s.mode === 'local')
-  if (!localSamples.length) return null
-
-  const keptFracs    = []   // нормализованные площади оставленных комнат
-  const deletedFracs = []   // нормализованные площади удалённых комнат
-
-  for (const sample of localSamples) {
-    // imageHash формат: "WxH_<первые 80 символов b64>"
-    const m = (sample.imageHash || '').match(/^(\d+)x(\d+)_/)
-    if (!m) continue
-    const imgArea = Number(m[1]) * Number(m[2])
-    if (!imgArea) continue
-
-    const deletedSet = new Set(sample.deletedIds || [])
-    for (const r of (sample.original || [])) {
-      if (typeof r.areaPx !== 'number') continue
-      const frac = r.areaPx / imgArea
-      if (deletedSet.has(r.id)) deletedFracs.push(frac)
-      else                       keptFracs.push(frac)
-    }
-  }
-
-  if (keptFracs.length === 0) return null
-  keptFracs.sort((a, b) => a - b)
-
-  // p5 / p98 — устойчивые границы без выбросов
-  const idxLow  = Math.max(0, Math.floor(keptFracs.length * 0.05))
-  const idxHigh = Math.min(keptFracs.length - 1, Math.floor(keptFracs.length * 0.98))
-  const minAreaFrac = keptFracs[idxLow]
-  const maxAreaFrac = keptFracs[idxHigh]
-
-  // Считаем, сколько «удалённых» попадало вне диапазона — качество обучения
-  const truePositives = deletedFracs.filter(f => f < minAreaFrac || f > maxAreaFrac).length
-
-  return {
-    minAreaFrac,
-    maxAreaFrac,
-    sampleCount: localSamples.length,
-    keptCount:   keptFracs.length,
-    deletedCount: deletedFracs.length,
-    filterAccuracy: deletedFracs.length
-      ? Math.round(truePositives / deletedFracs.length * 100)
-      : null,
-  }
-}
-
 async function analyseLocal() {
-  showProgress('Локальный анализ…', 'Загрузка данных обучения')
-  await tick()
-
-  // ── Загружаем накопленные правки ───────────────────────
-  const trainingData = await ipcRenderer.invoke('get-training-data')
-
-  // ── Функция 1: точное восстановление ──────────────────
-  // Если это изображение уже исправлялось — возвращаем сохранённый результат.
-  const hash = imageHash()
-  const exactMatch = trainingData.find(
-    s => s.imageHash === hash && (s.mode === 'local' || !s.mode) && s.edited?.length
-  )
-  if (exactMatch) {
-    rooms = exactMatch.edited.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) }))
-    finishAnalysis()
-    viewLabel.textContent = `✦ Восстановлено из обучения: ${rooms.length} помещений`
-    return
-  }
-
-  // ── Стандартная детекция ───────────────────────────────
-  setProgressStep('Подготовка изображения')
+  showProgress('Локальный анализ…', 'Подготовка изображения')
   await tick()
 
   const tManual = Number(paramThreshold.value)         // 0 = auto (Otsu)
@@ -489,32 +417,9 @@ async function analyseLocal() {
     minAreaFrac: minPct,
     epsilon,
   })
-
-  // ── Функция 2: автофильтрация по накопленным площадям ─
-  // Учится на том, комнаты каких размеров пользователь обычно удаляет.
-  const learned = computeLocalLearning(trainingData)
-  let filteredCount = 0
-  if (learned && rooms.length) {
-    const imgArea = currentImageEl.naturalWidth * currentImageEl.naturalHeight
-    const before  = rooms.length
-    rooms = rooms.filter(r => {
-      if (typeof r.areaPx !== 'number') return true   // нет данных → не трогаем
-      const frac = r.areaPx / imgArea
-      return frac >= learned.minAreaFrac && frac <= learned.maxAreaFrac
-    })
-    filteredCount = before - rooms.length
-  }
-
   if (!rooms.length) throw new Error('Помещения не найдены. Попробуй уменьшить «Мин. площадь» или включить «Утолщение стен».')
 
   finishAnalysis()
-
-  // Показываем информацию об активном обучении в строке статуса
-  if (learned) {
-    const accNote    = learned.filterAccuracy !== null ? `, точность ${learned.filterAccuracy}%` : ''
-    const filterNote = filteredCount > 0 ? ` · −${filteredCount} отф.` : ''
-    viewLabel.textContent += ` · ✦ обучение: ${learned.sampleCount} образц.${filterNote}${accNote}`
-  }
 }
 
 function finishAnalysis() {
@@ -774,7 +679,6 @@ async function saveEdits() {
   const sample = {
     imageHash:  hash,
     savedAt:    new Date().toISOString(),
-    mode,                 // 'local' | 'ai' — чтобы отделить локальные образцы при обучении CV
     original:   originalRooms,
     edited:     rooms.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) })),
     deletedIds,
