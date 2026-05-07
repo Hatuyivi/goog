@@ -260,14 +260,18 @@
   .edit-toolbar {
     display: none; align-items: center; padding: 0 10px; gap: 5px;
     height: 34px; background: var(--surface); border-top: 1px solid var(--border); flex-shrink: 0;
+    overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: none;
   }
+  .edit-toolbar::-webkit-scrollbar { display: none; }
   .edit-toolbar.visible { display: flex; }
-  .edit-toolbar .et-label { font-size: 10px; color: var(--text-ter); margin-right: 2px; text-transform: uppercase; letter-spacing: .4px; font-weight: 600; }
-  .edit-toolbar .et-sep { width: 1px; height: 16px; background: var(--border); margin: 0 3px; }
+  .edit-toolbar .et-label { font-size: 10px; color: var(--text-ter); margin-right: 2px; text-transform: uppercase; letter-spacing: .4px; font-weight: 600; flex-shrink: 0; white-space: nowrap; }
+  .edit-toolbar .et-sep { width: 1px; height: 16px; background: var(--border); margin: 0 3px; flex-shrink: 0; }
   .emode-btn {
     padding: 3px 9px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 500;
     border: 1px solid var(--border); cursor: pointer; background: transparent;
     color: var(--text-sec); transition: all .12s; letter-spacing: -0.01em;
+    flex-shrink: 0; white-space: nowrap;
   }
   .emode-btn:hover:not(.active) { background: var(--panel); color: var(--text-pri); }
   .emode-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
@@ -277,9 +281,9 @@
   #planCanvas.mode-eraser  { cursor: none; }
 
   .training-badge {
-    margin-left: auto; font-size: 10px; color: var(--text-sec); font-weight: 600;
+    margin-left: 4px; font-size: 10px; color: var(--text-sec); font-weight: 600;
     background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm);
-    padding: 2px 7px; display: none; letter-spacing: .2px;
+    padding: 2px 7px; display: none; letter-spacing: .2px; flex-shrink: 0; white-space: nowrap;
   }
   .training-badge.visible { display: block; }
   .canvas-placeholder { display: flex; flex-direction: column; align-items: center; gap: 10px; color: var(--text-ter); }
@@ -618,6 +622,7 @@
       <div class="canvas-toolbar">
         <button class="view-btn active" id="viewAll"      onclick="setView('all')"      style="display:none">Все</button>
         <button class="view-btn"        id="viewSelected" onclick="setView('selected')" style="display:none">Выбранное</button>
+        <span class="view-label" id="viewLabel">Загрузи план слева</span>
         <!-- Zoom controls -->
         <div class="zoom-group">
           <button class="zoom-btn" onclick="zoomOut()" title="Отдалить (Ctrl −)">−</button>
