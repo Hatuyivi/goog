@@ -1322,8 +1322,7 @@ async function detectRoomsLocal(imageEl, opts) {
   // Erode to thicken walls on both
   let bin1 = binStrict, bin2 = binLoose
   for (let i = 0; i < opts.dilateK; i++) { bin1 = erode4(bin1, W, H); bin2 = erode4(bin2, W, H) }
-  // Extra erode pass on loose to ensure walls are solid
-  bin2 = erode4(bin2, W, H)
+  // (no extra erode on loose — it already shares dilateK passes; extra pass destroys small rooms)
 
   // ── Connected components ────────────────────────────────
   function floodFill(bin) {
@@ -1378,19 +1377,27 @@ async function detectRoomsLocal(imageEl, opts) {
 
   function filterRegions(regions, fillRatioMin) {
     return regions.filter(r => {
-      if (r.touchesBorder) return false
+      // Reject only if bounding box spans most of the image edge (background)
+      // A room can legally touch one border edge (plan drawn to image edge)
+      const spanX = r.maxX - r.minX, spanY = r.maxY - r.minY
+      const touchesLeft   = r.minX <= 1
+      const touchesRight  = r.maxX >= W - 2
+      const touchesTop    = r.minY <= 1
+      const touchesBottom = r.maxY >= H - 2
+      const borderSides   = (touchesLeft ? 1 : 0) + (touchesRight ? 1 : 0) +
+                            (touchesTop  ? 1 : 0) + (touchesBottom ? 1 : 0)
+      if (borderSides >= 2) return false   // true background or outer frame
       if (r.area < minArea || r.area > maxArea) return false
       const bboxArea = (r.maxX - r.minX + 1) * (r.maxY - r.minY + 1)
-      // Small rooms can have lower fill ratio (irregular shapes, notched walls)
       if (bboxArea > 0 && r.area / bboxArea < fillRatioMin) return false
       return true
     })
   }
 
-  // Strict pass: normal fill threshold
-  const cand1 = filterRegions(regions1, 0.30)
+  // Strict pass: 0.18 allows L/U-shaped rooms; background blobs have ratio ~0.05
+  const cand1 = filterRegions(regions1, 0.18)
   // Loose pass: allow slightly lower fill ratio for small rooms
-  const cand2 = filterRegions(regions2, 0.20)
+  const cand2 = filterRegions(regions2, 0.12)
 
   // ── Merge and deduplicate ───────────────────────────────
   // Prefer strict candidates; add loose ones that don't overlap with any strict.
@@ -1434,7 +1441,7 @@ async function detectRoomsLocal(imageEl, opts) {
 
     const poly = traceContour(labelsMap, r.label, W, H, r)
     if (poly.length < 4) continue
-    const simp = rdp(poly, opts.epsilon || 2)
+    const simp = rdp(poly, (opts.epsilon || 2) * scale)  // scale epsilon to working resolution
     if (simp.length < 3) continue
 
     rooms.push({
@@ -1506,7 +1513,7 @@ function traceContour(labels, label, W, H, region) {
   // Came from West (since topmost-leftmost has nothing W or N)
   let backDir = 4
 
-  const maxSteps = (region.maxX - region.minX + region.maxY - region.minY + 4) * 8
+  const maxSteps = region.area * 4 + 64  // upper bound: each pixel visited at most 4 times
   for (let step = 0; step < maxSteps; step++) {
     let found = false
     // Search 8 directions clockwise starting from (backDir + 1)
