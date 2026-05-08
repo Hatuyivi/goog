@@ -558,12 +558,24 @@ function drawPlan() {
 
   ctx.globalAlpha = 1
 
-  // Draw in-progress room rectangle (draw mode)
+  // Draw in-progress room rectangle (draw mode or rescan zone)
   if (roomDraw) {
     const csx = canvas.width  / currentImageEl.naturalWidth
     const csy = canvas.height / currentImageEl.naturalHeight
     const x0 = roomDraw.x0 * csx, y0 = roomDraw.y0 * csy
     const x1 = roomDraw.x1 * csx, y1 = roomDraw.y1 * csy
+    if (editMode === 'rescan') {
+      const iz = 1 / zoomLevel
+      ctx.save()
+      ctx.strokeStyle = '#007aff'
+      ctx.lineWidth   = 2 * iz
+      ctx.setLineDash([6 * iz, 4 * iz])
+      ctx.strokeRect(Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0))
+      ctx.fillStyle = 'rgba(0,122,255,0.08)'
+      ctx.fillRect(Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0))
+      ctx.restore()
+      return
+    }
     ctx.globalAlpha = 1
     ctx.fillStyle = DRAW_ROOM_COLOR
     ctx.fillRect(Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0))
@@ -986,6 +998,7 @@ function setEditMode(m) {
   document.getElementById('emodeDraw').classList.toggle('active',     m === 'collider')
   document.getElementById('emodeEraser')?.classList.toggle('active',  m === 'eraser')
   document.getElementById('cropBtn')?.classList.toggle('active',      m === 'crop')
+  document.getElementById('emodeRescan')?.classList.toggle('active',  m === 'rescan')
   canvas.className = m === 'eraser' ? 'mode-eraser' : m !== 'view' ? `mode-${m}` : ''
   hoverState = null
   dragState  = null
@@ -1221,6 +1234,14 @@ canvas.addEventListener('mousedown', e => {
     return
   }
 
+  // ── Rescan zone draw ────────────────────────────────────
+  if (editMode === 'rescan') {
+    const [ix, iy] = canvasToImage(cx, cy)
+    roomDraw = { x0: ix, y0: iy, x1: ix, y1: iy }
+    e.preventDefault()
+    return
+  }
+
   if (!rooms.length) return
 
   if (editMode === 'delete') {
@@ -1418,6 +1439,18 @@ canvas.addEventListener('mouseup', e => {
     return
   }
 
+  // ── Finish rescan zone ─────────────────────────────────
+  if (editMode === 'rescan' && roomDraw) {
+    const { x0, y0, x1, y1 } = roomDraw
+    roomDraw = null
+    drawPlan()
+    const minW = Math.abs(x1 - x0), minH = Math.abs(y1 - y0)
+    if (minW > 10 && minH > 10) {
+      rescanZone(Math.min(x0,x1), Math.min(y0,y1), Math.max(x0,x1), Math.max(y0,y1))
+    }
+    return
+  }
+
   if (dragState) {
     markEdited()
     dragState = null
@@ -1445,6 +1478,115 @@ canvas.addEventListener('dblclick', e => {
     drawPlan()
   }
 })
+
+// ── Rescan zone ────────────────────────────────────────────
+// Запускает детекцию на вырезанном прямоугольнике изображения.
+// Найденные новые помещения добавляются к существующим.
+// Результат автоматически сохраняется как обучающий образец.
+async function rescanZone(x0, y0, x1, y1) {
+  if (!currentImageEl) return
+  const imgW = currentImageEl.naturalWidth
+  const imgH = currentImageEl.naturalHeight
+
+  // Зажимаем зону по границам изображения
+  x0 = Math.max(0, Math.round(x0)); y0 = Math.max(0, Math.round(y0))
+  x1 = Math.min(imgW, Math.round(x1)); y1 = Math.min(imgH, Math.round(y1))
+  const zw = x1 - x0, zh = y1 - y0
+  if (zw < 10 || zh < 10) return
+
+  showProgress('Доиск…', 'Вырезаем зону')
+  await tick()
+
+  // Вырезаем фрагмент изображения в отдельный canvas
+  const zoneCanvas = document.createElement('canvas')
+  zoneCanvas.width = zw; zoneCanvas.height = zh
+  const zc = zoneCanvas.getContext('2d')
+  const srcImg = showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl)
+  zc.drawImage(srcImg, x0, y0, zw, zh, 0, 0, zw, zh)
+
+  // Применяем BW-обработку если используем цветное изображение
+  if (!showBWBackground && _rawPixels) {
+    const tmp = document.createElement('canvas')
+    tmp.width = zw; tmp.height = zh
+    const tc = tmp.getContext('2d')
+    tc.drawImage(currentImageEl, x0, y0, zw, zh, 0, 0, zw, zh)
+    const id = tc.getImageData(0, 0, zw, zh)
+    applyBWProcessing(id.data)
+    tc.putImageData(id, 0, 0)
+    zoneCanvas.getContext('2d').drawImage(tmp, 0, 0)
+  }
+
+  setProgressStep('Поиск помещений в зоне…')
+  await tick()
+
+  let found = []
+  try {
+    const tManual = Number(paramThreshold.value)
+    const dilateK = Number(paramDilate.value)
+    const minPct  = Number(paramMinArea.value) / 1000
+    const epsilon = Number(paramEpsilon.value)
+
+    const zoneRooms = await detectRoomsLocal(zoneCanvas, {
+      threshold:   tManual || null,
+      dilateK,
+      minAreaFrac: minPct,
+      epsilon,
+    })
+
+    // Переводим координаты зоны → координаты всего изображения
+    const translated = zoneRooms.map(r => ({
+      ...r,
+      polygon: r.polygon.map(([px, py]) => [px + x0, py + y0]),
+      areaPx:  r.areaPx,
+    }))
+
+    // Фильтруем дубли: пропускаем помещение если его центр попадает в уже существующий полигон
+    const newRooms = translated.filter(nr => {
+      const cx = nr.polygon.reduce((s,p)=>s+p[0],0) / nr.polygon.length
+      const cy = nr.polygon.reduce((s,p)=>s+p[1],0) / nr.polygon.length
+      const sx = canvas.width  / imgW
+      const sy = canvas.height / imgH
+      return !rooms.some(existing => {
+        if (!existing.polygon?.length) return false
+        return pointInPolygon(cx * sx, cy * sy,
+          existing.polygon.map(([ex,ey]) => [ex*sx, ey*sy]))
+      })
+    })
+
+    found = newRooms
+  } catch (err) {
+    hideProgress()
+    console.warn('rescanZone: детекция не дала результатов:', err.message)
+    setEditMode('rescan')
+    return
+  }
+
+  hideProgress()
+
+  if (!found.length) {
+    viewLabel.textContent = 'Доиск: помещений не найдено в выделенной зоне'
+    setEditMode('rescan')
+    return
+  }
+
+  // Добавляем найденные комнаты
+  pushUndo()
+  const baseIdx = rooms.length
+  found.forEach((r, i) => {
+    r.id    = `rescan_${Date.now()}_${i}`
+    r.label = `Помещение ${baseIdx + i + 1}`
+    rooms.push(r)
+  })
+
+  markEdited()
+  buildRoomList()
+  drawPlan()
+  viewLabel.textContent = `Доиск: найдено ${found.length} новых помещений — сохрани образец`
+  setEditMode('view')
+
+  // Автосохраняем обучающий образец — нашли что-то новое, это ценный сигнал
+  await saveEdits()
+}
 
 // ── Training ───────────────────────────────────────────────
 async function updateTrainingBadge() {
