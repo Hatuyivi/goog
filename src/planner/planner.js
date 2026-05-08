@@ -44,9 +44,9 @@ let panX             = 0        // pan offset in screen px
 let panY             = 0        // pan offset in screen px
 let isPanning        = false    // is user currently panning (middle-btn drag)
 let panStart         = null     // {x, y, panX, panY}
-const ZOOM_MIN       = 0.5
-const ZOOM_MAX       = 8.0
-const ZOOM_STEP      = 0.15
+const ZOOM_MIN       = 0.1
+const ZOOM_MAX       = 12.0
+const ZOOM_STEP      = 0.12
 
 // ── Room drawing state ──────────────────────────────────────
 // Users can draw rectangular rooms manually on the canvas.
@@ -666,21 +666,24 @@ async function analyseAI() {
 // Анализирует накопленные правки пользователя и возвращает
 // диапазоны нормализованной площади (доля от площади изображения),
 // которые стоит сохранять или отбрасывать.
-function computeLocalLearning(trainingData) {
-  // Берём только локальные образцы (обратная совместимость: mode отсутствует → тоже считаем local)
+function computeLocalLearning(trainingData, currentHash) {
+  // Берём только локальные образцы
   const localSamples = trainingData.filter(s => !s.mode || s.mode === 'local')
   if (!localSamples.length) return null
 
-  const keptFracs    = []   // нормализованные площади оставленных комнат
-  const deletedFracs = []   // нормализованные площади удалённых комнат
-  const addedFracs   = []   // нормализованные площади добавленных пользователем комнат
+  const keptFracs    = []
+  const deletedFracs = []
+  const addedFracs   = []
 
   for (const sample of localSamples) {
-    // imageHash формат: "WxH_<первые 80 символов b64>"
     const m = (sample.imageHash || '').match(/^(\d+)x(\d+)_/)
     if (!m) continue
     const imgArea = Number(m[1]) * Number(m[2])
     if (!imgArea) continue
+
+    // Правки с текущего плана весят вдвое — детектор точнее подстроится
+    // под конкретный масштаб/стиль чертежа, а не только под «среднее по всем»
+    const weight = (currentHash && sample.imageHash === currentHash) ? 2 : 1
 
     const deletedSet = new Set(sample.deletedIds || [])
     const addedSet   = new Set(sample.addedIds   || [])
@@ -688,40 +691,39 @@ function computeLocalLearning(trainingData) {
     for (const r of (sample.original || [])) {
       if (typeof r.areaPx !== 'number') continue
       const frac = r.areaPx / imgArea
-      if (deletedSet.has(r.id)) deletedFracs.push(frac)
-      else                       keptFracs.push(frac)
+      for (let w = 0; w < weight; w++) {
+        if (deletedSet.has(r.id)) deletedFracs.push(frac)
+        else                       keptFracs.push(frac)
+      }
     }
 
-    // Добавленные пользователем помещения — явный позитивный сигнал:
-    // пользователь счёл нужным нарисовать именно такой размер → расширяем диапазон
     for (const r of (sample.edited || [])) {
-      if (!addedSet.has(r.id)) continue
-      if (typeof r.areaPx !== 'number') continue
+      if (!addedSet.has(r.id) || typeof r.areaPx !== 'number') continue
       const frac = r.areaPx / imgArea
-      addedFracs.push(frac)
-      keptFracs.push(frac)   // тоже входит в «правильный» диапазон
+      for (let w = 0; w < weight; w++) {
+        addedFracs.push(frac)
+        keptFracs.push(frac)
+      }
     }
   }
 
   if (keptFracs.length === 0) return null
   keptFracs.sort((a, b) => a - b)
 
-  // p5 / p98 — устойчивые границы без выбросов
   const idxLow  = Math.max(0, Math.floor(keptFracs.length * 0.05))
   const idxHigh = Math.min(keptFracs.length - 1, Math.floor(keptFracs.length * 0.98))
   const minAreaFrac = keptFracs[idxLow]
   const maxAreaFrac = keptFracs[idxHigh]
 
-  // Считаем, сколько «удалённых» попадало вне диапазона — качество обучения
   const truePositives = deletedFracs.filter(f => f < minAreaFrac || f > maxAreaFrac).length
 
   return {
     minAreaFrac,
     maxAreaFrac,
-    sampleCount: localSamples.length,
-    keptCount:   keptFracs.length,
-    deletedCount: deletedFracs.length,
-    addedCount:  addedFracs.length,
+    sampleCount:   localSamples.length,
+    keptCount:     keptFracs.length,
+    deletedCount:  deletedFracs.length,
+    addedCount:    addedFracs.length,
     filterAccuracy: deletedFracs.length
       ? Math.round(truePositives / deletedFracs.length * 100)
       : null,
@@ -729,31 +731,55 @@ function computeLocalLearning(trainingData) {
 }
 
 
-// ── МОП-фильтр: учится на удалённых помещениях с низкой компактностью ─────
-function computeMopFilter(trainingData) {
+// ── Shape-фильтр: учится на compactness/aspect удалённых помещений ────────────
+// Применяется ТОЛЬКО если накопили ≥5 образцов И точность фильтра >70%.
+// Без достаточной статистики — не трогает ничего.
+function computeShapeFilter(trainingData, currentHash) {
+  const MIN_SAMPLES  = 5
+  const MIN_ACCURACY = 0.70
+
   const localSamples = trainingData.filter(s => !s.mode || s.mode === 'local')
-  if (!localSamples.length) return null
-  const deletedCompactness = [], keptCompactness = [], keptAspect = []
+  if (localSamples.length < MIN_SAMPLES) return null
+
+  const deletedShapes = []
+  const keptShapes    = []
+
   for (const sample of localSamples) {
+    const weight     = (currentHash && sample.imageHash === currentHash) ? 2 : 1
     const deletedSet = new Set(sample.deletedIds || [])
-    const allRooms = [...(sample.original || []), ...(sample.edited || [])]
+    const allRooms   = [...(sample.original || []), ...(sample.edited || [])]
     for (const r of allRooms) {
-      const c = r.compactness, a = r.aspect
-      if (typeof c !== 'number') continue
-      if (deletedSet.has(r.id)) { deletedCompactness.push(c) }
-      else { keptCompactness.push(c); if (typeof a === 'number') keptAspect.push(a) }
+      if (typeof r.compactness !== 'number' || typeof r.aspect !== 'number') continue
+      const entry = { c: r.compactness, a: r.aspect }
+      for (let w = 0; w < weight; w++) {
+        if (deletedSet.has(r.id)) deletedShapes.push(entry)
+        else                       keptShapes.push(entry)
+      }
     }
   }
-  if (!keptCompactness.length) return null
-  keptCompactness.sort((a, b) => a - b)
-  const minKeptC = keptCompactness[Math.floor(keptCompactness.length * 0.10)]
-  const avgDel = deletedCompactness.length ? deletedCompactness.reduce((s,v)=>s+v,0)/deletedCompactness.length : null
-  const hasSignal = avgDel !== null && avgDel < minKeptC * 0.85
-  const compactnessThresh = Math.max(0.05, Math.min(0.32, minKeptC * 0.72))
-  keptAspect.sort((a, b) => a - b)
-  const maxKeptAspect = keptAspect.length ? keptAspect[Math.min(keptAspect.length-1, Math.floor(keptAspect.length*0.95))] : 5
-  const aspectThresh = Math.max(3.5, Math.min(9, maxKeptAspect * 1.35))
-  return { compactnessThresh, aspectThresh, hasSignal, sampleCount: localSamples.length }
+
+  if (!keptShapes.length || !deletedShapes.length) return null
+
+  // Строим пороги по p10 оставленных (консервативно — не режем то, что пользователь хранит)
+  keptShapes.sort((a, b) => a.c - b.c)
+  const compactThresh = keptShapes[Math.floor(keptShapes.length * 0.10)].c * 0.80
+
+  keptShapes.sort((a, b) => a.a - b.a)
+  const aspectThresh  = keptShapes[Math.floor(keptShapes.length * 0.90)].a * 1.30
+
+  // Проверяем точность: сколько удалённых действительно попадают под фильтр
+  const trueFiltered = deletedShapes.filter(s => s.c < compactThresh || s.a > aspectThresh).length
+  const accuracy = trueFiltered / deletedShapes.length
+
+  // Активируем только если фильтр действительно работает
+  if (accuracy < MIN_ACCURACY) return null
+
+  return {
+    compactThresh,
+    aspectThresh,
+    accuracy: Math.round(accuracy * 100),
+    sampleCount: localSamples.length,
+  }
 }
 
 async function analyseLocal() {
@@ -763,20 +789,10 @@ async function analyseLocal() {
   // ── Загружаем накопленные правки ───────────────────────
   const trainingData = await ipcRenderer.invoke('get-training-data')
 
-  // ── Функция 1: точное восстановление ──────────────────
-  // Если это изображение уже исправлялось — возвращаем сохранённый результат.
-  const hash = imageHash()
-  const exactMatch = trainingData.find(
-    s => s.imageHash === hash && (s.mode === 'local' || !s.mode) && s.edited?.length
-  )
-  if (exactMatch) {
-    rooms = exactMatch.edited.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) }))
-    finishAnalysis()
-    viewLabel.textContent = `✦ Восстановлено из обучения: ${rooms.length} помещений`
-    return
-  }
-
   // ── Стандартная детекция ───────────────────────────────
+  // Правки пользователя — сигнал для обучения (фильтры площади и формы),
+  // а не кэш результата. Детекция запускается всегда заново.
+  const currentHash = imageHash()   // передаём в learning-функции для взвешивания
   setProgressStep('Подготовка изображения')
   await tick()
 
@@ -797,7 +813,7 @@ async function analyseLocal() {
 
   // ── Функция 2: автофильтрация по накопленным площадям ─
   // Учится на том, комнаты каких размеров пользователь обычно удаляет.
-  const learned = computeLocalLearning(trainingData)
+  const learned = computeLocalLearning(trainingData, currentHash)
   let filteredCount = 0
   if (learned && rooms.length) {
     const imgArea = currentImageEl.naturalWidth * currentImageEl.naturalHeight
@@ -812,23 +828,43 @@ async function analyseLocal() {
 
   if (!rooms.length) throw new Error('Помещения не найдены. Попробуй уменьшить «Мин. площадь» или включить «Утолщение стен».')
 
-  // Merge any overlapping auto-detected rooms
+  // ── Shape-фильтр (МОП и нестандартные формы) ──────────────────────────────
+  // Активируется только при достаточном количестве обучающих данных (≥5 образцов)
+  // и высокой точности (>70%). Без данных — не трогает ничего.
+  const shapeFilter = computeShapeFilter(trainingData, currentHash)
+  let shapeFilteredCount = 0
+  if (shapeFilter && rooms.length) {
+    const before = rooms.length
+    rooms = rooms.filter(r => {
+      if (typeof r.compactness !== 'number' || typeof r.aspect !== 'number') return true
+      if (r.compactness < shapeFilter.compactThresh) return false
+      if (r.aspect      > shapeFilter.aspectThresh)  return false
+      return true
+    })
+    shapeFilteredCount = before - rooms.length
+  }
+
+  // ── Слияние перекрывающихся комнат ────────────────────────────────────────
   const beforeMerge = rooms.length
   rooms = mergeOverlappingRooms(rooms)
-  // Re-number labels if any were merged
   if (rooms.length < beforeMerge) {
     rooms.forEach((r, i) => { r.id = `r${i+1}`; r.label = `Помещение ${i+1}` })
   }
 
   finishAnalysis()
 
-  // Показываем информацию об активном обучении в строке статуса
+  // ── Строка статуса ─────────────────────────────────────────────────────────
+  const notes = []
   if (learned) {
-    const accNote    = learned.filterAccuracy !== null ? `, точность ${learned.filterAccuracy}%` : ''
-    const filterNote = filteredCount > 0 ? ` · −${filteredCount} отф.` : ''
-    const addedNote  = learned.addedCount > 0 ? ` · +${learned.addedCount} доб.` : ''
-    viewLabel.textContent += ` · ✦ обучение: ${learned.sampleCount} образц.${filterNote}${addedNote}${accNote}`
+    notes.push(`✦ обучение: ${learned.sampleCount} образц.`)
+    if (filteredCount > 0)      notes.push(`−${filteredCount} по площади`)
+    if (learned.addedCount > 0) notes.push(`+${learned.addedCount} доб.`)
+    if (learned.filterAccuracy !== null) notes.push(`точность ${learned.filterAccuracy}%`)
   }
+  if (shapeFilter) {
+    notes.push(`−${shapeFilteredCount} по форме (${shapeFilter.accuracy}%)`)
+  }
+  if (notes.length) viewLabel.textContent += ` · ${notes.join(' · ')}`
 }
 
 function finishAnalysis() {
@@ -1127,18 +1163,24 @@ canvas.addEventListener('mousedown', e => {
     return
   }
 
-  // view mode: click selects room
-  const sx = canvas.width  / currentImageEl.naturalWidth
-  const sy = canvas.height / currentImageEl.naturalHeight
-
-  for (const room of [...rooms].reverse()) {
-    if (!room.polygon) continue
-    const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
-    if (pointInPolygon(cx, cy, pts)) { selectRoom(room.id); return }
+  // view mode: клик по комнате — выбор; клик по пустому месту — начало пана
+  if (editMode === 'view' && e.button === 0 && !e.altKey && !_spaceDown) {
+    const sx = canvas.width  / currentImageEl.naturalWidth
+    const sy = canvas.height / currentImageEl.naturalHeight
+    for (const room of [...rooms].reverse()) {
+      if (!room.polygon) continue
+      const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
+      if (pointInPolygon(cx, cy, pts)) { selectRoom(room.id); return }
+    }
+    // Пустое место — запускаем пан
+    isPanning = true
+    panStart = { x: e.clientX, y: e.clientY, panX, panY }
+    document.querySelector('.canvas-wrap').style.cursor = 'grabbing'
+    selectedRoomId = null
+    document.querySelectorAll('.room-item').forEach(el => el.classList.remove('selected'))
+    drawPlan()
+    return
   }
-  selectedRoomId = null
-  document.querySelectorAll('.room-item').forEach(el => el.classList.remove('selected'))
-  drawPlan()
 })
 
 canvas.addEventListener('mousemove', e => {
@@ -1213,6 +1255,17 @@ canvas.addEventListener('mousemove', e => {
       if (pointInPolygon(cx, cy, pts)) { canvas.style.cursor = 'not-allowed'; return }
     }
     canvas.style.cursor = 'default'; return
+  }
+
+  // view mode: курсор-рука на пустом месте подсказывает что можно тащить
+  if (editMode === 'view' && !isPanning) {
+    const sx = canvas.width  / currentImageEl.naturalWidth
+    const sy = canvas.height / currentImageEl.naturalHeight
+    const overRoom = rooms.some(room => {
+      if (!room.polygon) return false
+      return pointInPolygon(cx, cy, room.polygon.map(([x,y]) => [x*sx, y*sy]))
+    })
+    canvas.style.cursor = overRoom ? 'pointer' : (_spaceDown ? 'grab' : 'grab')
   }
 })
 
@@ -1345,7 +1398,6 @@ function tick() { return new Promise(r => setTimeout(r, 0)) }
 async function detectRoomsLocal(imageEl, opts) {
   const W0 = imageEl.naturalWidth, H0 = imageEl.naturalHeight
 
-  // Downscale for speed — but keep enough detail for small rooms
   const MAX_DIM = 2000
   const scale = Math.min(1, MAX_DIM / Math.max(W0, H0))
   const W = Math.round(W0 * scale), H = Math.round(H0 * scale)
@@ -1356,63 +1408,163 @@ async function detectRoomsLocal(imageEl, opts) {
   wctx.drawImage(imageEl, 0, 0, W, H)
   const px = wctx.getImageData(0, 0, W, H).data
 
-  // Grayscale
+  // ── Grayscale ──────────────────────────────────────────────────────────────
   const gray = new Uint8Array(W * H)
   for (let i = 0, j = 0; i < px.length; i += 4, j++) {
     gray[j] = (px[i] * 0.299 + px[i+1] * 0.587 + px[i+2] * 0.114) | 0
   }
 
-  // ── Multi-level threshold ──────────────────────────────
-  // Run two passes: global Otsu + a slightly lower threshold to catch
-  // rooms whose walls are lighter (partial walls, dashed lines).
-  const T_global = opts.threshold != null ? opts.threshold : otsu(gray)
-  // Second threshold slightly lower catches semi-dark boundaries
-  const T_loose  = Math.max(T_global - 30, 80)
+  // ── Оцениваем качество изображения ────────────────────────────────────────
+  // Стандартное отклонение яркости: низкое (<40) = плохой контраст (скан, фото телефоном)
+  // В этом случае применяем CLAHE для выравнивания контраста перед порогованием.
+  let mean = 0
+  for (let i = 0; i < gray.length; i++) mean += gray[i]
+  mean /= gray.length
+  let variance = 0
+  for (let i = 0; i < gray.length; i++) variance += (gray[i] - mean) ** 2
+  const stddev = Math.sqrt(variance / gray.length)
+  const needsCLAHE = stddev < 40
 
-  // Binary pass 1: strict (main structure)
-  const binStrict = new Uint8Array(W * H)
-  for (let i = 0; i < gray.length; i++) binStrict[i] = gray[i] > T_global ? 1 : 0
+  if (needsCLAHE) {
+    // CLAHE только на изображениях с плохим контрастом
+    // Делим на 8x8 тайлов, каждый выравниваем независимо, потом билинейно смешиваем
+    const TILE_COLS = 8, TILE_ROWS = 8, CLIP = 3.0
+    const tw = Math.ceil(W / TILE_COLS), th = Math.ceil(H / TILE_ROWS)
+    const luts = []
+    for (let tr = 0; tr < TILE_ROWS; tr++) {
+      luts[tr] = []
+      for (let tc = 0; tc < TILE_COLS; tc++) {
+        const hist = new Uint32Array(256)
+        const x0 = tc * tw, y0 = tr * th
+        const x1 = Math.min(x0 + tw, W), y1 = Math.min(y0 + th, H)
+        let count = 0
+        for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { hist[gray[y*W+x]]++; count++ }
+        const clipLimit = Math.max(1, Math.round(CLIP * count / 256))
+        let excess = 0
+        for (let v = 0; v < 256; v++) { if (hist[v] > clipLimit) { excess += hist[v] - clipLimit; hist[v] = clipLimit } }
+        const add = (excess / 256) | 0
+        for (let v = 0; v < 256; v++) hist[v] += add
+        const lut = new Uint8Array(256)
+        let cdf = 0, cdfMin = -1
+        for (let v = 0; v < 256; v++) {
+          cdf += hist[v]
+          if (cdfMin < 0 && hist[v] > 0) cdfMin = cdf
+          lut[v] = count > cdfMin ? Math.round((cdf - cdfMin) / (count - cdfMin) * 255) : v
+        }
+        luts[tr][tc] = lut
+      }
+    }
+    const out = new Uint8Array(gray.length)
+    for (let y = 0; y < H; y++) {
+      const fyRaw = (y - th/2) / th
+      const tr0 = Math.max(0, Math.min(TILE_ROWS-2, Math.floor(fyRaw)))
+      const fy  = Math.max(0, Math.min(1, fyRaw - tr0))
+      for (let x = 0; x < W; x++) {
+        const fxRaw = (x - tw/2) / tw
+        const tc0 = Math.max(0, Math.min(TILE_COLS-2, Math.floor(fxRaw)))
+        const fx  = Math.max(0, Math.min(1, fxRaw - tc0))
+        const v   = gray[y*W+x]
+        const v00 = luts[tr0][tc0][v], v01 = luts[tr0][tc0+1][v]
+        const v10 = luts[tr0+1][tc0][v], v11 = luts[tr0+1][tc0+1][v]
+        out[y*W+x] = (v00*(1-fx)*(1-fy) + v01*fx*(1-fy) + v10*(1-fx)*fy + v11*fx*fy) | 0
+      }
+    }
+    for (let i = 0; i < gray.length; i++) gray[i] = out[i]
+  }
 
-  // Binary pass 2: loose (small rooms inside thick walls)
-  const binLoose = new Uint8Array(W * H)
-  for (let i = 0; i < gray.length; i++) binLoose[i] = gray[i] > T_loose ? 1 : 0
+  // ── Адаптивный порог Саувола ───────────────────────────────────────────────
+  // Для каждого пикселя порог = локальное среднее + k * локальное σ
+  // Работает одинаково хорошо на светлых и тёмных планах — без угадывания типа.
+  // Если пользователь задал порог вручную — используем глобальный Otsu как раньше.
+  // Буферы под интегральные образы — выделяем один раз, переиспользуем в обоих вызовах
+  // Float64Array(2001×2001) = ~32 МБ × 2 = ~64 МБ, приемлемо для Electron
+  const _iSum  = new Float64Array((W+1) * (H+1))
+  const _iSum2 = new Float64Array((W+1) * (H+1))
 
-  // Erode to thicken walls on both
-  let bin1 = binStrict, bin2 = binLoose
+  function sauvolaThreshold(gray, W, H, windowR, k) {
+    const iSum  = _iSum
+    const iSum2 = _iSum2
+    // Обнуляем перед использованием (буфер переиспользуется)
+    iSum.fill(0); iSum2.fill(0)
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const v = gray[y*W+x]
+        iSum [(y+1)*(W+1)+(x+1)] = v + iSum [y*(W+1)+(x+1)] + iSum [(y+1)*(W+1)+x] - iSum [y*(W+1)+x]
+        iSum2[(y+1)*(W+1)+(x+1)] = v*v + iSum2[y*(W+1)+(x+1)] + iSum2[(y+1)*(W+1)+x] - iSum2[y*(W+1)+x]
+      }
+    }
+    const bin = new Uint8Array(W * H)
+    for (let y = 0; y < H; y++) {
+      const y0 = Math.max(0, y - windowR), y1 = Math.min(H-1, y + windowR)
+      for (let x = 0; x < W; x++) {
+        const x0 = Math.max(0, x - windowR), x1 = Math.min(W-1, x + windowR)
+        const n  = (y1-y0+1) * (x1-x0+1)
+        const s  = iSum [(y1+1)*(W+1)+(x1+1)] - iSum [y0*(W+1)+(x1+1)] - iSum [(y1+1)*(W+1)+x0] + iSum [y0*(W+1)+x0]
+        const s2 = iSum2[(y1+1)*(W+1)+(x1+1)] - iSum2[y0*(W+1)+(x1+1)] - iSum2[(y1+1)*(W+1)+x0] + iSum2[y0*(W+1)+x0]
+        const localMean = s / n
+        const localVar  = Math.max(0, s2/n - localMean*localMean)
+        const localStd  = Math.sqrt(localVar)
+        // Саувола: T = mean * (1 + k * (std/128 - 1))
+        // Пиксель светлее порога → свободное пространство (комната)
+        const T = localMean * (1 + k * (localStd / 128 - 1))
+        bin[y*W+x] = gray[y*W+x] > T ? 1 : 0
+      }
+    }
+    return bin
+  }
+
+  // Размер окна Саувола ≈ толщина стены × 3.
+  // Толщина стены эвристически: ~1% меньшей стороны, но не меньше 2px и не больше 40px.
+  // Окно = wallEst × 3, но не меньше 7 (иначе локальная статистика нестабильна).
+  const wallEst = Math.max(2, Math.min(40, Math.round(Math.min(W, H) * 0.01)))
+  const windowR = Math.max(7, wallEst * 3)
+  // k=-0.2: отрицательный → порог смещается вниз в однородных областях,
+  // что хорошо для белых комнат внутри тёмных стен
+  const K_SAUVOLA = -0.2
+
+  let bin1, bin2
+  if (opts.threshold != null) {
+    // Ручной режим: глобальный порог (как раньше)
+    const T = opts.threshold
+    bin1 = new Uint8Array(W * H)
+    bin2 = new Uint8Array(W * H)
+    const T_loose = Math.max(T - 30, 80)
+    for (let i = 0; i < gray.length; i++) { bin1[i] = gray[i] > T ? 1 : 0; bin2[i] = gray[i] > T_loose ? 1 : 0 }
+  } else {
+    // Автоматический режим: Саувола — один алгоритм для всех типов планов
+    bin1 = sauvolaThreshold(gray, W, H, windowR,      K_SAUVOLA)
+    bin2 = sauvolaThreshold(gray, W, H, windowR + 8,  K_SAUVOLA - 0.05) // чуть свободнее — ловит тонкие стены
+  }
+
+  // ── Эрозия (утолщение стен) ────────────────────────────────────────────────
   for (let i = 0; i < opts.dilateK; i++) { bin1 = erode4(bin1, W, H); bin2 = erode4(bin2, W, H) }
-  // Extra erode pass on loose to ensure walls are solid
-  bin2 = erode4(bin2, W, H)
+  bin2 = erode4(bin2, W, H)  // доп. проход для loose
 
-  // ── Connected components ────────────────────────────────
+  // ── Connected components ───────────────────────────────────────────────────
   function floodFill(bin) {
-    const labels = new Int32Array(W * H)
+    const labels  = new Int32Array(W * H)
     const regions = []
     let nextLabel = 1
-    const stack = new Int32Array(W * H)
-
+    const stack   = new Int32Array(W * H)
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
         const idx = y * W + x
         if (bin[idx] !== 1 || labels[idx] !== 0) continue
-
         let minX = x, maxX = x, minY = y, maxY = y, area = 0
         let touchesBorder = false
         let sp = 0
-        stack[sp++] = idx
-        labels[idx] = nextLabel
-
+        stack[sp++] = idx; labels[idx] = nextLabel
         while (sp > 0) {
           const p = stack[--sp]
-          const py = (p / W) | 0
-          const pxx = p - py * W
+          const py = (p / W) | 0, pxx = p - py * W
           area++
           if (pxx < minX) minX = pxx; if (pxx > maxX) maxX = pxx
           if (py  < minY) minY = py;  if (py  > maxY) maxY = py
-          if (pxx === 0 || py === 0 || pxx === W - 1 || py === H - 1) touchesBorder = true
-          if (pxx > 0)     { const n = p-1; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
-          if (pxx < W - 1) { const n = p+1; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
-          if (py  > 0)     { const n = p-W; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
-          if (py  < H - 1) { const n = p+W; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
+          if (pxx === 0 || py === 0 || pxx === W-1 || py === H-1) touchesBorder = true
+          if (pxx > 0)     { const n=p-1; if (bin[n]===1&&labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
+          if (pxx < W - 1) { const n=p+1; if (bin[n]===1&&labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
+          if (py  > 0)     { const n=p-W; if (bin[n]===1&&labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
+          if (py  < H - 1) { const n=p+W; if (bin[n]===1&&labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
         }
         regions.push({ label: nextLabel, minX, maxX, minY, maxY, area, touchesBorder })
         nextLabel++
@@ -1426,67 +1578,55 @@ async function detectRoomsLocal(imageEl, opts) {
 
   await tick()
 
-  // ── Candidate filtering ─────────────────────────────────
-  const total = W * H
-  const minArea    = total * opts.minAreaFrac
-  // No fixed maxArea ceiling — instead filter by bboxFill ratio
-  // This lets us catch small rooms while still rejecting background.
-  // Only reject regions that are overwhelmingly large (>70% of image)
-  const maxArea    = total * 0.70
+  // ── Фильтрация кандидатов ──────────────────────────────────────────────────
+  const total   = W * H
+  const minArea = total * opts.minAreaFrac
+  const maxArea = total * 0.70
 
   function filterRegions(regions, fillRatioMin) {
     return regions.filter(r => {
       if (r.touchesBorder) return false
       if (r.area < minArea || r.area > maxArea) return false
       const bboxArea = (r.maxX - r.minX + 1) * (r.maxY - r.minY + 1)
-      // Small rooms can have lower fill ratio (irregular shapes, notched walls)
       if (bboxArea > 0 && r.area / bboxArea < fillRatioMin) return false
       return true
     })
   }
 
-  // Strict pass: normal fill threshold
   const cand1 = filterRegions(regions1, 0.30)
-  // Loose pass: allow slightly lower fill ratio for small rooms
   const cand2 = filterRegions(regions2, 0.20)
 
-  // ── Merge and deduplicate ───────────────────────────────
-  // Prefer strict candidates; add loose ones that don't overlap with any strict.
-  // Two regions "overlap" if their centroids are within ~30px or bboxes >50% IoU.
-  function bbox(r) { return { x1: r.minX, y1: r.minY, x2: r.maxX, y2: r.maxY } }
+  // ── Дедупликация ───────────────────────────────────────────────────────────
+  function bboxOf(r) { return { x1: r.minX, y1: r.minY, x2: r.maxX, y2: r.maxY } }
   function iou(a, b) {
-    const ix1 = Math.max(a.x1, b.x1), iy1 = Math.max(a.y1, b.y1)
-    const ix2 = Math.min(a.x2, b.x2), iy2 = Math.min(a.y2, b.y2)
-    if (ix2 <= ix1 || iy2 <= iy1) return 0
-    const inter = (ix2 - ix1) * (iy2 - iy1)
-    const unionA = (a.x2-a.x1)*(a.y2-a.y1) + (b.x2-b.x1)*(b.y2-b.y1) - inter
-    return unionA <= 0 ? 0 : inter / unionA
+    const ix1 = Math.max(a.x1,b.x1), iy1 = Math.max(a.y1,b.y1)
+    const ix2 = Math.min(a.x2,b.x2), iy2 = Math.min(a.y2,b.y2)
+    if (ix2<=ix1||iy2<=iy1) return 0
+    const inter = (ix2-ix1)*(iy2-iy1)
+    const u = (a.x2-a.x1)*(a.y2-a.y1)+(b.x2-b.x1)*(b.y2-b.y1)-inter
+    return u<=0 ? 0 : inter/u
   }
-
   const merged = [...cand1]
-  const strictBoxes = cand1.map(bbox)
+  const strictBoxes = cand1.map(bboxOf)
   for (const r of cand2) {
-    const rb = bbox(r)
-    const overlaps = strictBoxes.some(sb => iou(sb, rb) > 0.4)
-    if (!overlaps) merged.push(r)
+    if (!strictBoxes.some(sb => iou(sb, bboxOf(r)) > 0.4)) merged.push(r)
   }
 
-  // ── Sort top-to-bottom, left-to-right ──────────────────
   merged.sort((a, b) => {
-    const cyA = (a.minY + a.maxY) / 2, cyB = (b.minY + b.maxY) / 2
-    if (Math.abs(cyA - cyB) > 20) return cyA - cyB
-    return ((a.minX + a.maxX) / 2) - ((b.minX + b.maxX) / 2)
+    const cyA = (a.minY+a.maxY)/2, cyB = (b.minY+b.maxY)/2
+    if (Math.abs(cyA-cyB) > 20) return cyA-cyB
+    return (a.minX+a.maxX)/2 - (b.minX+b.maxX)/2
   })
 
   await tick()
 
-  // ── Build polygons ──────────────────────────────────────
-  const inv = 1 / scale
+  // ── Построение полигонов + вычисление shape-метрик ─────────────────────────
+  // compactness и aspect сохраняются в каждой комнате — используются shape-фильтром
+  // в analyseLocal (только если набралось достаточно обучающих данных).
+  const inv   = 1 / scale
   const rooms = []
-
   for (let i = 0; i < merged.length; i++) {
     const r = merged[i]
-    // Use the label map that produced this candidate
     const isFromLoose = !cand1.includes(r)
     const labelsMap   = isFromLoose ? labels2 : labels1
 
@@ -1495,16 +1635,27 @@ async function detectRoomsLocal(imageEl, opts) {
     const simp = rdp(poly, opts.epsilon || 2)
     if (simp.length < 3) continue
 
+    // Compactness = 4π·Area / Perimeter² (1 = круг, → 0 = очень вытянутый)
+    let perim = 0
+    for (let k = 0; k < simp.length; k++) {
+      const [x1,y1] = simp[k], [x2,y2] = simp[(k+1)%simp.length]
+      perim += Math.hypot(x2-x1, y2-y1)
+    }
+    const compactness = perim > 0 ? (4 * Math.PI * r.area) / (perim * perim) : 1
+    const bboxW = r.maxX - r.minX + 1, bboxH = r.maxY - r.minY + 1
+    const aspect = Math.max(bboxW, bboxH) / Math.max(1, Math.min(bboxW, bboxH))
+
     rooms.push({
-      id:      `r${i + 1}`,
-      label:   `Помещение ${i + 1}`,
-      areaPx:  Math.round(r.area * inv * inv),
-      polygon: simp.map(([x, y]) => [Math.round(x * inv), Math.round(y * inv)]),
+      id:          `r${i+1}`,
+      label:       `Помещение ${i+1}`,
+      areaPx:      Math.round(r.area * inv * inv),
+      compactness: Math.round(compactness * 100) / 100,
+      aspect,
+      polygon:     simp.map(([x,y]) => [Math.round(x*inv), Math.round(y*inv)]),
     })
   }
   return rooms
 }
-
 // Otsu threshold
 function otsu(gray) {
   const hist = new Uint32Array(256)
@@ -1870,24 +2021,43 @@ function showProgress(text, step) {
 function setProgressStep(s) { progressStep.textContent = s }
 function hideProgress() { progressOverlay.classList.remove('visible') }
 
-// ── Mouse wheel: zoom canvas or change eraser size ─────────
+// ── Zoom & Pan ─────────────────────────────────────────────
+// Плавный зум: накапливаем deltaY и применяем через rAF (инерция трекпада)
+let _wheelAccum   = 0      // накопленная «сырая» дельта (px / line / page)
+let _wheelRafId   = null
+let _wheelOriginX = 0
+let _wheelOriginY = 0
+const WHEEL_SENSITIVITY = 0.0008   // px→ratio: меньше = мягче
+const WHEEL_MAX_STEP    = 0.18     // максимальный шаг за один кадр
+
+function _flushWheel() {
+  _wheelRafId = null
+  if (_wheelAccum === 0) return
+  // Нормализуем дельту — трекпад даёт маленькие дроби, мышь — 100/120/3
+  const clamped = Math.max(-WHEEL_MAX_STEP, Math.min(WHEEL_MAX_STEP, _wheelAccum * WHEEL_SENSITIVITY))
+  zoomBy(-clamped, _wheelOriginX, _wheelOriginY)
+  _wheelAccum = 0
+}
+
 document.querySelector('.canvas-wrap').addEventListener('wheel', e => {
   e.preventDefault()
   if (editMode === 'eraser') {
-    // In eraser mode: wheel changes eraser size
+    // В режиме ластика колесо меняет размер
     eraserSize = Math.max(5, Math.min(150, eraserSize - Math.sign(e.deltaY) * 3))
-    const sizeEl = document.getElementById('eraserSizeVal')
-    if (sizeEl) sizeEl.textContent = eraserSize
-    const sizeEl2 = document.getElementById('eraserSizeVal2')
-    if (sizeEl2) sizeEl2.textContent = eraserSize
-    const slider = document.getElementById('eraserSizeSlider')
-    if (slider) slider.value = eraserSize
+    const sizeEl  = document.getElementById('eraserSizeVal');   if (sizeEl)  sizeEl.textContent  = eraserSize
+    const sizeEl2 = document.getElementById('eraserSizeVal2');  if (sizeEl2) sizeEl2.textContent = eraserSize
+    const slider  = document.getElementById('eraserSizeSlider');if (slider)  slider.value        = eraserSize
     drawPlan()
-  } else {
-    // Normal mode: wheel zooms, centred on cursor
-    const delta = e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP
-    zoomBy(delta, e.clientX, e.clientY)
+    return
   }
+  // Нормализуем единицы: DOM_DELTA_LINE ≈ 16px, DOM_DELTA_PAGE ≈ 400px
+  let delta = e.deltaY
+  if (e.deltaMode === 1) delta *= 16
+  if (e.deltaMode === 2) delta *= 400
+  _wheelAccum   += delta
+  _wheelOriginX  = e.clientX
+  _wheelOriginY  = e.clientY
+  if (!_wheelRafId) _wheelRafId = requestAnimationFrame(_flushWheel)
 }, { passive: false })
 
 // ── Touch pinch-to-zoom ────────────────────────────────────
@@ -1905,8 +2075,7 @@ document.querySelector('.canvas-wrap').addEventListener('touchmove', e => {
     const ratio = dist / _lastPinchDist
     const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2
     const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2
-    const delta = ratio - 1
-    zoomBy(delta, cx, cy)
+    zoomBy(ratio - 1, cx, cy)
   }
   _lastPinchDist = dist
 }, { passive: false })
@@ -1916,15 +2085,38 @@ document.querySelector('.canvas-wrap').addEventListener('touchend', () => { _las
 document.querySelector('.canvas-wrap').addEventListener('gesturestart', e => e.preventDefault(), { passive: false })
 document.querySelector('.canvas-wrap').addEventListener('gesturechange', e => {
   e.preventDefault()
-  const delta = (e.scale - 1) * 0.08
-  zoomBy(delta)
+  zoomBy((e.scale - 1) * 0.08)
 }, { passive: false })
+
+// ── Пanning ────────────────────────────────────────────────
+// Способы начать панорамирование:
+//   1. Средняя кнопка мыши (MMB)
+//   2. Alt + ЛКМ
+//   3. Пробел + ЛКМ (Figma/Sketch стиль)
+//   4. Левая кнопка мыши в режиме просмотра (editMode === 'view') вне комнат
+let _spaceDown = false
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' && !e.repeat && !['INPUT','TEXTAREA'].includes(document.activeElement?.tagName)) {
+    e.preventDefault()
+    _spaceDown = true
+    document.querySelector('.canvas-wrap').style.cursor = 'grab'
+  }
+})
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space') {
+    _spaceDown = false
+    if (!isPanning) document.querySelector('.canvas-wrap').style.cursor = ''
+  }
+})
+
 document.querySelector('.canvas-wrap').addEventListener('mousedown', e => {
-  if (e.button === 1 || (e.button === 0 && e.altKey)) {
+  const startPan = e.button === 1 || (e.button === 0 && e.altKey) || (e.button === 0 && _spaceDown)
+  if (startPan) {
     e.preventDefault()
     isPanning = true
     panStart = { x: e.clientX, y: e.clientY, panX, panY }
-    document.querySelector('.canvas-wrap').style.cursor = 'grab'
+    document.querySelector('.canvas-wrap').style.cursor = 'grabbing'
   }
 })
 window.addEventListener('mousemove', e => {
@@ -1932,11 +2124,12 @@ window.addEventListener('mousemove', e => {
   panX = panStart.panX + (e.clientX - panStart.x)
   panY = panStart.panY + (e.clientY - panStart.y)
   applyZoomTransform()
+  document.querySelector('.canvas-wrap').style.cursor = 'grabbing'
 })
 window.addEventListener('mouseup', e => {
   if (isPanning) {
     isPanning = false; panStart = null
-    document.querySelector('.canvas-wrap').style.cursor = ''
+    document.querySelector('.canvas-wrap').style.cursor = _spaceDown ? 'grab' : ''
   }
 })
 
