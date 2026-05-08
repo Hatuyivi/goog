@@ -259,29 +259,44 @@
   /* ── Edit toolbar ─────────────────────────────────────────────────── */
   .edit-toolbar {
     display: none; align-items: center; padding: 0 10px; gap: 5px;
-    height: 34px; background: var(--surface); border-top: 1px solid var(--border); flex-shrink: 0;
-    overflow-x: auto; overflow-y: hidden;
+    min-height: 34px; background: var(--surface); border-top: 1px solid var(--border);
+    flex-shrink: 0; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden;
     scrollbar-width: none;
   }
   .edit-toolbar::-webkit-scrollbar { display: none; }
   .edit-toolbar.visible { display: flex; }
-  .edit-toolbar .et-label { font-size: 10px; color: var(--text-ter); margin-right: 2px; text-transform: uppercase; letter-spacing: .4px; font-weight: 600; flex-shrink: 0; white-space: nowrap; }
-  .edit-toolbar .et-sep { width: 1px; height: 16px; background: var(--border); margin: 0 3px; flex-shrink: 0; }
+
+  /* Группа режимов и группа действий — flex-контейнеры внутри тулбара */
+  .et-modes, .et-actions {
+    display: flex; align-items: center; gap: 4px; flex-shrink: 0;
+  }
+  /* Действия прижаты вправо */
+  .et-actions { margin-left: auto; }
+
+  .edit-toolbar .et-label {
+    font-size: 10px; color: var(--text-ter); margin-right: 2px;
+    text-transform: uppercase; letter-spacing: .4px; font-weight: 600;
+    flex-shrink: 0; white-space: nowrap;
+  }
+  .edit-toolbar .et-sep {
+    width: 1px; height: 16px; background: var(--border); margin: 0 3px; flex-shrink: 0;
+  }
   .emode-btn {
     padding: 3px 9px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 500;
     border: 1px solid var(--border); cursor: pointer; background: transparent;
     color: var(--text-sec); transition: all .12s; letter-spacing: -0.01em;
     flex-shrink: 0; white-space: nowrap;
   }
-  .emode-btn:hover:not(.active) { background: var(--panel); color: var(--text-pri); }
+  .emode-btn:hover:not(.active):not(:disabled) { background: var(--panel); color: var(--text-pri); }
+  .emode-btn:disabled { opacity: .4; cursor: default; }
   .emode-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .emode-btn.danger.active { background: var(--text-pri); color: #fff; border-color: var(--text-pri); }
   .emode-btn.collider.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .emode-btn.eraser.active { background: var(--text-pri); color: #fff; border-color: var(--text-pri); }
-  #planCanvas.mode-eraser  { cursor: none; }
+  #planCanvas.mode-eraser { cursor: none; }
 
   .training-badge {
-    margin-left: 4px; font-size: 10px; color: var(--text-sec); font-weight: 600;
+    font-size: 10px; color: var(--text-sec); font-weight: 600;
     background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm);
     padding: 2px 7px; display: none; letter-spacing: .2px; flex-shrink: 0; white-space: nowrap;
   }
@@ -424,16 +439,21 @@
     .view-label { flex: none; font-size: 11px; }
     .zoom-group { margin-left: auto; }
 
-    /* Edit toolbar: horizontal scroll */
+    /* Edit toolbar: на мобильных — два ряда.
+       Первый ряд: режимы. Второй ряд: действия (undo, сохранить, бейдж) */
     .edit-toolbar {
-      overflow-x: auto; flex-wrap: nowrap;
-      scrollbar-width: none; padding: 0 8px; gap: 4px;
-      height: auto; min-height: 36px; padding-top: 4px; padding-bottom: 4px;
+      flex-wrap: wrap;
+      overflow-x: visible; overflow-y: visible;
+      padding: 5px 8px; gap: 5px; min-height: auto;
     }
-    .edit-toolbar::-webkit-scrollbar { display: none; }
-    .et-label { flex-shrink: 0; }
-    .emode-btn { flex-shrink: 0; white-space: nowrap; }
-    .training-badge { flex-shrink: 0; }
+    .et-label { display: none; }   /* убираем метку — экономим место */
+    .et-sep   { display: none; }   /* разделитель не нужен при переносе */
+    /* Группа режимов занимает всю строку */
+    .et-modes { width: 100%; flex-wrap: wrap; gap: 4px; margin-left: 0; }
+    /* Группа действий на второй строке, растянута вправо */
+    .et-actions { width: 100%; margin-left: 0; flex-wrap: wrap; gap: 4px; }
+    /* Кнопки режима чуть компактнее */
+    .emode-btn { padding: 4px 8px; font-size: 11px; }
 
     /* Save bar: wrap on narrow */
     .save-bar { flex-wrap: wrap; }
@@ -445,11 +465,8 @@
   @media (min-width: 640px) and (max-width: 899px) {
     .left-panel { width: 220px; }
 
-    .edit-toolbar {
-      overflow-x: auto; flex-wrap: nowrap;
-      scrollbar-width: none; gap: 4px;
-    }
-    .edit-toolbar::-webkit-scrollbar { display: none; }
+    .edit-toolbar { gap: 4px; }
+    .et-actions { gap: 4px; }
     .emode-btn { flex-shrink: 0; white-space: nowrap; }
   }
 
@@ -635,17 +652,26 @@
       <!-- Edit mode toolbar (visible after recognition) -->
       <div class="edit-toolbar" id="editToolbar">
         <span class="et-label">Редактор:</span>
-        <button class="emode-btn active" id="emodeView"     onclick="setEditMode('view')">👁 Просмотр</button>
-        <button class="emode-btn"        id="emodeEdit"     onclick="setEditMode('edit')">✏️ Редактировать</button>
-        <button class="emode-btn danger" id="emodeDelete"   onclick="setEditMode('delete')">🗑 Удалить</button>
-        <button class="emode-btn collider" id="emodeDraw" onclick="setEditMode('collider')" title="Нарисуй прямоугольное помещение на плане">✚ Помещение</button>
-        <button class="emode-btn eraser"   id="emodeEraser" onclick="setEditMode('eraser')" title="Белый ластик — стирает фон (колесо мыши меняет размер)">◯ Ластик <span id="eraserSizeVal">30</span>px</button>
+
+        <!-- Группа 1: режимы работы с планом -->
+        <div class="et-modes">
+          <button class="emode-btn active" id="emodeView"   onclick="setEditMode('view')"     title="Просмотр и панорамирование">👁 Просмотр</button>
+          <button class="emode-btn"        id="emodeEdit"   onclick="setEditMode('edit')"     title="Редактировать вершины">✏️ Правка</button>
+          <button class="emode-btn danger" id="emodeDelete" onclick="setEditMode('delete')"   title="Удалить помещение кликом">🗑 Удалить</button>
+          <button class="emode-btn collider" id="emodeDraw" onclick="setEditMode('collider')" title="Нарисовать новое помещение">✚ Добавить</button>
+          <button class="emode-btn eraser" id="emodeEraser" onclick="setEditMode('eraser')"   title="Ластик фона (колесо = размер)">◯ Ластик <span id="eraserSizeVal">30</span>px</button>
+        </div>
+
         <div class="et-sep"></div>
-        <button class="emode-btn" onclick="undo()" id="undoBtn" disabled title="Отменить последнее действие (Ctrl+Z)">↩ Шаг назад</button>
-        <button class="emode-btn" style="background:#e8e8ed;color:#555;" onclick="togglePolygons()" id="togglePolygonsBtn" title="Показать / скрыть полигоны помещений">🔲 Скрыть полигоны</button>
-        <button class="emode-btn" style="background:#e8e8ed;color:#555;" onclick="toggleBWBackground()" id="toggleBWBtn" title="Переключить фон: оригинальное цветное изображение / обработанное ч/б">⬛ Ч/Б фон</button>
-        <button class="emode-btn" onclick="saveEdits()" id="saveEditsBtn" style="display:none">💾 Сохранить правки</button>
-        <span class="training-badge" id="trainingBadge">✦ обучено</span>
+
+        <!-- Группа 2: действия — прижата вправо на широком, вторая строка на узком -->
+        <div class="et-actions">
+          <button class="emode-btn" id="undoBtn"        onclick="undo()"              disabled title="Отменить (Ctrl+Z)">↩ Назад</button>
+          <button class="emode-btn" id="togglePolygonsBtn" onclick="togglePolygons()"          title="Показать / скрыть полигоны">🔲 Полигоны</button>
+          <button class="emode-btn" id="toggleBWBtn"    onclick="toggleBWBackground()"         title="Цветной / Ч/Б фон">⬛ Ч/Б</button>
+          <button class="emode-btn" id="saveEditsBtn"   onclick="saveEdits()"         style="display:none" title="Сохранить как обучающий образец">💾 Сохранить</button>
+          <span class="training-badge" id="trainingBadge">✦ обучено</span>
+        </div>
       </div>
 
       <div class="canvas-wrap">
