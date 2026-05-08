@@ -27,6 +27,9 @@ let hoverState       = null     // { roomId, ptIdx, edgeIdx } — what cursor is
 let hasUnsavedEdits  = false
 let trainingCount    = 0        // cached count of saved training samples
 
+// ── Wall detection state ────────────────────────────────────
+let _analyseRunCount = 0   // increments per recognition run; drives valley→k-means switch
+
 // ── Undo history ───────────────────────────────────────────
 const MAX_UNDO       = 30
 let undoStack        = []       // each entry: deep copy of rooms array
@@ -91,17 +94,11 @@ const undoBtn           = document.getElementById('undoBtn')
 const trainingBadge     = document.getElementById('trainingBadge')
 
 const paramThreshold = document.getElementById('paramThreshold')
-const paramDilate    = document.getElementById('paramDilate')
-const paramMinArea   = document.getElementById('paramMinArea')
 const paramEpsilon   = document.getElementById('paramEpsilon')
 const vThr = document.getElementById('vThr')
-const vDil = document.getElementById('vDil')
-const vMin = document.getElementById('vMin')
 const vEps = document.getElementById('vEps')
 
 paramThreshold.oninput = () => vThr.textContent = paramThreshold.value === '0' ? 'авто' : paramThreshold.value
-paramDilate   .oninput = () => vDil.textContent = `${paramDilate.value} px`
-paramMinArea  .oninput = () => vMin.textContent = `${(Number(paramMinArea.value)/10).toFixed(2)}%`
 paramEpsilon  .oninput = () => vEps.textContent = `${paramEpsilon.value} px`
 
 // ── Init ───────────────────────────────────────────────────
@@ -445,6 +442,9 @@ function clearResults() {
   undoStack = []
   if (undoBtn) undoBtn.disabled = true
   eraserStrokes = []; eraserActive = false
+  _analyseRunCount = 0   // reset method choice for new image
+  const wib = document.getElementById('wallInfoBox')
+  if (wib) wib.style.display = 'none'
   saveBar.classList.remove('visible')
   editToolbar.classList.remove('visible')
   roomsTitle.style.display = 'none'; roomsDivider.style.display = 'none'
@@ -899,19 +899,20 @@ async function analyseLocal() {
   await tick()
 
   const tManual = Number(paramThreshold.value)         // 0 = auto (Otsu)
-  const dilateK = Number(paramDilate.value)            // 0..5
-  const minPct  = Number(paramMinArea.value) / 1000    // /10 -> percent then /100 -> fraction
   const epsilon = Number(paramEpsilon.value)           // px in display scale
+
+  _analyseRunCount++   // 1st run → valley method; 2nd+ → k-means
 
   setProgressStep('Поиск стен и помещений…')
   await tick()
 
-  rooms = await detectRoomsLocal(recognitionCanvas || currentImageEl, {
+  const result = await detectRoomsLocal(recognitionCanvas || currentImageEl, {
     threshold: tManual || null,
-    dilateK,
-    minAreaFrac: minPct,
     epsilon,
+    useKmeans: _analyseRunCount > 1,
   })
+  rooms = result.rooms
+  updateWallInfoDisplay(result.wallInfo)
 
   // ── Функция 2: автофильтрация по накопленным площадям ─
   // Учится на том, комнаты каких размеров пользователь обычно удаляет.
@@ -1522,16 +1523,14 @@ async function rescanZone(x0, y0, x1, y1) {
   let found = []
   try {
     const tManual = Number(paramThreshold.value)
-    const dilateK = Number(paramDilate.value)
-    const minPct  = Number(paramMinArea.value) / 1000
     const epsilon = Number(paramEpsilon.value)
 
-    const zoneRooms = await detectRoomsLocal(zoneCanvas, {
-      threshold:   tManual || null,
-      dilateK,
-      minAreaFrac: minPct,
+    const result = await detectRoomsLocal(zoneCanvas, {
+      threshold:  tManual || null,
       epsilon,
+      useKmeans:  _analyseRunCount > 1,
     })
+    const zoneRooms = result.rooms
 
     // Переводим координаты зоны → координаты всего изображения
     const translated = zoneRooms.map(r => ({
@@ -1667,6 +1666,11 @@ async function detectRoomsLocal(imageEl, opts) {
   let mean = 0
   for (let i = 0; i < gray.length; i++) mean += gray[i]
   mean /= gray.length
+
+  // ── Автодетекция толщины стен ─────────────────────────────────────────────
+  // Запускаем до CLAHE — на исходных пикселях сигнал чище для сканов.
+  // Результат используется вместо захардкоженного wallEst = 1% от короткой стороны.
+  const wallInfo = detectWallThickness(gray, W, H, opts.useKmeans || false)
   let variance = 0
   for (let i = 0; i < gray.length; i++) variance += (gray[i] - mean) ** 2
   const stddev = Math.sqrt(variance / gray.length)
@@ -1761,7 +1765,10 @@ async function detectRoomsLocal(imageEl, opts) {
   }
 
   // Размер окна Саувола ≈ толщина стены × 3.
-  const wallEst = Math.max(2, Math.min(40, Math.round(Math.min(W, H) * 0.01)))
+  // Используем реальный wallPeak из детекции вместо грубой эвристики 1% от стороны.
+  const wallEst = wallInfo
+    ? Math.max(2, Math.min(40, wallInfo.wallPeak))
+    : Math.max(2, Math.min(40, Math.round(Math.min(W, H) * 0.01)))
   const windowR = Math.max(7, wallEst * 3)
   const K_SAUVOLA = 0.2
 
@@ -1944,7 +1951,10 @@ async function detectRoomsLocal(imageEl, opts) {
   bin2 = closeDoorGaps(bin2, W, H)
 
   // ---- Erosion (thicken walls) ----------------------------------------------
-  for (let i = 0; i < opts.dilateK; i++) { bin1 = erode4(bin1, W, H); bin2 = erode4(bin2, W, H) }
+  // Auto: erode once when walls look thin (wallPeak < 8px in work canvas).
+  // Manual threshold overrides to no erosion (user controls via threshold slider).
+  const autoDilateK = (opts.threshold == null && wallInfo && wallInfo.wallPeak <= 7) ? 1 : 0
+  for (let i = 0; i < autoDilateK; i++) { bin1 = erode4(bin1, W, H); bin2 = erode4(bin2, W, H) }
   bin2 = erode4(bin2, W, H)  // extra pass for loose
 
   // ── Connected components ───────────────────────────────────────────────────
@@ -1987,7 +1997,12 @@ async function detectRoomsLocal(imageEl, opts) {
 
   // ── Фильтрация кандидатов ──────────────────────────────────────────────────
   const total   = W * H
-  const minArea = total * opts.minAreaFrac
+  // Auto min area: room must be at least (wallMin × 4)² pixels — ~4 wall thicknesses wide.
+  // Falls back to 0.3% of image area if wall detection failed.
+  const autoMinAreaFrac = wallInfo
+    ? Math.pow(wallInfo.wallMin * 4, 2) / total
+    : 0.003
+  const minArea = total * autoMinAreaFrac
   const maxArea = total * 0.70
 
   // touchesBorder — умная проверка: отбрасываем регион только если он касается
@@ -2150,9 +2165,144 @@ async function detectRoomsLocal(imageEl, opts) {
     }
   }
 
-  return rooms
+  return { rooms, wallInfo }
 }
-// Otsu threshold
+
+// ── Auto wall-thickness detection ──────────────────────────────────────────
+// Scans 3 horizontal + 3 vertical lines through the gray image,
+// collects dark-pixel run lengths, and finds the structural-wall cluster
+// via valley detection (1st run) or k-means (subsequent runs).
+// Returns { wallMin, wallMax, wallPeak, method } in work-canvas px, or null.
+function detectWallThickness(gray, W, H, useKmeans) {
+  // Quick threshold: pixels below 75% of mean = dark (wall candidate)
+  let gSum = 0
+  for (let i = 0; i < gray.length; i++) gSum += gray[i]
+  const darkThresh = (gSum / gray.length) * 0.75
+
+  const maxRun = Math.min(W, H) * 0.18   // longer runs = background, skip
+
+  const runs = []
+  // Helper: collect dark runs along a scanline
+  function scanLine(get, len) {
+    let inDark = false, runStart = 0
+    for (let i = 0; i < len; i++) {
+      const dark = get(i) < darkThresh
+      if (dark && !inDark) { inDark = true; runStart = i }
+      else if (!dark && inDark) {
+        inDark = false
+        const r = i - runStart
+        if (r >= 2 && r < maxRun) runs.push(r)
+      }
+    }
+    if (inDark) { const r = len - runStart; if (r >= 2 && r < maxRun) runs.push(r) }
+  }
+
+  // 3 horizontal scan lines at 33%, 50%, 67%
+  for (const fy of [0.33, 0.50, 0.67]) {
+    const y = Math.floor(H * fy)
+    scanLine(x => gray[y*W+x], W)
+  }
+  // 3 vertical scan lines at 33%, 50%, 67%
+  for (const fx of [0.33, 0.50, 0.67]) {
+    const x = Math.floor(W * fx)
+    scanLine(y => gray[y*W+x], H)
+  }
+
+  if (runs.length < 6) return null
+
+  const maxBin = Math.ceil(maxRun)
+
+  if (!useKmeans) {
+    // ── Valley method (first run) ────────────────────────────────────────────
+    const hist = new Uint32Array(maxBin + 1)
+    for (const r of runs) hist[Math.min(Math.round(r), maxBin)]++
+
+    // 3-point smooth
+    const s = new Float32Array(maxBin + 1)
+    s[0] = hist[0]
+    for (let i = 1; i < maxBin; i++) s[i] = (hist[i-1] + hist[i]*2 + hist[i+1]) / 4
+    s[maxBin] = hist[maxBin]
+
+    // First peak — thin lines/artifacts (search first quarter)
+    let p1 = 1
+    const p1Limit = Math.min(14, maxBin >> 2)
+    for (let i = 2; i <= p1Limit; i++) if (s[i] > s[p1]) p1 = i
+
+    // Valley after first peak
+    let valley = p1
+    for (let i = p1 + 1; i < Math.min(p1 * 6 + 3, maxBin); i++) if (s[i] < s[valley]) valley = i
+
+    // Second peak — structural walls
+    let p2 = valley
+    for (let i = valley + 1; i < Math.min(valley + p1 * 10 + 4, maxBin); i++) if (s[i] > s[p2]) p2 = i
+
+    // If no clear two-peak structure — fall back to median
+    if (p2 <= valley || s[p2] < 1) {
+      const sorted = runs.slice().sort((a, b) => a - b)
+      const wallPeak = sorted[Math.floor(sorted.length * 0.50)]
+      return {
+        wallMin:  Math.max(2, Math.round(wallPeak * 0.60)),
+        wallMax:  Math.min(maxBin, Math.round(wallPeak * 2.20)),
+        wallPeak: Math.round(wallPeak),
+        method:   'median',
+      }
+    }
+
+    return {
+      wallMin:  Math.max(2, valley > p1 ? valley : p1 + 1),
+      wallMax:  Math.min(maxBin, Math.round(p2 * 2.20)),
+      wallPeak: p2,
+      method:   'valley',
+    }
+
+  } else {
+    // ── K-means k=3: thin lines | structural walls | exterior walls ──────────
+    let c0 = 2, c1 = maxRun * 0.08, c2 = maxRun * 0.25
+    for (let iter = 0; iter < 25; iter++) {
+      let s0=0,n0=0, s1=0,n1=0, s2=0,n2=0
+      for (const v of runs) {
+        const d0=Math.abs(v-c0), d1=Math.abs(v-c1), d2=Math.abs(v-c2)
+        if (d0<=d1&&d0<=d2) { s0+=v; n0++ }
+        else if (d1<=d2)    { s1+=v; n1++ }
+        else                { s2+=v; n2++ }
+      }
+      const nc0=n0?s0/n0:c0, nc1=n1?s1/n1:c1, nc2=n2?s2/n2:c2
+      if (Math.abs(nc0-c0)<0.3&&Math.abs(nc1-c1)<0.3&&Math.abs(nc2-c2)<0.3) break
+      c0=nc0; c1=nc1; c2=nc2
+    }
+    const [thin, wall, thick] = [c0,c1,c2].sort((a,b)=>a-b)
+    return {
+      wallMin:  Math.max(2, Math.round((thin + wall) / 2)),
+      wallMax:  Math.min(maxBin, Math.round((wall + thick) / 2 + wall * 0.5)),
+      wallPeak: Math.round(wall),
+      method:   'kmeans',
+    }
+  }
+}
+
+// ── Wall info display ──────────────────────────────────────────────────────
+function updateWallInfoDisplay(wallInfo) {
+  const box = document.getElementById('wallInfoBox')
+  if (!box) return
+  if (!wallInfo) { box.style.display = 'none'; return }
+
+  // Scale factor: work-canvas px → image px
+  const inv = currentImageEl
+    ? Math.min(1, 2000 / Math.max(currentImageEl.naturalWidth, currentImageEl.naturalHeight))
+    : 1
+
+  const minPx  = Math.round(wallInfo.wallMin  / inv)
+  const maxPx  = Math.round(wallInfo.wallMax  / inv)
+  const minSide = wallInfo.wallMin * 4   // min room side in work-canvas px
+  const minAreaImg = Math.round(Math.pow(minSide / inv, 2) / 1000)
+
+  document.getElementById('wallInfoRange').textContent   = `${minPx}–${maxPx} px`
+  document.getElementById('wallInfoMinArea').textContent = `${minAreaImg}k px²`
+  const labels = { valley: 'долина (1-й запуск)', kmeans: 'k-means', median: 'медиана' }
+  document.getElementById('wallInfoMethod').textContent  = labels[wallInfo.method] || wallInfo.method
+
+  box.style.display = ''
+}
 function otsu(gray) {
   const hist = new Uint32Array(256)
   for (let i = 0; i < gray.length; i++) hist[gray[i]]++

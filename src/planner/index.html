@@ -518,6 +518,21 @@
     .emode-btn { flex-shrink: 0; white-space: nowrap; }
   }
 
+  /* ── Wall info block ──────────────────────────────────────────────── */
+  .wall-info-box {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 7px 10px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .wall-info-row {
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .wall-info-key { font-size: 10px; color: var(--text-ter); }
+  .wall-info-val {
+    font-size: 10px; font-weight: 600; color: var(--text-sec);
+    font-variant-numeric: tabular-nums;
+  }
+
   /* ── Divider ──────────────────────────────────────────────────────── */
   hr { border: none; border-top: 1px solid var(--border); }
 </style>
@@ -573,16 +588,23 @@
             <input type="range" id="paramThreshold" min="0" max="255" value="0">
           </div>
           <div class="param-row">
-            <label>Утолщение стен <span id="vDil">1 px</span></label>
-            <input type="range" id="paramDilate" min="0" max="5" value="1">
-          </div>
-          <div class="param-row">
-            <label>Мин. площадь помещения <span id="vMin">0.30%</span></label>
-            <input type="range" id="paramMinArea" min="1" max="50" value="1">
-          </div>
-          <div class="param-row">
             <label>Сглаживание полигонов <span id="vEps">3 px</span></label>
             <input type="range" id="paramEpsilon" min="0" max="20" value="3">
+          </div>
+          <!-- Wall info: shown after recognition, updated automatically -->
+          <div class="wall-info-box" id="wallInfoBox" style="display:none">
+            <div class="wall-info-row">
+              <span class="wall-info-key">Толщина стен</span>
+              <span class="wall-info-val" id="wallInfoRange">—</span>
+            </div>
+            <div class="wall-info-row">
+              <span class="wall-info-key">Мин. помещение</span>
+              <span class="wall-info-val" id="wallInfoMinArea">—</span>
+            </div>
+            <div class="wall-info-row">
+              <span class="wall-info-key">Метод</span>
+              <span class="wall-info-val" id="wallInfoMethod">—</span>
+            </div>
           </div>
         </div>
 
