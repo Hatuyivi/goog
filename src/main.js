@@ -499,6 +499,7 @@ app.whenReady().then(() => {
     }
 
     tray = new Tray(nativeImage.createEmpty()); tray.setTitle('Σ'); tray.setToolTip('numsum')
+    tray.on('double-click', () => createMainWindow())  // регистрируем один раз при создании
     buildMenu()
 
     const geminiKey = cfg.gemini_api_key || cfg.api_key
@@ -579,8 +580,6 @@ function buildMenu() {
     const fallback = s.activeProvider!==s.selectedProvider || s.activeModelId!==s.selectedModelId
     return model ? `${PROVIDERS[s.activeProvider]?.label} · ${model.label}${fallback?' [fallback]':''}` : 'нет модели'
   }
-
-  tray.on('double-click', () => createMainWindow())  // двойной клик открывает/поднимает планировщик
 
   tray.setContextMenu(Menu.buildFromTemplate([
     { label:'Выделить область', click:capture },
