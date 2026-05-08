@@ -11,7 +11,8 @@ const path = require('path')
 let currentImageB64  = null
 let currentMime      = 'image/jpeg'
 let currentImageEl   = null
-let currentImageBW   = null   // offscreen B&W canvas (for export)
+let currentImageBW   = null   // offscreen B&W canvas (BW mix applied)
+let currentImageColor = null   // offscreen colour-adjusted canvas
 let rooms            = []
 let originalRooms    = []     // snapshot at recognition time — for training diff
 let selectedRoomId   = null   // single highlighted room (click)
@@ -225,7 +226,13 @@ function makeBWCanvas(img) {
   _rawHeight = off.height
 
   applyColorAdjustments(imageData.data)
-  if (showBWBackground) applyBWConversion(imageData.data)
+  // Build colour-adjusted canvas
+  const colOff = document.createElement('canvas')
+  colOff.width = off.width; colOff.height = off.height
+  colOff.getContext('2d').putImageData(imageData, 0, 0)
+  currentImageColor = colOff
+  // Build BW canvas (colour adjustments + BW mix)
+  applyBWConversion(imageData.data)
   c.putImageData(imageData, 0, 0)
   return off
 }
@@ -254,6 +261,16 @@ function _doRebuildBWCanvas() {
   // Work on a copy of raw pixels — no getImageData round-trip
   const data = new Uint8ClampedArray(_rawPixels)
   applyColorAdjustments(data)          // always: Основные sliders
+  // Rebuild colour-adjusted canvas
+  if (!currentImageColor) { currentImageColor = document.createElement('canvas'); currentImageColor.width = _rawWidth; currentImageColor.height = _rawHeight }
+  currentImageColor.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(data), _rawWidth, _rawHeight), 0, 0)
+  // Re-apply eraser strokes on colour canvas too
+  if (eraserStrokes.length) {
+    const cc = currentImageColor.getContext('2d')
+    cc.fillStyle = '#ffffff'
+    for (const stroke of eraserStrokes) for (const pt of stroke) { cc.beginPath(); cc.arc(pt.x, pt.y, pt.r, 0, Math.PI*2); cc.fill() }
+  }
+  applyBWConversion(data)              // Смешение ч/б sliders baked into BW canvas
 
   const imageData = new ImageData(data, _rawWidth, _rawHeight)
   c.putImageData(imageData, 0, 0)
@@ -410,7 +427,7 @@ function resizeCanvas(img) {
 }
 
 function clearPlan() {
-  currentImageB64 = null; currentImageEl = null; currentImageBW = null
+  currentImageB64 = null; currentImageEl = null; currentImageBW = null; currentImageColor = null
   _rawPixels = null; _rawWidth = 0; _rawHeight = 0
   if (_rebuildRaf) { cancelAnimationFrame(_rebuildRaf); _rebuildRaf = null }
   previewThumb.style.display = 'none'; dropzone.style.display = 'block'
@@ -443,11 +460,11 @@ function drawPlan() {
   const sx = canvas.width  / currentImageEl.naturalWidth
   const sy = canvas.height / currentImageEl.naturalHeight
 
-  // Draw colour-adjusted image; optionally apply B&W filter on top
+  // Colour mode: draw original (currentImageBW has BW mix baked in — not suitable for colour)
+  // B&W mode: draw currentImageBW which has colour adjustments + BW mix sliders applied
   ctx.save()
-  if (showBWBackground) ctx.filter = 'grayscale(1)'
-  ctx.drawImage(currentImageBW || currentImageEl, 0, 0, canvas.width, canvas.height)
-  ctx.filter = 'none'
+  const srcImg = showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl)
+  ctx.drawImage(srcImg, 0, 0, canvas.width, canvas.height)
 
   // Overlay eraser strokes as white
   if (eraserStrokes.length) {
@@ -953,16 +970,22 @@ function finishAnalysis() {
 
 // ── Edit mode ──────────────────────────────────────────────
 function setEditMode(m) {
+  // Exit crop mode if leaving it
+  if (editMode === 'crop' && m !== 'crop') exitCropMode()
+
   editMode = m
   document.getElementById('emodeView').classList.toggle('active',     m === 'view')
   document.getElementById('emodeEdit').classList.toggle('active',     m === 'edit')
   document.getElementById('emodeDelete').classList.toggle('active',   m === 'delete')
   document.getElementById('emodeDraw').classList.toggle('active',     m === 'collider')
   document.getElementById('emodeEraser')?.classList.toggle('active',  m === 'eraser')
+  document.getElementById('cropBtn')?.classList.toggle('active',      m === 'crop')
   canvas.className = m === 'eraser' ? 'mode-eraser' : m !== 'view' ? `mode-${m}` : ''
   hoverState = null
   dragState  = null
   roomDraw   = null
+
+  if (m === 'crop') initCropMode()
   drawPlan()
 }
 
@@ -1736,7 +1759,8 @@ async function detectRoomsLocal(imageEl, opts) {
 
     const poly = traceContour(labelsMap, r.label, W, H, r)
     if (poly.length < 4) continue
-    const simp = rdp(poly, opts.epsilon || 2)
+    const simp0 = rdp(poly, opts.epsilon || 2)
+    const simp  = removeSharpAngles(simp0, 65)
     if (simp.length < 3) continue
 
     // Compactness = 4π·Area / Perimeter² (1 = круг, → 0 = очень вытянутый)
@@ -1840,6 +1864,61 @@ function traceContour(labels, label, W, H, region) {
     }
     if (!found) break  // isolated pixel
     if (cx === sx && cy === sy && poly.length > 2) break
+  }
+  return poly
+}
+
+// Remove jagged vertices (зубчики от цифр/текста на планировке).
+// Вершина удаляется если выполнены ОБА условия:
+//   1. Угол при ней острее minAngleDeg (зубчик всегда острый)
+//   2. Хотя бы один из двух прилегающих отрезков короче shortFrac*периметр
+//      (реальный угол комнаты имеет длинные стены с обеих сторон)
+// Итерируем до стабилизации — зубчики могут быть цепочкой.
+function removeSharpAngles(points, minAngleDeg, shortFrac) {
+  shortFrac = shortFrac || 0.04   // 4% периметра — порог "короткого" отрезка
+  let poly = points.slice()
+  const minRad = minAngleDeg * Math.PI / 180
+
+  let changed = true
+  while (changed && poly.length > 3) {
+    changed = false
+
+    // Считаем периметр текущего полигона
+    const n = poly.length
+    let perim = 0
+    for (let i = 0; i < n; i++) {
+      const a = poly[i], b = poly[(i + 1) % n]
+      perim += Math.hypot(b[0] - a[0], b[1] - a[1])
+    }
+    const shortLen = perim * shortFrac
+
+    const next = []
+    for (let i = 0; i < n; i++) {
+      const prev = poly[(i - 1 + n) % n]
+      const cur  = poly[i]
+      const nxt  = poly[(i + 1) % n]
+
+      // Длины прилегающих отрезков
+      const lenPrev = Math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+      const lenNext = Math.hypot(nxt[0] - cur[0],  nxt[1] - cur[1])
+
+      // Угол при cur (между векторами cur→prev и cur→next)
+      const ax = prev[0] - cur[0], ay = prev[1] - cur[1]
+      const bx = nxt[0]  - cur[0], by = nxt[1]  - cur[1]
+      const dot   = ax * bx + ay * by
+      const cross = ax * by - ay * bx
+      const angle = Math.atan2(Math.abs(cross), dot)
+
+      const isSharpAngle = angle < minRad
+      const hasShortSide = lenPrev < shortLen || lenNext < shortLen
+
+      if (isSharpAngle && hasShortSide) {
+        changed = true  // удаляем вершину-зубчик
+      } else {
+        next.push(cur)
+      }
+    }
+    if (next.length >= 3) poly = next
   }
   return poly
 }
@@ -2190,8 +2269,7 @@ function makeRoomCanvas(room) {
   const w = currentImageEl.naturalWidth, h = currentImageEl.naturalHeight
   const off = document.createElement('canvas'); off.width = w; off.height = h
   const c = off.getContext('2d')
-  c.drawImage(currentImageBW || currentImageEl, 0, 0)
-  if (showBWBackground) applyGrayscaleToCanvas(c, w, h)
+  c.drawImage(showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl), 0, 0)
   if (room.polygon?.length >= 3) {
     c.beginPath()
     c.moveTo(room.polygon[0][0], room.polygon[0][1])
@@ -2210,8 +2288,7 @@ function makeMultiRoomCanvas(roomList) {
   const w = currentImageEl.naturalWidth, h = currentImageEl.naturalHeight
   const off = document.createElement('canvas'); off.width = w; off.height = h
   const c = off.getContext('2d')
-  c.drawImage(currentImageBW || currentImageEl, 0, 0)
-  if (showBWBackground) applyGrayscaleToCanvas(c, w, h)
+  c.drawImage(showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl), 0, 0)
   c.strokeStyle = 'transparent'; c.lineWidth = 0
   roomList.forEach(room => {
     if (!room.polygon?.length) return
@@ -2229,8 +2306,7 @@ function makeCombinedCanvas() {
   const w = currentImageEl.naturalWidth, h = currentImageEl.naturalHeight
   const off = document.createElement('canvas'); off.width = w; off.height = h
   const c = off.getContext('2d')
-  c.drawImage(currentImageBW || currentImageEl, 0, 0)
-  if (showBWBackground) applyGrayscaleToCanvas(c, w, h)
+  c.drawImage(showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl), 0, 0)
   c.strokeStyle = 'transparent'; c.lineWidth = 0
   rooms.forEach(room => {
     if (!room.polygon?.length) return
@@ -2405,3 +2481,186 @@ document.addEventListener('keydown', e => {
 })
 init()
 updateTrainingBadge()
+
+// ── Crop ───────────────────────────────────────────────────
+let cropRect    = null   // { x, y, w, h } in canvas-overlay px
+let cropRatio   = 'free' // 'free' | '4:3' | '3:4' | '16:9' | '1:1'
+let _cropDrag   = null   // { type: 'move'|handle, startX, startY, origRect }
+
+const RATIOS = { 'free': null, '4:3': 4/3, '3:4': 3/4, '16:9': 16/9, '1:1': 1 }
+
+function initCropMode() {
+  const overlay = document.getElementById('cropOverlay')
+  const wrap    = document.querySelector('.canvas-wrap')
+  const wrapRect = wrap.getBoundingClientRect()
+
+  // Default crop: full canvas area, or 4:3 centred
+  const cRect = canvas.getBoundingClientRect()
+  const cx = cRect.left - wrapRect.left
+  const cy = cRect.top  - wrapRect.top
+  const cw = cRect.width
+  const ch = cRect.height
+
+  let bx, by, bw, bh
+  const r = RATIOS[cropRatio]
+  if (r) {
+    if (cw / ch > r) { bh = ch * 0.9; bw = bh * r } else { bw = cw * 0.9; bh = bw / r }
+  } else { bw = cw * 0.85; bh = ch * 0.85 }
+  bx = cx + (cw - bw) / 2
+  by = cy + (ch - bh) / 2
+
+  cropRect = { x: bx, y: by, w: bw, h: bh }
+  overlay.style.display = 'block'
+  updateCropBox()
+
+  // Ratio buttons
+  document.querySelectorAll('.crop-ratio-btn').forEach(btn => {
+    btn.onclick = () => {
+      cropRatio = btn.dataset.ratio
+      document.querySelectorAll('.crop-ratio-btn').forEach(b => b.classList.toggle('active', b === btn))
+      enforceRatio()
+      updateCropBox()
+    }
+  })
+
+  // Drag on cropBox (move) and handles (resize)
+  const cropBox = document.getElementById('cropBox')
+  cropBox.onmousedown = e => {
+    if (e.target.classList.contains('crop-handle')) return
+    e.preventDefault()
+    _cropDrag = { type: 'move', startX: e.clientX, startY: e.clientY, origRect: { ...cropRect } }
+  }
+  document.querySelectorAll('.crop-handle').forEach(h => {
+    h.onmousedown = e => {
+      e.preventDefault(); e.stopPropagation()
+      _cropDrag = { type: h.dataset.h, startX: e.clientX, startY: e.clientY, origRect: { ...cropRect } }
+    }
+  })
+
+  window.addEventListener('mousemove', onCropMouseMove)
+  window.addEventListener('mouseup',   onCropMouseUp)
+}
+
+function onCropMouseMove(e) {
+  if (!_cropDrag) return
+  const wrap = document.querySelector('.canvas-wrap')
+  const wrapRect = wrap.getBoundingClientRect()
+  const dx = e.clientX - _cropDrag.startX
+  const dy = e.clientY - _cropDrag.startY
+  const o  = _cropDrag.origRect
+  let { x, y, w, h } = o
+  const MIN = 30
+
+  if (_cropDrag.type === 'move') {
+    x = o.x + dx; y = o.y + dy
+  } else {
+    const t = _cropDrag.type
+    if (t.includes('e')) w = Math.max(MIN, o.w + dx)
+    if (t.includes('s')) h = Math.max(MIN, o.h + dy)
+    if (t.includes('w')) { const nw = Math.max(MIN, o.w - dx); x = o.x + o.w - nw; w = nw }
+    if (t.includes('n')) { const nh = Math.max(MIN, o.h - dy); y = o.y + o.h - nh; h = nh }
+  }
+
+  cropRect = { x, y, w, h }
+  enforceRatio()
+  updateCropBox()
+}
+
+function onCropMouseUp() {
+  _cropDrag = null
+}
+
+function enforceRatio() {
+  const r = RATIOS[cropRatio]
+  if (!r) return
+  // Keep width, adjust height
+  cropRect.h = cropRect.w / r
+}
+
+function updateCropBox() {
+  const box = document.getElementById('cropBox')
+  box.style.left   = cropRect.x + 'px'
+  box.style.top    = cropRect.y + 'px'
+  box.style.width  = cropRect.w + 'px'
+  box.style.height = cropRect.h + 'px'
+}
+
+function exitCropMode() {
+  document.getElementById('cropOverlay').style.display = 'none'
+  window.removeEventListener('mousemove', onCropMouseMove)
+  window.removeEventListener('mouseup',   onCropMouseUp)
+  _cropDrag = null
+}
+
+function applyCrop() {
+  if (!currentImageEl || !cropRect) return
+
+  const wrap    = document.querySelector('.canvas-wrap')
+  const wrapRect = wrap.getBoundingClientRect()
+  const cRect   = canvas.getBoundingClientRect()
+
+  // Convert overlay px → image px
+  // cropRect is in wrap coords; canvas is positioned inside wrap
+  const scaleX = currentImageEl.naturalWidth  / cRect.width
+  const scaleY = currentImageEl.naturalHeight / cRect.height
+
+  // offset of canvas inside wrap
+  const offX = cRect.left - wrapRect.left
+  const offY = cRect.top  - wrapRect.top
+
+  // crop box in canvas-element px
+  const bx = (cropRect.x - offX)
+  const by = (cropRect.y - offY)
+  const bw = cropRect.w
+  const bh = cropRect.h
+
+  // crop in image px (may extend outside image bounds)
+  const ix = Math.round(bx * scaleX)
+  const iy = Math.round(by * scaleY)
+  const iw = Math.round(bw * scaleX)
+  const ih = Math.round(bh * scaleY)
+
+  // Build new canvas with white background (handles out-of-bounds)
+  const off = document.createElement('canvas')
+  off.width  = iw
+  off.height = ih
+  const c = off.getContext('2d')
+  c.fillStyle = '#ffffff'
+  c.fillRect(0, 0, iw, ih)
+
+  // Draw source image offset so crop origin aligns
+  const srcImg = showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl)
+  c.drawImage(srcImg, -ix, -iy, currentImageEl.naturalWidth, currentImageEl.naturalHeight)
+
+  // Convert to data URL and reload as new image
+  const dataUrl = off.toDataURL('image/jpeg', 0.95)
+  const newImg = new Image()
+  newImg.onload = () => {
+    pushUndo()
+    currentImageEl = newImg
+    currentImageB64 = dataUrl.split(',')[1]
+    currentMime = 'image/jpeg'
+
+    // Rebuild adjusted canvases
+    currentImageBW    = null
+    currentImageColor = null
+    _rawPixels = null
+
+    const rebuildOff = document.createElement('canvas')
+    rebuildOff.width  = newImg.naturalWidth
+    rebuildOff.height = newImg.naturalHeight
+    const rc = rebuildOff.getContext('2d')
+    rc.drawImage(newImg, 0, 0)
+    const id = rc.getImageData(0, 0, rebuildOff.width, rebuildOff.height)
+    _rawPixels = new Uint8ClampedArray(id.data)
+    _rawWidth  = rebuildOff.width
+    _rawHeight = rebuildOff.height
+
+    currentImageBW = makeBWCanvas(newImg)
+    resizeCanvas(newImg)
+    exitCropMode()
+    setEditMode('view')
+    drawPlan()
+  }
+  newImg.src = dataUrl
+}

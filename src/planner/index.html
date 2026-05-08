@@ -320,6 +320,39 @@
     font-size: 12px; font-weight: 500; color: var(--text-ter); letter-spacing: -0.01em;
   }
 
+  /* ── Crop overlay ─────────────────────────────────────────────────── */
+  #cropOverlay { pointer-events: none; }
+  #cropBox { pointer-events: all; }
+  #cropRatioBar, #cropActionBar { pointer-events: all; }
+  .crop-handle {
+    position: absolute; width: 10px; height: 10px;
+    background: #fff; border: 1.5px solid rgba(0,0,0,.35);
+    border-radius: 2px; pointer-events: all;
+  }
+  .crop-handle[data-h="nw"] { cursor: nw-resize; }
+  .crop-handle[data-h="ne"] { cursor: ne-resize; }
+  .crop-handle[data-h="sw"] { cursor: sw-resize; }
+  .crop-handle[data-h="se"] { cursor: se-resize; }
+  .crop-handle[data-h="n"]  { cursor: n-resize; }
+  .crop-handle[data-h="s"]  { cursor: s-resize; }
+  .crop-handle[data-h="w"]  { cursor: w-resize; }
+  .crop-handle[data-h="e"]  { cursor: e-resize; }
+  .crop-ratio-btn {
+    font-family: inherit; font-size: 11px; font-weight: 500;
+    padding: 3px 10px; border-radius: var(--radius-sm);
+    border: 1px solid rgba(255,255,255,.4); background: rgba(26,25,21,.75);
+    color: #fff; cursor: pointer; white-space: nowrap;
+  }
+  .crop-ratio-btn.active { background: #fff; color: var(--text-pri); border-color: #fff; }
+  .crop-ratio-btn:hover:not(.active) { background: rgba(255,255,255,.15); }
+  .crop-action-btn {
+    font-family: inherit; font-size: 12px; font-weight: 500;
+    padding: 5px 16px; border-radius: var(--radius-sm);
+    border: none; background: var(--text-pri); color: #fff; cursor: pointer;
+  }
+  .crop-action-btn.secondary { background: rgba(26,25,21,.55); }
+  .crop-action-btn:hover { opacity: .85; }
+
   /* ── Progress overlay ─────────────────────────────────────────────── */
   .progress-overlay {
     position: absolute; inset: 0; background: rgba(250,250,249,.94);
@@ -684,6 +717,7 @@
           <button class="emode-btn" id="undoBtn"        onclick="undo()"              disabled title="Отменить (Ctrl+Z)">↩ Назад</button>
           <button class="emode-btn" id="togglePolygonsBtn" onclick="togglePolygons()"          title="Показать / скрыть полигоны">🔲 Полигоны</button>
           <button class="emode-btn" id="toggleBWBtn"    onclick="toggleBWBackground()"         title="Цветной / Ч/Б фон">⬛ Ч/Б</button>
+          <button class="emode-btn" id="cropBtn" onclick="setEditMode('crop')" title="Обрезка">✂ Кадр</button>
           <button class="emode-btn" id="saveEditsBtn"   onclick="saveEdits()"         style="display:none" title="Сохранить как обучающий образец">💾 Сохранить</button>
           <span class="training-badge" id="trainingBadge">✦ обучено</span>
         </div>
@@ -691,6 +725,30 @@
 
       <div class="canvas-wrap">
         <canvas id="planCanvas"></canvas>
+        <!-- Crop overlay -->
+        <div id="cropOverlay" style="display:none;position:absolute;inset:0;z-index:5;">
+          <div id="cropBox" style="position:absolute;border:2px solid #fff;box-shadow:0 0 0 9999px rgba(0,0,0,0.5);cursor:move;">
+            <div class="crop-handle" data-h="nw" style="top:-5px;left:-5px;"></div>
+            <div class="crop-handle" data-h="ne" style="top:-5px;right:-5px;"></div>
+            <div class="crop-handle" data-h="sw" style="bottom:-5px;left:-5px;"></div>
+            <div class="crop-handle" data-h="se" style="bottom:-5px;right:-5px;"></div>
+            <div class="crop-handle" data-h="n" style="top:-5px;left:50%;transform:translateX(-50%);"></div>
+            <div class="crop-handle" data-h="s" style="bottom:-5px;left:50%;transform:translateX(-50%);"></div>
+            <div class="crop-handle" data-h="w" style="top:50%;left:-5px;transform:translateY(-50%);"></div>
+            <div class="crop-handle" data-h="e" style="top:50%;right:-5px;transform:translateY(-50%);"></div>
+          </div>
+          <div id="cropRatioBar" style="position:absolute;top:8px;left:50%;transform:translateX(-50%);display:flex;gap:4px;">
+            <button class="crop-ratio-btn active" data-ratio="free">Свободно</button>
+            <button class="crop-ratio-btn" data-ratio="4:3">4:3</button>
+            <button class="crop-ratio-btn" data-ratio="3:4">3:4</button>
+            <button class="crop-ratio-btn" data-ratio="16:9">16:9</button>
+            <button class="crop-ratio-btn" data-ratio="1:1">1:1</button>
+          </div>
+          <div id="cropActionBar" style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);display:flex;gap:6px;">
+            <button class="crop-action-btn" onclick="applyCrop()">✓ Применить</button>
+            <button class="crop-action-btn secondary" onclick="setEditMode('view')">✕ Отмена</button>
+          </div>
+        </div>
         <div class="canvas-placeholder" id="canvasPlaceholder">
           <div class="canvas-placeholder-inner">
             <div class="big-icon">🏗️</div>
