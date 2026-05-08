@@ -1795,19 +1795,37 @@ async function detectRoomsLocal(imageEl, opts) {
   }
 
   let bin1, bin2
-  let _cannyEdges = null  // card of Canny edges — kept for Hough (scan mode only)
+  let _cannyEdges  = null  // Canny edges — kept for Hough snap/align (scan mode)
+  let _houghRooms  = null  // Polygons built from Probabilistic Hough intersections
 
   if (opts.threshold == null && isPhoto) {
     bin1 = sauvolaThreshold(gray, W, H, windowR,     K_SAUVOLA)
     bin2 = sauvolaThreshold(gray, W, H, windowR + 8, K_SAUVOLA - 0.05)
   } else if (opts.threshold == null && !isPhoto) {
-    // ---- Canny for clean scans & PDF ----------------------------------------
-    // Canny finds thin wall lines more precisely than global Otsu.
-    // After edge detection we dilate edges to close gaps, then invert:
-    // edge/wall=0, free space=1 -- ready for flood fill.
+    // ── New pipeline: Gaussian blur → Canny → Morphological Closing →
+    //   Probabilistic Hough Transform → Line intersections → Room polygons
+    // ─────────────────────────────────────────────────────────────────────────
+    // Step 1: Canny edge detection (includes 3×3 Gaussian blur internally)
     _cannyEdges = cannyEdges(gray, W, H)
 
-    // Dilate Canny edges by ~half wall thickness to close gaps
+    // Step 2: Morphological Closing — close gaps between broken wall edges.
+    // Radius = ~half wall thickness so thin walls become solid closed contours.
+    const closeR = Math.max(1, Math.round(wallEst * 0.6))
+    const closedEdges = morphClose(_cannyEdges, W, H, closeR)
+
+    // Step 3: Probabilistic Hough Transform — extract wall line segments.
+    const houghSegs = probabilisticHough(closedEdges, W, H, {
+      threshold:  Math.max(25, Math.min(W, H) * 0.05),
+      minLength:  Math.max(15, Math.min(W, H) * 0.03),
+      maxGap:     Math.max(4,  Math.min(W, H) * 0.006),
+    })
+
+    // Step 4: Build room polygons from line intersections (H/V grid approach).
+    // This computes all rectangle vertices from pairs of H-wall × V-wall lines.
+    _houghRooms = buildRoomsFromLines(houghSegs, W, H, closedEdges)
+
+    // Step 5: Fall back to flood-fill if Hough found too few rooms (complex plans).
+    // Also build binary maps for the flood-fill fallback path.
     const dilR = Math.max(1, wallEst >> 1)
     const dilated = new Uint8Array(W * H)
     for (let y = dilR; y < H - dilR; y++) {
@@ -1940,7 +1958,7 @@ async function detectRoomsLocal(imageEl, opts) {
 
   await tick()
 
-  // ---- Hough H/V wall line detection ----------------------------------------
+  // ---- Hough H/V wall line detection (for snap/align of flood-fill polygons) ---
   // Project the Canny edge map onto Y-axis (horizontals) and X-axis (verticals).
   // Peaks in each projection = wall positions used to snap polygon vertices.
   let _houghLines = null
@@ -1951,56 +1969,108 @@ async function detectRoomsLocal(imageEl, opts) {
   // в analyseLocal (только если набралось достаточно обучающих данных).
   const inv   = 1 / scale
   const rooms = []
-  for (let i = 0; i < merged.length; i++) {
-    const r = merged[i]
-    const isFromLoose = !cand1.includes(r)
-    const labelsMap   = isFromLoose ? labels2 : labels1
 
-    const poly = traceContour(labelsMap, r.label, W, H, r)
-    if (poly.length < 4) continue
-    // ---- Dynamic epsilon: adapts to image scale ----------------------------
-    // opts.epsilon=0 -> auto: 0.5% of the shorter image dimension.
-    // Removes pixel-level staircase artefacts without blurring real corners.
-    const dynEps = opts.epsilon > 0
-      ? opts.epsilon
-      : Math.max(2, Math.round(Math.min(W, H) * 0.005))
-    const simp0 = rdp(poly, dynEps)
-    if (simp0.length < 3) continue
-    // ---- Hough snap or classic 90-degree correction -----------------------
-    // For scans: align edges to detected Hough wall lines (removes staircase),
-    // then snap residual angles to 90 and clean jagged intermediate points.
-    // For photos / manual mode: unchanged classic pipeline.
-    let simp
-    if (_cannyEdges && _houghLines) {
-      const snapDist = Math.max(4, Math.round(Math.min(W, H) * 0.008))
-      const aligned  = axisAlignEdges(simp0, _houghLines.hLines, _houghLines.vLines, snapDist)
-      const snapped  = snapToRightAngles(aligned)
-      simp = cleanJaggedEdges(snapped)
-    } else {
-      const simp1 = snapToRightAngles(simp0)
-      simp = cleanJaggedEdges(simp1)
+  // ── PATH A: Probabilistic Hough + intersection polygons (scan/PDF mode) ────
+  // If _houghRooms has results, convert them directly to room records.
+  // Polygons are already clean rectangles with vertices at wall intersections.
+  if (_houghRooms && _houghRooms.length > 0) {
+    for (let i = 0; i < _houghRooms.length; i++) {
+      const poly = _houghRooms[i]  // [[x,y], ...] in work-canvas coords
+      if (poly.length < 3) continue
+
+      // Compute area (shoelace) and bounding box for metrics
+      let area = 0
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+      for (let k = 0; k < poly.length; k++) {
+        const [x1, y1] = poly[k], [x2, y2] = poly[(k+1) % poly.length]
+        area += x1*y2 - x2*y1
+        if (x1 < minX) minX = x1; if (x1 > maxX) maxX = x1
+        if (y1 < minY) minY = y1; if (y1 > maxY) maxY = y1
+      }
+      area = Math.abs(area) / 2
+
+      let perim = 0
+      for (let k = 0; k < poly.length; k++) {
+        const [x1,y1] = poly[k], [x2,y2] = poly[(k+1)%poly.length]
+        perim += Math.hypot(x2-x1, y2-y1)
+      }
+      const compactness = perim > 0 ? (4 * Math.PI * area) / (perim * perim) : 1
+      const bboxW = maxX - minX + 1, bboxH = maxY - minY + 1
+      const aspect = Math.max(bboxW, bboxH) / Math.max(1, Math.min(bboxW, bboxH))
+
+      rooms.push({
+        id:          `r${i+1}`,
+        label:       `Помещение ${i+1}`,
+        areaPx:      Math.round(area * inv * inv),
+        compactness: Math.round(compactness * 100) / 100,
+        aspect,
+        polygon:     poly.map(([x,y]) => [Math.round(x*inv), Math.round(y*inv)]),
+        _source:     'hough',
+      })
     }
-    if (simp.length < 3) continue
-
-    // Compactness = 4π·Area / Perimeter² (1 = круг, → 0 = очень вытянутый)
-    let perim = 0
-    for (let k = 0; k < simp.length; k++) {
-      const [x1,y1] = simp[k], [x2,y2] = simp[(k+1)%simp.length]
-      perim += Math.hypot(x2-x1, y2-y1)
-    }
-    const compactness = perim > 0 ? (4 * Math.PI * r.area) / (perim * perim) : 1
-    const bboxW = r.maxX - r.minX + 1, bboxH = r.maxY - r.minY + 1
-    const aspect = Math.max(bboxW, bboxH) / Math.max(1, Math.min(bboxW, bboxH))
-
-    rooms.push({
-      id:          `r${i+1}`,
-      label:       `Помещение ${i+1}`,
-      areaPx:      Math.round(r.area * inv * inv),
-      compactness: Math.round(compactness * 100) / 100,
-      aspect,
-      polygon:     simp.map(([x,y]) => [Math.round(x*inv), Math.round(y*inv)]),
-    })
   }
+
+  // ── PATH B: Flood-fill + contour tracing (photo mode or Hough fallback) ────
+  // Used when: (a) isPhoto mode, (b) manual threshold, or
+  // (c) Hough found < 2 rooms — complex/non-orthogonal floor plans.
+  const houghCoveredWell = rooms.length >= 2
+  if (!houghCoveredWell) {
+    // Clear any partial Hough results before adding flood-fill rooms
+    rooms.length = 0
+
+    for (let i = 0; i < merged.length; i++) {
+      const r = merged[i]
+      const isFromLoose = !cand1.includes(r)
+      const labelsMap   = isFromLoose ? labels2 : labels1
+
+      const poly = traceContour(labelsMap, r.label, W, H, r)
+      if (poly.length < 4) continue
+      // ---- Dynamic epsilon: adapts to image scale ----------------------------
+      // opts.epsilon=0 -> auto: 0.5% of the shorter image dimension.
+      // Removes pixel-level staircase artefacts without blurring real corners.
+      const dynEps = opts.epsilon > 0
+        ? opts.epsilon
+        : Math.max(2, Math.round(Math.min(W, H) * 0.005))
+      const simp0 = rdp(poly, dynEps)
+      if (simp0.length < 3) continue
+      // ---- Hough snap or classic 90-degree correction -----------------------
+      // For scans: align edges to detected Hough wall lines (removes staircase),
+      // then snap residual angles to 90 and clean jagged intermediate points.
+      // For photos / manual mode: unchanged classic pipeline.
+      let simp
+      if (_cannyEdges && _houghLines) {
+        const snapDist = Math.max(4, Math.round(Math.min(W, H) * 0.008))
+        const aligned  = axisAlignEdges(simp0, _houghLines.hLines, _houghLines.vLines, snapDist)
+        const snapped  = snapToRightAngles(aligned)
+        simp = cleanJaggedEdges(snapped)
+      } else {
+        const simp1 = snapToRightAngles(simp0)
+        simp = cleanJaggedEdges(simp1)
+      }
+      if (simp.length < 3) continue
+
+      // Compactness = 4π·Area / Perimeter² (1 = круг, → 0 = очень вытянутый)
+      let perim = 0
+      for (let k = 0; k < simp.length; k++) {
+        const [x1,y1] = simp[k], [x2,y2] = simp[(k+1)%simp.length]
+        perim += Math.hypot(x2-x1, y2-y1)
+      }
+      const compactness = perim > 0 ? (4 * Math.PI * r.area) / (perim * perim) : 1
+      const bboxW = r.maxX - r.minX + 1, bboxH = r.maxY - r.minY + 1
+      const aspect = Math.max(bboxW, bboxH) / Math.max(1, Math.min(bboxW, bboxH))
+
+      rooms.push({
+        id:          `r${i+1}`,
+        label:       `Помещение ${i+1}`,
+        areaPx:      Math.round(r.area * inv * inv),
+        compactness: Math.round(compactness * 100) / 100,
+        aspect,
+        polygon:     simp.map(([x,y]) => [Math.round(x*inv), Math.round(y*inv)]),
+        _source:     'flood',
+      })
+    }
+  }
+
   return rooms
 }
 // Otsu threshold
@@ -2125,7 +2195,304 @@ function cannyEdges(gray, W, H) {
   return out
 }
 
-// ---- Hough H/V Line Detector -----------------------------------------------
+// ── Morphological Closing ─────────────────────────────────────────────────────
+// Dilation followed by erosion with a square structuring element of radius r.
+// Closes small gaps in edge maps, connecting broken wall segments.
+// Input/output: Uint8Array of edge pixels (1 = edge, 0 = background).
+function morphClose(edges, W, H, r) {
+  // Dilation pass — set pixel if any neighbour within r×r is an edge
+  const dilated = new Uint8Array(W * H)
+  for (let y = r; y < H - r; y++) {
+    for (let x = r; x < W - r; x++) {
+      let has = 0
+      outer1: for (let dy = -r; dy <= r && !has; dy++)
+        for (let dx = -r; dx <= r; dx++)
+          if (edges[(y+dy)*W+(x+dx)]) { has = 1; break outer1 }
+      dilated[y*W+x] = has
+    }
+  }
+  // Erosion pass — keep pixel only if all neighbours within r×r are set
+  const closed = new Uint8Array(W * H)
+  for (let y = r; y < H - r; y++) {
+    for (let x = r; x < W - r; x++) {
+      if (!dilated[y*W+x]) continue
+      let all = 1
+      outer2: for (let dy = -r; dy <= r; dy++)
+        for (let dx = -r; dx <= r; dx++)
+          if (!dilated[(y+dy)*W+(x+dx)]) { all = 0; break outer2 }
+      closed[y*W+x] = all
+    }
+  }
+  return closed
+}
+
+// ── Probabilistic Hough Transform ─────────────────────────────────────────────
+// Detects line segments in an edge map using a simplified PPHT approach:
+//   1. Accumulate votes in (rho, theta) space for 180 angle buckets.
+//   2. For each peak above threshold, walk along the line collecting
+//      connected edge pixels into segments (gap tolerance = maxGap).
+// Returns [{x1,y1,x2,y2,theta,rho}, ...] sorted by length descending.
+function probabilisticHough(edges, W, H, opts) {
+  const NUM_ANGLES  = 180
+  const threshold   = opts.threshold  ?? Math.max(30, Math.min(W, H) * 0.06)
+  const minLength   = opts.minLength  ?? Math.max(20, Math.min(W, H) * 0.04)
+  const maxGap      = opts.maxGap     ?? Math.max(5,  Math.min(W, H) * 0.008)
+
+  const diag     = Math.ceil(Math.sqrt(W*W + H*H))
+  const numRho   = diag * 2 + 1
+  const cosT     = new Float32Array(NUM_ANGLES)
+  const sinT     = new Float32Array(NUM_ANGLES)
+  for (let a = 0; a < NUM_ANGLES; a++) {
+    const ang = a * Math.PI / NUM_ANGLES
+    cosT[a] = Math.cos(ang)
+    sinT[a] = Math.sin(ang)
+  }
+
+  // Accumulator
+  const acc = new Int32Array(numRho * NUM_ANGLES)
+  const edgePts = []
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++)
+      if (edges[y*W+x]) {
+        edgePts.push([x, y])
+        for (let a = 0; a < NUM_ANGLES; a++) {
+          const rho = Math.round(x * cosT[a] + y * sinT[a]) + diag
+          acc[rho * NUM_ANGLES + a]++
+        }
+      }
+
+  // Find peaks with NMS (5×5 window)
+  const peaks = []
+  for (let ri = 5; ri < numRho - 5; ri++) {
+    for (let ai = 5; ai < NUM_ANGLES - 5; ai++) {
+      const v = acc[ri * NUM_ANGLES + ai]
+      if (v < threshold) continue
+      let isMax = true
+      check: for (let dr = -2; dr <= 2; dr++)
+        for (let da = -2; da <= 2; da++) {
+          if (dr === 0 && da === 0) continue
+          if (acc[(ri+dr)*NUM_ANGLES+(ai+da)] >= v) { isMax = false; break check }
+        }
+      if (isMax) peaks.push({ rho: ri - diag, theta: ai, votes: v })
+    }
+  }
+  peaks.sort((a,b) => b.votes - a.votes)
+
+  // For each peak, extract segments by walking along the line
+  const used = new Uint8Array(W * H)
+  const segments = []
+
+  for (const pk of peaks) {
+    const { rho, theta } = pk
+    const cos = cosT[theta], sin = sinT[theta]
+
+    // Parametrise scan direction perpendicular to line normal
+    // Walk in the direction of the line (perpendicular to normal)
+    const scanDx = -sin, scanDy = cos  // direction along the line
+    // Find starting point: the edge pixel closest to the line
+    let bestDist = Infinity, startX = -1, startY = -1
+    for (const [ex, ey] of edgePts) {
+      if (used[ey*W+ex]) continue
+      const d = Math.abs(ex * cos + ey * sin - rho)
+      if (d < 1.5 && d < bestDist) { bestDist = d; startX = ex; startY = ey }
+    }
+    if (startX < 0) continue
+
+    // Walk in both directions from startX,startY collecting pixels
+    function collectSegment(sx, sy) {
+      const segs = []
+      let curSeg = null, gapCount = 0
+      // Project all edge points onto line, sort by parameter t
+      const pts = []
+      for (const [ex, ey] of edgePts) {
+        if (used[ey*W+ex]) continue
+        const perpDist = Math.abs(ex * cos + ey * sin - rho)
+        if (perpDist > 1.5) continue
+        const t = ex * scanDx + ey * scanDy
+        pts.push({ x: ex, y: ey, t })
+      }
+      pts.sort((a,b) => a.t - b.t)
+
+      if (pts.length < 2) return []
+      const result = []
+      let segStart = null, segPrev = null
+      for (const pt of pts) {
+        if (!segStart) { segStart = pt; segPrev = pt; continue }
+        const gap = pt.t - segPrev.t
+        if (gap > maxGap) {
+          const len = Math.hypot(segPrev.x - segStart.x, segPrev.y - segStart.y)
+          if (len >= minLength) result.push([segStart, segPrev])
+          segStart = pt
+        }
+        segPrev = pt
+      }
+      if (segStart && segPrev && segStart !== segPrev) {
+        const len = Math.hypot(segPrev.x - segStart.x, segPrev.y - segStart.y)
+        if (len >= minLength) result.push([segStart, segPrev])
+      }
+      return result
+    }
+
+    const found = collectSegment(startX, startY)
+    for (const [a, b] of found) {
+      segments.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, theta, rho })
+      // Mark used pixels near this segment to avoid double-counting
+      const len = Math.hypot(b.x - a.x, b.y - a.y)
+      const steps = Math.ceil(len)
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps
+        const mx = Math.round(a.x + (b.x - a.x) * t)
+        const my = Math.round(a.y + (b.y - a.y) * t)
+        if (mx >= 0 && mx < W && my >= 0 && my < H) used[my*W+mx] = 1
+      }
+    }
+  }
+
+  segments.sort((a,b) =>
+    Math.hypot(b.x2-b.x1,b.y2-b.y1) - Math.hypot(a.x2-a.x1,a.y2-a.y1))
+  return segments
+}
+
+// ── Line-segment intersection ──────────────────────────────────────────────────
+// Returns {x, y} intersection point or null if lines are parallel / don't meet.
+// Lines are treated as infinite (for wall extension) — use tMin/tMax to clamp.
+function lineIntersect(x1,y1,x2,y2, x3,y3,x4,y4) {
+  const d1x = x2-x1, d1y = y2-y1
+  const d2x = x4-x3, d2y = y4-y3
+  const denom = d1x*d2y - d1y*d2x
+  if (Math.abs(denom) < 1e-6) return null
+  const t = ((x3-x1)*d2y - (y3-y1)*d2x) / denom
+  return { x: x1 + t*d1x, y: y1 + t*d1y, t }
+}
+
+// ── Build room polygons from Hough line intersections ─────────────────────────
+// Groups wall segments by orientation (H/V), extends them to their grid position,
+// then computes all grid-cell polygons formed by pairs of H-walls and V-walls.
+// Returns array of polygon vertex arrays [[x,y], ...].
+function buildRoomsFromLines(segments, W, H, edges) {
+  // Separate horizontal vs vertical segments (within 20° of axis)
+  const hSegs = [], vSegs = []
+  for (const seg of segments) {
+    const dx = Math.abs(seg.x2 - seg.x1), dy = Math.abs(seg.y2 - seg.y1)
+    if (dy <= dx * 0.36) hSegs.push(seg)   // ≤ ~20° from horizontal
+    else if (dx <= dy * 0.36) vSegs.push(seg)  // ≤ ~20° from vertical
+    // Diagonal segments ignored for rectangular room detection
+  }
+
+  if (hSegs.length < 2 || vSegs.length < 2) return []
+
+  // Cluster H-segments by Y coordinate (merge if within mergeR pixels)
+  function clusterLines(segs, coordFn, spanFn, mergeR) {
+    const sorted = [...segs].sort((a,b) => coordFn(a) - coordFn(b))
+    const clusters = []
+    for (const seg of sorted) {
+      const c = coordFn(seg)
+      const last = clusters[clusters.length - 1]
+      if (last && Math.abs(c - last.coord) <= mergeR) {
+        last.coord = (last.coord * last.count + c) / (last.count + 1)
+        last.count++
+        const [s1, e1] = spanFn(last)
+        const [s2, e2] = spanFn(seg)
+        last.span = [Math.min(s1, s2), Math.max(e1, e2)]
+      } else {
+        clusters.push({ coord: c, count: 1, span: spanFn(seg) })
+      }
+    }
+    return clusters
+  }
+
+  const mergeR = Math.max(6, Math.min(W, H) * 0.012)
+  const hClusters = clusterLines(hSegs,
+    s => (s.y1 + s.y2) / 2,
+    s => [Math.min(s.x1,s.x2), Math.max(s.x1,s.x2)],
+    mergeR)
+  const vClusters = clusterLines(vSegs,
+    s => (s.x1 + s.x2) / 2,
+    s => [Math.min(s.y1,s.y2), Math.max(s.y1,s.y2)],
+    mergeR)
+
+  hClusters.sort((a,b) => a.coord - b.coord)
+  vClusters.sort((a,b) => a.coord - b.coord)
+
+  // Build candidate room rectangles: for each pair of adjacent H-lines and
+  // adjacent V-lines, check that all 4 corners are near real edge pixels.
+  const minRoomPx = Math.min(W, H) * 0.03
+  const maxRoomPx = Math.min(W, H) * 0.85
+  const rooms = []
+
+  function edgeNear(ex, ey, r) {
+    const ix = Math.round(ex), iy = Math.round(ey)
+    const r2 = r * r
+    for (let dy = -r; dy <= r; dy++) {
+      const ny = iy + dy
+      if (ny < 0 || ny >= H) continue
+      for (let dx = -r; dx <= r; dx++) {
+        if (dx*dx+dy*dy > r2) continue
+        const nx = ix + dx
+        if (nx >= 0 && nx < W && edges[ny*W+nx]) return true
+      }
+    }
+    return false
+  }
+
+  const cornerR = Math.max(8, mergeR * 1.5)
+
+  for (let hi = 0; hi < hClusters.length - 1; hi++) {
+    const h1 = hClusters[hi], h2 = hClusters[hi+1]
+    const roomH = h2.coord - h1.coord
+    if (roomH < minRoomPx || roomH > maxRoomPx) continue
+
+    for (let vi = 0; vi < vClusters.length - 1; vi++) {
+      const v1 = vClusters[vi], v2 = vClusters[vi+1]
+      const roomW2 = v2.coord - v1.coord
+      if (roomW2 < minRoomPx || roomW2 > maxRoomPx) continue
+
+      // Check all 4 corners have real edges nearby
+      const corners = [
+        [v1.coord, h1.coord], [v2.coord, h1.coord],
+        [v2.coord, h2.coord], [v1.coord, h2.coord],
+      ]
+      const cornersOk = corners.every(([cx, cy]) => edgeNear(cx, cy, cornerR))
+      if (!cornersOk) continue
+
+      // Check that the centre of the room is NOT an edge pixel (it's open space)
+      const midX = Math.round((v1.coord + v2.coord) / 2)
+      const midY = Math.round((h1.coord + h2.coord) / 2)
+      let wallDensity = 0
+      const checkR = Math.min(roomW2, roomH) * 0.2
+      const checkRi = Math.max(3, Math.round(checkR))
+      for (let dy = -checkRi; dy <= checkRi; dy++)
+        for (let dx = -checkRi; dx <= checkRi; dx++) {
+          const ny = midY+dy, nx = midX+dx
+          if (ny>=0&&ny<H&&nx>=0&&nx<W&&edges[ny*W+nx]) wallDensity++
+        }
+      const checkArea = (2*checkRi+1)*(2*checkRi+1)
+      if (wallDensity / checkArea > 0.25) continue  // too many edges = wall, not room
+
+      rooms.push(corners.map(([cx,cy]) => [Math.round(cx), Math.round(cy)]))
+    }
+  }
+
+  // Deduplicate highly overlapping rectangles (IoU > 0.5)
+  function rectIoU(a, b) {
+    const ax1=a[0][0],ay1=a[0][1],ax2=a[2][0],ay2=a[2][1]
+    const bx1=b[0][0],by1=b[0][1],bx2=b[2][0],by2=b[2][1]
+    const ix1=Math.max(ax1,bx1), iy1=Math.max(ay1,by1)
+    const ix2=Math.min(ax2,bx2), iy2=Math.min(ay2,by2)
+    if (ix2<=ix1||iy2<=iy1) return 0
+    const inter=(ix2-ix1)*(iy2-iy1)
+    const ua=(ax2-ax1)*(ay2-ay1), ub=(bx2-bx1)*(by2-by1)
+    return inter/(ua+ub-inter)
+  }
+  const kept = []
+  for (let i = 0; i < rooms.length; i++) {
+    if (kept.some(j => rectIoU(rooms[j], rooms[i]) > 0.5)) continue
+    kept.push(i)
+  }
+  return kept.map(i => rooms[i])
+}
+
+// ---- Hough H/V Line Detector (legacy — used for snap/align only) -----------
 // Projects the Canny edge map onto the Y-axis (horizontals) and X-axis
 // (verticals). Local maxima in each 1-D projection that exceed minVotes are
 // returned as wall coordinates.  minVotes defaults to 4% of image dimension.
