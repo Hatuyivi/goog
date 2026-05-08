@@ -1874,6 +1874,75 @@ async function detectRoomsLocal(imageEl, opts) {
     }
   }
 
+  // ---- Close doorway gaps in binary map ----------------------------------------
+  // Architectural plans have doorway openings: short gaps in walls (typ. 80-120cm).
+  // We close these gaps by scanning for "gap columns/rows" — sequences of free pixels
+  // flanked by wall pixels on both sides — and filling them if gap ≤ maxDoorPx.
+  // This is done BEFORE erosion so that rooms separated only by a door opening
+  // are treated as separate connected components.
+  function closeDoorGaps(bin, W, H) {
+    const out = bin.slice()
+    const maxDoor = Math.max(6, Math.round(Math.min(W, H) * 0.025))  // ~2.5% of short side
+
+    // Horizontal scan: for each row, find gaps in wall=0 regions flanked by wall
+    for (let y = 1; y < H - 1; y++) {
+      let x = 1
+      while (x < W - 1) {
+        if (out[y*W+x] === 1) { x++; continue }  // free pixel, skip
+        // Find end of wall-free run
+        let gapStart = x
+        while (x < W && out[y*W+x] === 0) x++
+        const gapEnd = x - 1
+        const gapLen = gapEnd - gapStart + 1
+        if (gapLen > maxDoor) continue
+        // Check both sides have a wall pixel in nearby rows
+        const hasWallLeft  = gapStart > 0 && out[y*W+(gapStart-1)] === 0
+        const hasWallRight = gapEnd < W-1  && out[y*W+(gapEnd+1)]  === 0
+        // Close if the gap is narrow AND walls exist above/below (confirming wall direction)
+        if (hasWallLeft && hasWallRight) {
+          let wallAbove = 0, wallBelow = 0
+          for (let gx = gapStart; gx <= gapEnd; gx++) {
+            if (y > 0   && out[(y-1)*W+gx] === 0) wallAbove++
+            if (y < H-1 && out[(y+1)*W+gx] === 0) wallBelow++
+          }
+          // If walls are present above/below this gap — it's a doorway, fill it
+          if (wallAbove > gapLen * 0.4 || wallBelow > gapLen * 0.4) {
+            for (let gx = gapStart; gx <= gapEnd; gx++) out[y*W+gx] = 0
+          }
+        }
+      }
+    }
+
+    // Vertical scan: same logic for columns
+    for (let x = 1; x < W - 1; x++) {
+      let y = 1
+      while (y < H - 1) {
+        if (out[y*W+x] === 1) { y++; continue }
+        let gapStart = y
+        while (y < H && out[y*W+x] === 0) y++
+        const gapEnd = y - 1
+        const gapLen = gapEnd - gapStart + 1
+        if (gapLen > maxDoor) continue
+        const hasWallAbove = gapStart > 0 && out[(gapStart-1)*W+x] === 0
+        const hasWallBelow = gapEnd < H-1  && out[(gapEnd+1)*W+x]  === 0
+        if (hasWallAbove && hasWallBelow) {
+          let wallLeft = 0, wallRight = 0
+          for (let gy = gapStart; gy <= gapEnd; gy++) {
+            if (x > 0   && out[gy*W+(x-1)] === 0) wallLeft++
+            if (x < W-1 && out[gy*W+(x+1)] === 0) wallRight++
+          }
+          if (wallLeft > gapLen * 0.4 || wallRight > gapLen * 0.4) {
+            for (let gy = gapStart; gy <= gapEnd; gy++) out[gy*W+x] = 0
+          }
+        }
+      }
+    }
+    return out
+  }
+
+  bin1 = closeDoorGaps(bin1, W, H)
+  bin2 = closeDoorGaps(bin2, W, H)
+
   // ---- Erosion (thicken walls) ----------------------------------------------
   for (let i = 0; i < opts.dilateK; i++) { bin1 = erode4(bin1, W, H); bin2 = erode4(bin2, W, H) }
   bin2 = erode4(bin2, W, H)  // extra pass for loose
@@ -1921,12 +1990,22 @@ async function detectRoomsLocal(imageEl, opts) {
   const minArea = total * opts.minAreaFrac
   const maxArea = total * 0.70
 
+  // touchesBorder — умная проверка: отбрасываем регион только если он касается
+  // самого края растра (вероятно, фоновая область за пределами здания).
+  // НО: если регион большой (> 1% площади) и компактный (fill ratio > 0.5),
+  // это скорее перименальный офис у внешней стены — его НЕ выбрасываем.
   function filterRegions(regions, fillRatioMin) {
     return regions.filter(r => {
-      if (r.touchesBorder) return false
       if (r.area < minArea || r.area > maxArea) return false
       const bboxArea = (r.maxX - r.minX + 1) * (r.maxY - r.minY + 1)
-      if (bboxArea > 0 && r.area / bboxArea < fillRatioMin) return false
+      const fillRatio = bboxArea > 0 ? r.area / bboxArea : 0
+      if (fillRatio < fillRatioMin) return false
+      // Отбрасываем граничные регионы только если они маленькие ИЛИ некомпактные
+      // Большие компактные регионы у края — это легитимные комнаты у внешней стены
+      if (r.touchesBorder) {
+        const isBigAndCompact = r.area > total * 0.01 && fillRatio > 0.45
+        if (!isBigAndCompact) return false
+      }
       return true
     })
   }
@@ -2416,8 +2495,8 @@ function buildRoomsFromLines(segments, W, H, edges) {
 
   // Build candidate room rectangles: for each pair of adjacent H-lines and
   // adjacent V-lines, check that all 4 corners are near real edge pixels.
-  const minRoomPx = Math.min(W, H) * 0.03
-  const maxRoomPx = Math.min(W, H) * 0.85
+  const minRoomPx = Math.min(W, H) * 0.02   // минимум ~2% короткой стороны
+  const maxRoomPx = Math.min(W, H) * 0.98   // почти вся картинка — нет потолка
   const rooms = []
 
   function edgeNear(ex, ey, r) {
@@ -2435,7 +2514,8 @@ function buildRoomsFromLines(segments, W, H, edges) {
     return false
   }
 
-  const cornerR = Math.max(8, mergeR * 1.5)
+  // Радиус поиска рёбра у угла — для больших комнат чуть больше
+  const cornerR = Math.max(12, mergeR * 2)
 
   for (let hi = 0; hi < hClusters.length - 1; hi++) {
     const h1 = hClusters[hi], h2 = hClusters[hi+1]
@@ -2447,19 +2527,19 @@ function buildRoomsFromLines(segments, W, H, edges) {
       const roomW2 = v2.coord - v1.coord
       if (roomW2 < minRoomPx || roomW2 > maxRoomPx) continue
 
-      // Check all 4 corners have real edges nearby
+      // Check corners: достаточно 3 из 4 углов (один может быть проёмом/дверью)
       const corners = [
         [v1.coord, h1.coord], [v2.coord, h1.coord],
         [v2.coord, h2.coord], [v1.coord, h2.coord],
       ]
-      const cornersOk = corners.every(([cx, cy]) => edgeNear(cx, cy, cornerR))
-      if (!cornersOk) continue
+      const cornersFound = corners.filter(([cx, cy]) => edgeNear(cx, cy, cornerR)).length
+      if (cornersFound < 3) continue
 
       // Check that the centre of the room is NOT an edge pixel (it's open space)
       const midX = Math.round((v1.coord + v2.coord) / 2)
       const midY = Math.round((h1.coord + h2.coord) / 2)
       let wallDensity = 0
-      const checkR = Math.min(roomW2, roomH) * 0.2
+      const checkR = Math.min(roomW2, roomH) * 0.15
       const checkRi = Math.max(3, Math.round(checkR))
       for (let dy = -checkRi; dy <= checkRi; dy++)
         for (let dx = -checkRi; dx <= checkRi; dx++) {
@@ -2467,7 +2547,9 @@ function buildRoomsFromLines(segments, W, H, edges) {
           if (ny>=0&&ny<H&&nx>=0&&nx<W&&edges[ny*W+nx]) wallDensity++
         }
       const checkArea = (2*checkRi+1)*(2*checkRi+1)
-      if (wallDensity / checkArea > 0.25) continue  // too many edges = wall, not room
+      // Порог плотности адаптивен: большие комнаты допускают меньше стен в центре
+      const densityLimit = (roomW2 * roomH > W * H * 0.02) ? 0.15 : 0.25
+      if (wallDensity / checkArea > densityLimit) continue  // too many edges = wall, not room
 
       rooms.push(corners.map(([cx,cy]) => [Math.round(cx), Math.round(cy)]))
     }
