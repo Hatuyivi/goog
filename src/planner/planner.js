@@ -1548,7 +1548,7 @@ async function detectRoomsLocal(imageEl, opts) {
         for (let v = 0; v < 256; v++) {
           cdf += hist[v]
           if (cdfMin < 0 && hist[v] > 0) cdfMin = cdf
-          lut[v] = count > cdfMin ? Math.round((cdf - cdfMin) / (count - cdfMin) * 255) : v
+          lut[v] = (cdfMin >= 0 && count > cdfMin) ? Math.round((cdf - cdfMin) / (count - cdfMin) * 255) : v
         }
         luts[tr][tc] = lut
       }
@@ -1615,7 +1615,7 @@ async function detectRoomsLocal(imageEl, opts) {
   // Размер окна Саувола ≈ толщина стены × 3.
   const wallEst = Math.max(2, Math.min(40, Math.round(Math.min(W, H) * 0.01)))
   const windowR = Math.max(7, wallEst * 3)
-  const K_SAUVOLA = -0.2
+  const K_SAUVOLA = 0.2
 
   // ── Определяем тип источника: фото или скан ──────────────────────────────
   // Фото с телефона: неравномерный фон (тени, перспектива) — высокая локальная
