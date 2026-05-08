@@ -502,16 +502,18 @@ function drawPlan() {
 
     ctx.globalAlpha = 1
     ctx.strokeStyle = isSelected ? 'rgba(30,120,60,0.95)' : isChecked ? 'rgba(0,100,220,0.85)' : STROKE_COLOR
-    ctx.lineWidth   = isSelected ? 3 : isChecked ? 2.5 : STROKE_WIDTH
+    // Обводка и шрифт делятся на zoomLevel — остаются постоянными на экране
+    const iz = 1 / zoomLevel
+    ctx.lineWidth   = (isSelected ? 3 : isChecked ? 2.5 : STROKE_WIDTH) * iz
     ctx.stroke()
 
     // label
     const cx = pts.reduce((s,p)=>s+p[0],0) / pts.length
     const cy = pts.reduce((s,p)=>s+p[1],0) / pts.length
-    const fontSize = Math.max(11, Math.min(16, Math.round(canvas.width / 80)))
+    const fontSize = Math.max(11, Math.min(16, Math.round(canvas.width / 80))) * iz
     ctx.font = `600 ${fontSize}px -apple-system, sans-serif`
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
-    const tw = ctx.measureText(room.label).width + 10
+    const tw = ctx.measureText(room.label).width + 10 * iz
     ctx.fillStyle = 'rgba(255,255,255,0.92)'
     ctx.fillRect(cx - tw/2, cy - fontSize*0.7, tw, fontSize*1.4)
     ctx.fillStyle = '#1d1d1f'
@@ -525,13 +527,17 @@ function drawPlan() {
       if (currentView === 'selected' && room.id !== selectedRoomId) continue
       const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
 
+      // Точки рисуются в canvas-px, но canvas масштабируется через CSS transform scale(zoomLevel).
+      // Делим радиусы и lineWidth на zoomLevel — точки остаются одного размера на экране.
+      const iz = 1 / zoomLevel
+
       // Draw edge midpoints as faint add-points
       for (let i = 0; i < pts.length; i++) {
         const j = (i+1) % pts.length
         const mx = (pts[i][0]+pts[j][0])/2, my = (pts[i][1]+pts[j][1])/2
         const isHovered = hoverState?.roomId===room.id && hoverState?.edgeIdx===i
         ctx.globalAlpha = isHovered ? 1 : 0.35
-        ctx.beginPath(); ctx.arc(mx, my, isHovered ? 5 : 3, 0, Math.PI*2)
+        ctx.beginPath(); ctx.arc(mx, my, (isHovered ? 5 : 3) * iz, 0, Math.PI*2)
         ctx.fillStyle = '#007aff'; ctx.fill()
       }
 
@@ -541,11 +547,11 @@ function drawPlan() {
         const isDragging = dragState?.roomId===room.id && dragState?.ptIdx===i
         const r = (isHovered || isDragging) ? 7 : 5
         ctx.globalAlpha = 1
-        ctx.beginPath(); ctx.arc(pts[i][0], pts[i][1], r, 0, Math.PI*2)
+        ctx.beginPath(); ctx.arc(pts[i][0], pts[i][1], r * iz, 0, Math.PI*2)
         ctx.fillStyle = isDragging ? '#ff9500' : isHovered ? '#ff3b30' : '#fff'
         ctx.fill()
         ctx.strokeStyle = isDragging ? '#ff6a00' : isHovered ? '#cc1000' : 'rgba(30,120,60,0.9)'
-        ctx.lineWidth = 2; ctx.stroke()
+        ctx.lineWidth = 2 * iz; ctx.stroke()
       }
     }
   }
@@ -1760,7 +1766,9 @@ async function detectRoomsLocal(imageEl, opts) {
     const poly = traceContour(labelsMap, r.label, W, H, r)
     if (poly.length < 4) continue
     const simp0 = rdp(poly, opts.epsilon || 2)
-    const simp  = removeSharpAngles(simp0, 65)
+    if (simp0.length < 3) continue
+    const simp1 = snapToRightAngles(simp0)   // 1. снаппим углы к 90°
+    const simp  = cleanJaggedEdges(simp1)     // 2. чистим зубчики вдоль сторон
     if (simp.length < 3) continue
 
     // Compactness = 4π·Area / Perimeter² (1 = круг, → 0 = очень вытянутый)
@@ -1868,61 +1876,6 @@ function traceContour(labels, label, W, H, region) {
   return poly
 }
 
-// Remove jagged vertices (зубчики от цифр/текста на планировке).
-// Вершина удаляется если выполнены ОБА условия:
-//   1. Угол при ней острее minAngleDeg (зубчик всегда острый)
-//   2. Хотя бы один из двух прилегающих отрезков короче shortFrac*периметр
-//      (реальный угол комнаты имеет длинные стены с обеих сторон)
-// Итерируем до стабилизации — зубчики могут быть цепочкой.
-function removeSharpAngles(points, minAngleDeg, shortFrac) {
-  shortFrac = shortFrac || 0.04   // 4% периметра — порог "короткого" отрезка
-  let poly = points.slice()
-  const minRad = minAngleDeg * Math.PI / 180
-
-  let changed = true
-  while (changed && poly.length > 3) {
-    changed = false
-
-    // Считаем периметр текущего полигона
-    const n = poly.length
-    let perim = 0
-    for (let i = 0; i < n; i++) {
-      const a = poly[i], b = poly[(i + 1) % n]
-      perim += Math.hypot(b[0] - a[0], b[1] - a[1])
-    }
-    const shortLen = perim * shortFrac
-
-    const next = []
-    for (let i = 0; i < n; i++) {
-      const prev = poly[(i - 1 + n) % n]
-      const cur  = poly[i]
-      const nxt  = poly[(i + 1) % n]
-
-      // Длины прилегающих отрезков
-      const lenPrev = Math.hypot(cur[0] - prev[0], cur[1] - prev[1])
-      const lenNext = Math.hypot(nxt[0] - cur[0],  nxt[1] - cur[1])
-
-      // Угол при cur (между векторами cur→prev и cur→next)
-      const ax = prev[0] - cur[0], ay = prev[1] - cur[1]
-      const bx = nxt[0]  - cur[0], by = nxt[1]  - cur[1]
-      const dot   = ax * bx + ay * by
-      const cross = ax * by - ay * bx
-      const angle = Math.atan2(Math.abs(cross), dot)
-
-      const isSharpAngle = angle < minRad
-      const hasShortSide = lenPrev < shortLen || lenNext < shortLen
-
-      if (isSharpAngle && hasShortSide) {
-        changed = true  // удаляем вершину-зубчик
-      } else {
-        next.push(cur)
-      }
-    }
-    if (next.length >= 3) poly = next
-  }
-  return poly
-}
-
 // Ramer-Douglas-Peucker polygon simplification (iterative-safe)
 // Сглаживание контура с сохранением углов.
 // Алгоритм:
@@ -2026,6 +1979,154 @@ function rdpSegment(points, a, b, eps) {
   for (let i = a; i <= b; i++) if (keep[i]) out.push(points[i])
   return out
 }
+
+// ── Post-processing: snap corners + clean jagged edges ────────────────────────
+
+// Шаг 1. snapToRightAngles
+// Если угол при вершине близок к 90° (90° ± snapThr), делаем его точно 90°.
+//
+// Edge cases:
+//  • Круглые/многоугольные помещения — у них нет углов ≈90°, функция их не трогает
+//  • Очень короткие рёбра (< minEdge px) — снап пропускается, чтобы не схлопнуть точки
+//  • Сдвиг вершины оказался слишком большим (> 35% короткого ребра) — снап отменяется
+//  • Все вершины сошлись в одну точку — возвращаем исходный массив
+//  • < 3 точек — возвращаем as-is
+function snapToRightAngles(points, snapThr) {
+  snapThr = snapThr || 15   // ±15° от 90°
+  const n = points.length
+  if (n < 3) return points.slice()
+
+  const result = points.map(p => [p[0], p[1]])
+
+  for (let iter = 0; iter < 4; iter++) {
+    let anySnapped = false
+    for (let i = 0; i < n; i++) {
+      const prev = result[(i - 1 + n) % n]
+      const cur  = result[i]
+      const next = result[(i + 1) % n]
+
+      const ax = cur[0] - prev[0], ay = cur[1] - prev[1]
+      const bx = next[0] - cur[0], by = next[1] - cur[1]
+      const lenA = Math.hypot(ax, ay)
+      const lenB = Math.hypot(bx, by)
+
+      // Защита от вырожденных рёбер (точки совпадают или почти)
+      if (lenA < 2 || lenB < 2) continue
+
+      const uax = ax / lenA, uay = ay / lenA
+      const ubx = bx / lenB, uby = by / lenB
+
+      const dot   = uax * ubx + uay * uby
+      const cross = uax * uby - uay * ubx
+      // turnDeg — угол отклонения от прямой (0° = прямо, 90° = поворот)
+      const turnDeg = Math.abs(Math.atan2(Math.abs(cross), dot) * 180 / Math.PI)
+
+      // Нас интересует только поворот ≈90°
+      if (Math.abs(turnDeg - 90) > snapThr) continue
+
+      // Снаппим: двигаем cur так, чтобы B стал перпендикулярен A.
+      // Перп к A (повёрнут влево):
+      const perpAx = -uay, perpAy = uax
+      // Проекция B на перп(A) — это «правильная» составляющая B
+      const bAlongPerp = ubx * perpAx + uby * perpAy
+      const sign = bAlongPerp >= 0 ? 1 : -1
+
+      const newX = next[0] - lenB * sign * perpAx
+      const newY = next[1] - lenB * sign * perpAy
+
+      // Отменяем снап если сдвиг слишком большой
+      const shift   = Math.hypot(newX - cur[0], newY - cur[1])
+      const minEdge = Math.min(lenA, lenB)
+      if (shift > minEdge * 0.35) continue
+
+      result[i] = [Math.round(newX), Math.round(newY)]
+      anySnapped = true
+    }
+    if (!anySnapped) break
+  }
+
+  // Финальная проверка: не допускаем схлопывания точек
+  const deduped = []
+  for (let i = 0; i < n; i++) {
+    const prev = result[(i - 1 + n) % n]
+    const cur  = result[i]
+    if (Math.hypot(cur[0] - prev[0], cur[1] - prev[1]) >= 1) deduped.push(cur)
+  }
+  return deduped.length >= 3 ? deduped : points.slice()
+}
+
+// Шаг 2. cleanJaggedEdges
+// Удаляет точки-зубчики вдоль прямых участков стен (между угловыми вершинами).
+// Угловые вершины определяются по величине поворота — они защищены от удаления.
+//
+// Edge cases:
+//  • Круглые помещения — угловых вершин нет или мало, функция возвращает исходный контур
+//  • Все точки — угловые (сложная форма) — зубчики не удаляются, форма сохранена
+//  • После чистки осталось < 3 точек — возвращаем исходный массив
+//  • Сегмент между углами содержит 0 промежуточных точек — пропускается корректно
+function cleanJaggedEdges(points, devEps) {
+  devEps = devEps || 3  // макс. допустимое отклонение от прямой, пикс
+  const n = points.length
+  if (n < 4) return points.slice()
+
+  // Порог угла: считаем вершину «угловой» если поворот > cornerThr°
+  // 30° — достаточно мягко, чтобы поймать слегка скошенные углы после снаппа
+  const cornerThrRad = 30 * Math.PI / 180
+
+  const isCorner = new Uint8Array(n)
+  for (let i = 0; i < n; i++) {
+    const prev = points[(i - 1 + n) % n]
+    const cur  = points[i]
+    const next = points[(i + 1) % n]
+    const ax = cur[0] - prev[0], ay = cur[1] - prev[1]
+    const bx = next[0] - cur[0], by = next[1] - cur[1]
+    const lenA = Math.hypot(ax, ay), lenB = Math.hypot(bx, by)
+    if (lenA < 1 || lenB < 1) { isCorner[i] = 1; continue }  // вырожденная — считаем угловой
+    const dot   = (ax * bx + ay * by) / (lenA * lenB)
+    const cross = (ax * by - ay * bx) / (lenA * lenB)
+    const turn  = Math.abs(Math.atan2(Math.abs(cross), dot))
+    if (turn > cornerThrRad) isCorner[i] = 1
+  }
+
+  const corners = []
+  for (let i = 0; i < n; i++) if (isCorner[i]) corners.push(i)
+
+  // Круглое или бесформенное помещение — угловых вершин нет или очень мало.
+  // Не трогаем: RDP уже дал оптимальное приближение.
+  if (corners.length < 2) return points.slice()
+
+  const keep = new Uint8Array(n)
+  for (const ci of corners) keep[ci] = 1
+
+  for (let k = 0; k < corners.length; k++) {
+    const a = corners[k]
+    const b = corners[(k + 1) % corners.length]
+    const [x1, y1] = points[a]
+    const [x2, y2] = points[b]
+    const segLen = Math.hypot(x2 - x1, y2 - y1)
+
+    // Обходим сегмент от a до b (может перематываться через 0)
+    let idx = (a + 1) % n
+    while (idx !== b) {
+      const [px, py] = points[idx]
+      // Расстояние от точки до прямой AB
+      const dist = segLen > 0
+        ? Math.abs((y2 - y1) * px - (x2 - x1) * py + x2 * y1 - y2 * x1) / segLen
+        : Math.hypot(px - x1, py - y1)
+
+      // Оставляем только точки, которые заметно отклоняются от прямой стены
+      if (dist > devEps) keep[idx] = 1
+      idx = (idx + 1) % n
+    }
+  }
+
+  const out = []
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(points[i])
+
+  // Если после чистки потеряли слишком много — возвращаем исходное
+  return out.length >= 3 ? out : points.slice()
+}
+
 
 // ── Polygon overlap & union helpers ───────────────────────
 
@@ -2641,6 +2742,24 @@ function applyCrop() {
     currentImageB64 = dataUrl.split(',')[1]
     currentMime = 'image/jpeg'
 
+    // Сдвигаем полигоны всех помещений на величину кропа (ix, iy) в image px.
+    // Точки за пределами нового изображения зажимаем по границе.
+    // Комнаты, полностью вышедшие за кадр, удаляем.
+    function shiftPolygons(roomList) {
+      return roomList.map(room => {
+        if (!room.polygon?.length) return room
+        const newPoly = room.polygon.map(([x, y]) => [
+          Math.max(0, Math.min(iw, Math.round(x - ix))),
+          Math.max(0, Math.min(ih, Math.round(y - iy))),
+        ])
+        const inside = newPoly.some(([x, y]) => x > 0 && x < iw && y > 0 && y < ih)
+        if (!inside) return null
+        return { ...room, polygon: newPoly }
+      }).filter(Boolean)
+    }
+    rooms = shiftPolygons(rooms)
+    originalRooms = shiftPolygons(originalRooms)
+
     // Rebuild adjusted canvases
     currentImageBW    = null
     currentImageColor = null
@@ -2658,6 +2777,7 @@ function applyCrop() {
 
     currentImageBW = makeBWCanvas(newImg)
     resizeCanvas(newImg)
+    buildRoomList()
     exitCropMode()
     setEditMode('view')
     drawPlan()
