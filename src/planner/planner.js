@@ -1795,12 +1795,42 @@ async function detectRoomsLocal(imageEl, opts) {
   }
 
   let bin1, bin2
+  let _cannyEdges = null  // card of Canny edges — kept for Hough (scan mode only)
+
   if (opts.threshold == null && isPhoto) {
-    // Фото: Саувола — адаптивно справляется с тенями и неравномерным освещением
     bin1 = sauvolaThreshold(gray, W, H, windowR,     K_SAUVOLA)
     bin2 = sauvolaThreshold(gray, W, H, windowR + 8, K_SAUVOLA - 0.05)
+  } else if (opts.threshold == null && !isPhoto) {
+    // ---- Canny for clean scans & PDF ----------------------------------------
+    // Canny finds thin wall lines more precisely than global Otsu.
+    // After edge detection we dilate edges to close gaps, then invert:
+    // edge/wall=0, free space=1 -- ready for flood fill.
+    _cannyEdges = cannyEdges(gray, W, H)
+
+    // Dilate Canny edges by ~half wall thickness to close gaps
+    const dilR = Math.max(1, wallEst >> 1)
+    const dilated = new Uint8Array(W * H)
+    for (let y = dilR; y < H - dilR; y++) {
+      for (let x = dilR; x < W - dilR; x++) {
+        let has = 0
+        outer: for (let dy2 = -dilR; dy2 <= dilR && !has; dy2++)
+          for (let dx2 = -dilR; dx2 <= dilR; dx2++)
+            if (_cannyEdges[(y+dy2)*W+(x+dx2)]) { has = 1; break outer }
+        dilated[y*W+x] = has
+      }
+    }
+
+    // Invert: 1 = free space (room)
+    bin1 = new Uint8Array(W * H)
+    bin2 = new Uint8Array(W * H)
+    for (let i = 0; i < gray.length; i++) bin1[i] = dilated[i] ? 0 : 1
+
+    // bin2 = Otsu-loose as fallback (catches rooms with imperfect edges)
+    const T_otsu = otsu(gray)
+    const T_loose = Math.max(T_otsu - 30, 80)
+    for (let i = 0; i < gray.length; i++) bin2[i] = (bin1[i] || gray[i] > T_loose) ? 1 : 0
   } else {
-    // Скан/PDF или ручной режим: Otsu — стабилен на чистых равномерных планах
+    // Manual threshold or fallback
     const T = opts.threshold != null ? opts.threshold : otsu(gray)
     const T_loose = Math.max(T - 30, 80)
     bin1 = new Uint8Array(W * H)
@@ -1811,9 +1841,24 @@ async function detectRoomsLocal(imageEl, opts) {
     }
   }
 
-  // ── Эрозия (утолщение стен) ────────────────────────────────────────────────
+  // ---- Artificial wall border -----------------------------------------------
+  // 3-pixel ring of zeros around the binary image prevents the touchesBorder
+  // filter from incorrectly discarding perimeter offices along outer building walls.
+  const WALL_BORDER = 3
+  for (let k = 0; k < WALL_BORDER; k++) {
+    for (let x = 0; x < W; x++) {
+      bin1[k*W+x] = 0; bin2[k*W+x] = 0
+      bin1[(H-1-k)*W+x] = 0; bin2[(H-1-k)*W+x] = 0
+    }
+    for (let y = 0; y < H; y++) {
+      bin1[y*W+k] = 0; bin2[y*W+k] = 0
+      bin1[y*W+(W-1-k)] = 0; bin2[y*W+(W-1-k)] = 0
+    }
+  }
+
+  // ---- Erosion (thicken walls) ----------------------------------------------
   for (let i = 0; i < opts.dilateK; i++) { bin1 = erode4(bin1, W, H); bin2 = erode4(bin2, W, H) }
-  bin2 = erode4(bin2, W, H)  // доп. проход для loose
+  bin2 = erode4(bin2, W, H)  // extra pass for loose
 
   // ── Connected components ───────────────────────────────────────────────────
   function floodFill(bin) {
@@ -1895,6 +1940,12 @@ async function detectRoomsLocal(imageEl, opts) {
 
   await tick()
 
+  // ---- Hough H/V wall line detection ----------------------------------------
+  // Project the Canny edge map onto Y-axis (horizontals) and X-axis (verticals).
+  // Peaks in each projection = wall positions used to snap polygon vertices.
+  let _houghLines = null
+  if (_cannyEdges) _houghLines = houghHVLines(_cannyEdges, W, H)
+
   // ── Построение полигонов + вычисление shape-метрик ─────────────────────────
   // compactness и aspect сохраняются в каждой комнате — используются shape-фильтром
   // в analyseLocal (только если набралось достаточно обучающих данных).
@@ -1907,10 +1958,28 @@ async function detectRoomsLocal(imageEl, opts) {
 
     const poly = traceContour(labelsMap, r.label, W, H, r)
     if (poly.length < 4) continue
-    const simp0 = rdp(poly, opts.epsilon || 2)
+    // ---- Dynamic epsilon: adapts to image scale ----------------------------
+    // opts.epsilon=0 -> auto: 0.5% of the shorter image dimension.
+    // Removes pixel-level staircase artefacts without blurring real corners.
+    const dynEps = opts.epsilon > 0
+      ? opts.epsilon
+      : Math.max(2, Math.round(Math.min(W, H) * 0.005))
+    const simp0 = rdp(poly, dynEps)
     if (simp0.length < 3) continue
-    const simp1 = snapToRightAngles(simp0)   // 1. снаппим углы к 90°
-    const simp  = cleanJaggedEdges(simp1)     // 2. чистим зубчики вдоль сторон
+    // ---- Hough snap or classic 90-degree correction -----------------------
+    // For scans: align edges to detected Hough wall lines (removes staircase),
+    // then snap residual angles to 90 and clean jagged intermediate points.
+    // For photos / manual mode: unchanged classic pipeline.
+    let simp
+    if (_cannyEdges && _houghLines) {
+      const snapDist = Math.max(4, Math.round(Math.min(W, H) * 0.008))
+      const aligned  = axisAlignEdges(simp0, _houghLines.hLines, _houghLines.vLines, snapDist)
+      const snapped  = snapToRightAngles(aligned)
+      simp = cleanJaggedEdges(snapped)
+    } else {
+      const simp1 = snapToRightAngles(simp0)
+      simp = cleanJaggedEdges(simp1)
+    }
     if (simp.length < 3) continue
 
     // Compactness = 4π·Area / Perimeter² (1 = круг, → 0 = очень вытянутый)
@@ -1967,6 +2036,173 @@ function erode4(bin, W, H) {
     }
   }
   return out
+}
+
+// ---- Canny Edge Detection --------------------------------------------------
+// Pure-JS Canny for the Electron renderer.
+// Steps: 3x3 Gaussian -> Sobel -> NMS -> double-threshold + BFS hysteresis.
+// Returns Uint8Array: 1 = edge/wall, 0 = background/room.
+function cannyEdges(gray, W, H) {
+  // 1. Gaussian blur 3x3
+  const blur = new Uint8Array(W * H)
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      blur[y*W+x] = (
+        gray[(y-1)*W+(x-1)]   + gray[(y-1)*W+x]*2 + gray[(y-1)*W+(x+1)] +
+        gray[ y   *W+(x-1)]*2 + gray[ y   *W+x]*4 + gray[ y   *W+(x+1)]*2 +
+        gray[(y+1)*W+(x-1)]   + gray[(y+1)*W+x]*2 + gray[(y+1)*W+(x+1)]
+      ) >> 4
+    }
+  }
+
+  // 2. Sobel gradient magnitude + quantised angle (4 directions)
+  const mag = new Float32Array(W * H)
+  const ang = new Uint8Array(W * H)  // 0=horiz 1=+45 2=vert 3=-45
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const gx = -blur[(y-1)*W+(x-1)] + blur[(y-1)*W+(x+1)]
+               - 2*blur[y*W+(x-1)]   + 2*blur[y*W+(x+1)]
+               - blur[(y+1)*W+(x-1)] + blur[(y+1)*W+(x+1)]
+      const gy = -blur[(y-1)*W+(x-1)] - 2*blur[(y-1)*W+x] - blur[(y-1)*W+(x+1)]
+               + blur[(y+1)*W+(x-1)] + 2*blur[(y+1)*W+x] + blur[(y+1)*W+(x+1)]
+      mag[y*W+x] = Math.sqrt(gx*gx + gy*gy)
+      const a = Math.atan2(Math.abs(gy), Math.abs(gx))
+      ang[y*W+x] = a < 0.3927 ? 0 : a < 1.1781 ? (gy * gx >= 0 ? 1 : 3) : 2
+    }
+  }
+
+  // 3. Non-maximum suppression
+  const nms = new Float32Array(W * H)
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const m = mag[y*W+x]
+      if (!m) continue
+      let n1, n2
+      switch (ang[y*W+x]) {
+        case 0: n1 = mag[y*W+(x-1)];       n2 = mag[y*W+(x+1)];       break
+        case 1: n1 = mag[(y-1)*W+(x+1)];   n2 = mag[(y+1)*W+(x-1)];   break
+        case 2: n1 = mag[(y-1)*W+x];       n2 = mag[(y+1)*W+x];       break
+        case 3: n1 = mag[(y-1)*W+(x-1)];   n2 = mag[(y+1)*W+(x+1)];   break
+      }
+      if (m >= n1 && m >= n2) nms[y*W+x] = m
+    }
+  }
+
+  // 4. Auto-thresholds from 85th-percentile of non-zero gradient magnitudes
+  const magHist = new Uint32Array(512)
+  for (let i = 0; i < nms.length; i++) magHist[Math.min(511, nms[i] | 0)]++
+  let nonZero = 0
+  for (let i = 1; i < 512; i++) nonZero += magHist[i]
+  let cumul = 0, highT = 50
+  for (let i = 1; i < 512; i++) {
+    cumul += magHist[i]
+    if (cumul >= nonZero * 0.85) { highT = i; break }
+  }
+  const lowT = Math.max(5, highT * 0.35)
+
+  // 5. Double-threshold + BFS hysteresis
+  const state = new Uint8Array(W * H)  // 0=none 1=weak 2=strong
+  for (let i = 0; i < nms.length; i++) {
+    if (nms[i] >= highT) state[i] = 2
+    else if (nms[i] >= lowT) state[i] = 1
+  }
+  const queue = []
+  for (let i = 0; i < state.length; i++) if (state[i] === 2) queue.push(i)
+  let qi = 0
+  while (qi < queue.length) {
+    const p = queue[qi++]
+    const py = (p / W) | 0, px = p - py * W
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      if (!dx && !dy) continue
+      const ny = py + dy, nx = px + dx
+      if (ny < 0 || ny >= H || nx < 0 || nx >= W) continue
+      const ni = ny * W + nx
+      if (state[ni] === 1) { state[ni] = 2; queue.push(ni) }
+    }
+  }
+  const out = new Uint8Array(W * H)
+  for (let i = 0; i < state.length; i++) out[i] = state[i] === 2 ? 1 : 0
+  return out
+}
+
+// ---- Hough H/V Line Detector -----------------------------------------------
+// Projects the Canny edge map onto the Y-axis (horizontals) and X-axis
+// (verticals). Local maxima in each 1-D projection that exceed minVotes are
+// returned as wall coordinates.  minVotes defaults to 4% of image dimension.
+function houghHVLines(edges, W, H) {
+  const hAcc = new Uint32Array(H)
+  const vAcc = new Uint32Array(W)
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++)
+      if (edges[y*W+x]) { hAcc[y]++; vAcc[x]++ }
+
+  const minH = Math.max(8, W * 0.04)
+  const minV = Math.max(8, H * 0.04)
+
+  function nmsPeaks(acc, n, minVal) {
+    const peaks = []
+    for (let i = 2; i < n - 2; i++) {
+      if (acc[i] < minVal) continue
+      if (acc[i] >= acc[i-1] && acc[i] >= acc[i+1] &&
+          acc[i] >= acc[i-2] && acc[i] >= acc[i+2]) peaks.push(i)
+    }
+    return peaks
+  }
+
+  return {
+    hLines: nmsPeaks(hAcc, H, minH),  // y-coords of horizontal walls
+    vLines: nmsPeaks(vAcc, W, minV),  // x-coords of vertical walls
+  }
+}
+
+// ---- Axis-align polygon edges using Hough wall lines -----------------------
+// For each polygon edge:
+//   - nearly horizontal (dy <= 0.4*dx): snap both endpoints to the nearest
+//     horizontal Hough line within snapDist pixels;
+//   - nearly vertical  (dx <= 0.4*dy): snap to nearest vertical Hough line.
+// Two alignment passes stabilise adjacent edges that share vertices.
+function axisAlignEdges(poly, hLines, vLines, snapDist) {
+  if (!poly.length || (!hLines.length && !vLines.length)) return poly
+  const n = poly.length
+  const result = poly.map(p => [p[0], p[1]])
+
+  for (let iter = 0; iter < 2; iter++) {
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n
+      const [x1, y1] = result[i], [x2, y2] = result[j]
+      const dx = Math.abs(x2 - x1), dy = Math.abs(y2 - y1)
+
+      if (dy <= dx * 0.4) {
+        // Nearly horizontal edge: align to common Y
+        const midY = (y1 + y2) * 0.5
+        let bestY = midY, bestD = snapDist
+        for (const hy of hLines) {
+          const d = Math.abs(midY - hy)
+          if (d < bestD) { bestD = d; bestY = hy }
+        }
+        result[i][1] = Math.round(bestY)
+        result[j][1] = Math.round(bestY)
+      } else if (dx <= dy * 0.4) {
+        // Nearly vertical edge: align to common X
+        const midX = (x1 + x2) * 0.5
+        let bestX = midX, bestD = snapDist
+        for (const vx of vLines) {
+          const d = Math.abs(midX - vx)
+          if (d < bestD) { bestD = d; bestX = vx }
+        }
+        result[i][0] = Math.round(bestX)
+        result[j][0] = Math.round(bestX)
+      }
+    }
+  }
+
+  // Remove collapsed adjacent points
+  const out = []
+  for (let i = 0; i < n; i++) {
+    const [cx, cy] = result[i], [px, py] = result[(i - 1 + n) % n]
+    if (Math.hypot(cx - px, cy - py) >= 1) out.push([cx, cy])
+  }
+  return out.length >= 3 ? out : poly
 }
 
 // Moore-neighbor boundary tracing on a labeled region.
