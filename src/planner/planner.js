@@ -1893,47 +1893,104 @@ function unionPolygonsConvexHull(a, b) {
 
 // Merge rooms whose polygons overlap significantly (IoU or containment > threshold)
 // Returns new rooms array with overlapping rooms unified
+// Обрезаем полигон poly так, чтобы он не пересекался с полигоном clipper.
+// Используем инвертированный Sutherland-Hodgman: для каждого ребра clipper
+// оставляем пиксели СНАРУЖИ (outside) этого ребра.
+// Это даёт приближение разности A\ B для выпуклых clipper-ов.
+// Обрезаем poly по разделительной линии, сдвинутой на offset вдоль нормали ребра.
+// offset > 0 — линия смещается внутрь poly (отдаём часть перекрытия), < 0 — наружу.
+function clipPolyByOffsetEdge(poly, ax, ay, bx, by, offset) {
+  // Нормаль к ребру (a→b), единичная, направленная внутрь (влево)
+  const len = Math.hypot(bx - ax, by - ay)
+  if (len < 0.001) return poly
+  const nx = -(by - ay) / len
+  const ny =  (bx - ax) / len
+  // Смещаем ребро на offset вдоль нормали
+  const mx = ax + nx * offset
+  const my = ay + ny * offset
+  const ex = bx + nx * offset
+  const ey = by + ny * offset
+  // Оставляем пиксели снаружи сдвинутого ребра (переворачиваем — b→a)
+  return clipPolygonByEdge(poly, ex, ey, mx, my)
+}
+
 function mergeOverlappingRooms(roomList) {
-  const rects = roomList.map(r => r.polygon)
-  const n = roomList.length
-  const merged = new Uint8Array(n)  // which indices have been consumed
-  const result = []
+  if (!roomList.length) return roomList
+
+  const polys = roomList.map(r => r.polygon.map(p => [...p]))  // deep copy
+  const n = polys.length
 
   for (let i = 0; i < n; i++) {
-    if (merged[i]) continue
-    let poly = rects[i].slice()
-    let area = polygonArea(poly)
-    let label = roomList[i].label
-    let totalArea = roomList[i].areaPx || area
-
     for (let j = i + 1; j < n; j++) {
-      if (merged[j]) continue
-      if (!bboxOverlap(poly, rects[j])) continue
+      if (!bboxOverlap(polys[i], polys[j])) continue
 
-      const inter = intersectPolygons(poly, rects[j])
+      const inter = intersectPolygons(polys[i], polys[j])
       if (!inter.length) continue
 
       const interArea = polygonArea(inter)
-      const areaJ = polygonArea(rects[j])
-      const minArea = Math.min(area, areaJ)
+      if (interArea < 2) continue  // шум/артефакт
 
-      // Merge if overlap is > 10% of the smaller polygon
-      if (interArea / minArea > 0.10) {
-        poly = unionPolygonsConvexHull(poly, rects[j])
-        area = polygonArea(poly)
-        totalArea = Math.round(area)
-        merged[j] = 1
+      const areaI = polygonArea(polys[i])
+      const areaJ = polygonArea(polys[j])
+      if (areaI < 2 || areaJ < 2) continue
+
+      // Один полигон почти целиком внутри другого — поглощается (колонна, ниша)
+      const smaller = Math.min(areaI, areaJ)
+      if (interArea / smaller > 0.85) {
+        if (areaI < areaJ) polys[i] = []; else polys[j] = []
+        continue
       }
-    }
 
-    result.push({
-      ...roomList[i],
-      polygon: poly.map(p => [Math.round(p[0]), Math.round(p[1])]),
-      areaPx:  totalArea,
-      label,
-    })
+      // ── Смежные комнаты: делим перекрытие пополам ─────────────────────────
+      // Находим ребро полигона i, которое максимально "врезается" в j.
+      // Это ребро и есть граница стены. Делим перекрытие пополам:
+      // каждый полигон обрезается по линии, сдвинутой на половину глубины.
+      let bestEdge = -1, bestDepth = -Infinity, bestLen = 0
+      for (let e = 0; e < polys[i].length; e++) {
+        const [ax, ay] = polys[i][e]
+        const [bx, by] = polys[i][(e + 1) % polys[i].length]
+        const dx = bx - ax, dy = by - ay
+        // Глубина проникновения вершин j за это ребро
+        let depth = 0, count = 0
+        for (const [px, py] of polys[j]) {
+          const d = dx * (py - ay) - dy * (px - ax)  // > 0 = внутри i
+          if (d > 0) { depth += d; count++ }
+        }
+        if (count > 0 && depth > bestDepth) {
+          bestDepth = depth
+          bestEdge  = e
+          bestLen   = Math.hypot(dx, dy)
+        }
+      }
+
+      if (bestEdge < 0 || bestLen < 0.001) continue
+
+      const [ax, ay] = polys[i][bestEdge]
+      const [bx, by] = polys[i][(bestEdge + 1) % polys[i].length]
+
+      // Средняя глубина проникновения на вершину — половина этого = линия раздела
+      const avgDepth = bestDepth / polys[j].length
+      const half = avgDepth / 2
+
+      // Полигон i отступает на half (отдаёт половину перекрытия)
+      const newI = clipPolyByOffsetEdge(polys[i], ax, ay, bx, by, -half)
+      // Полигон j обрезается до той же линии (оставляет себе половину перекрытия)
+      const newJ = clipPolyByOffsetEdge(polys[j], ax, ay, bx, by,  half)
+
+      if (newI.length >= 3) polys[i] = newI
+      if (newJ.length >= 3) polys[j] = newJ
+    }
   }
-  return result
+
+  return roomList.map((room, i) => {
+    const poly = polys[i]
+    if (!poly || poly.length < 3) return null
+    return {
+      ...room,
+      polygon: poly.map(p => [Math.round(p[0]), Math.round(p[1])]),
+      areaPx:  Math.round(polygonArea(poly)),
+    }
+  }).filter(Boolean)
 }
 
 // ── Save ───────────────────────────────────────────────────
