@@ -444,14 +444,14 @@ function drawPlan() {
   const sx = canvas.width  / currentImageEl.naturalWidth
   const sy = canvas.height / currentImageEl.naturalHeight
 
-  // Show BW-processed view by default (sliders always active).
-  // Toggle lets user switch to original colour for reference.
-  const showBW = currentImageBW && showBWBackground
-  ctx.drawImage(showBW ? currentImageBW : currentImageEl, 0, 0, canvas.width, canvas.height)
+  // Draw image with optional grayscale filter
+  ctx.save()
+  if (showBWBackground) ctx.filter = 'grayscale(1)'
+  ctx.drawImage(currentImageEl, 0, 0, canvas.width, canvas.height)
+  ctx.filter = 'none'
 
-  // When showing original colour: overlay eraser strokes as white so they stay visible
-  if (!showBW && eraserStrokes.length) {
-    ctx.save()
+  // Overlay eraser strokes as white
+  if (eraserStrokes.length) {
     ctx.fillStyle = '#ffffff'
     for (const stroke of eraserStrokes) {
       for (const pt of stroke) {
@@ -460,8 +460,8 @@ function drawPlan() {
         ctx.fill()
       }
     }
-    ctx.restore()
   }
+  ctx.restore()
 
   if (!rooms.length) return
 
@@ -1066,8 +1066,9 @@ function togglePolygons() {
 function toggleBWBackground() {
   showBWBackground = !showBWBackground
   const btn = document.getElementById('toggleBWBtn')
+  if (btn) btn.classList.toggle('active', showBWBackground)
   if (btn) btn.textContent = showBWBackground ? '🎨 Цветной' : '⬛ Ч/Б'
-  rebuildBWCanvas()   // rebuild with or without BW conversion stage
+  drawPlan()
 }
 function undo() {
   const entry = undoStack.pop()
@@ -1356,15 +1357,29 @@ canvas.addEventListener('mouseup', e => {
       }
       rooms.push(newRoom)
 
-      // Merge with any existing rooms that overlap the newly drawn one
-      const beforeLen = rooms.length
-      rooms = mergeOverlappingRooms(rooms)
+      // For manually drawn rooms: union with any overlapping existing rooms
       let mergedRoomId = newRoom.id
-      if (rooms.length < beforeLen) {
-        // Some merges happened — find the room that now contains our new polygon area
-        rooms.forEach((r, i) => { r.id = r.id || `r${i+1}`; r.label = r.label || `Помещение ${i+1}` })
-        // The last room in result that isn't from original set = merged result
-        mergedRoomId = rooms[rooms.length - 1].id
+      let mergedPoly = newRoom.polygon.map(p => [...p])
+      const toAbsorb = []
+
+      for (let i = 0; i < rooms.length - 1; i++) {
+        const other = rooms[i]
+        if (!other.polygon || other.polygon.length < 3) continue
+        if (!bboxOverlap(mergedPoly, other.polygon)) continue
+        const inter = intersectPolygons(mergedPoly, other.polygon)
+        if (!inter.length || polygonArea(inter) < 4) continue
+        // True union via convex hull of both polygons
+        mergedPoly = unionPolygonsConvexHull(mergedPoly, other.polygon)
+        toAbsorb.push(other.id)
+      }
+
+      if (toAbsorb.length) {
+        rooms = rooms.filter(r => !toAbsorb.includes(r.id))
+        const nr = rooms.find(r => r.id === newRoom.id)
+        if (nr) {
+          nr.polygon = mergedPoly.map(p => [Math.round(p[0]), Math.round(p[1])])
+          nr.areaPx  = Math.round(polygonArea(mergedPoly))
+        }
       }
 
       markEdited()

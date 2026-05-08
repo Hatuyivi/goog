@@ -304,9 +304,21 @@
     padding: 2px 7px; display: none; letter-spacing: .2px; flex-shrink: 0; white-space: nowrap;
   }
   .training-badge.visible { display: block; }
-  .canvas-placeholder { display: flex; flex-direction: column; align-items: center; gap: 10px; color: var(--text-ter); }
-  .canvas-placeholder .big-icon { font-size: 48px; opacity: .25; }
-  .canvas-placeholder p { font-size: 12px; color: var(--text-ter); }
+  .canvas-placeholder {
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+  }
+  .canvas-placeholder-inner {
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-lg); padding: 28px 36px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06);
+  }
+  .canvas-placeholder .big-icon {
+    font-size: 36px; opacity: .35; line-height: 1;
+  }
+  .canvas-placeholder p {
+    font-size: 12px; font-weight: 500; color: var(--text-ter); letter-spacing: -0.01em;
+  }
 
   /* ── Progress overlay ─────────────────────────────────────────────── */
   .progress-overlay {
@@ -680,8 +692,10 @@
       <div class="canvas-wrap">
         <canvas id="planCanvas"></canvas>
         <div class="canvas-placeholder" id="canvasPlaceholder">
-          <div class="big-icon">🏗️</div>
-          <p>Здесь появится план</p>
+          <div class="canvas-placeholder-inner">
+            <div class="big-icon">🏗️</div>
+            <p>Здесь появится план</p>
+          </div>
         </div>
       </div>
 
