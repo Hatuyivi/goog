@@ -1774,21 +1774,88 @@ function traceContour(labels, label, W, H, region) {
 }
 
 // Ramer-Douglas-Peucker polygon simplification (iterative-safe)
+// Сглаживание контура с сохранением углов.
+// Алгоритм:
+//   1. Находим "угловые" точки — где направление контура резко меняется
+//      (угол между соседними отрезками > angleThr градусов).
+//   2. Между каждой парой соседних углов — прямой участок стены.
+//      Применяем RDP только внутри этого участка, фиксируя его концы.
+//      Это убирает зубчики вдоль прямой, не трогая сами углы.
 function rdp(points, eps) {
-  if (points.length < 3 || eps <= 0) return points.slice()
-  const keep = new Uint8Array(points.length)
-  keep[0] = 1; keep[points.length - 1] = 1
+  const n = points.length
+  if (n < 3 || eps <= 0) return points.slice()
 
-  const stack = [[0, points.length - 1]]
+  // Угол в градусах между векторами (prev→cur) и (cur→next)
+  function angleDeg(prev, cur, next) {
+    const ax = cur[0] - prev[0], ay = cur[1] - prev[1]
+    const bx = next[0] - cur[0],  by = next[1] - cur[1]
+    const dot   = ax*bx + ay*by
+    const cross  = ax*by - ay*bx
+    return Math.abs(Math.atan2(Math.abs(cross), dot) * 180 / Math.PI)
+  }
+
+  // Порог угла: чем больше eps, тем мягче (меньше точек считаются углами).
+  // При eps=1 почти все изломы — углы; при eps=20 только резкие повороты.
+  const angleThr = Math.max(15, 60 - eps * 2)  // 15°..58°
+
+  // Шаг 1: помечаем угловые точки (замкнутый контур)
+  const isCorner = new Uint8Array(n)
+  for (let i = 0; i < n; i++) {
+    const prev = points[(i - 1 + n) % n]
+    const cur  = points[i]
+    const next = points[(i + 1) % n]
+    if (angleDeg(prev, cur, next) > angleThr) isCorner[i] = 1
+  }
+
+  // Если углов нет — вся комната круглая/бесформенная, применяем обычный RDP
+  const corners = []
+  for (let i = 0; i < n; i++) if (isCorner[i]) corners.push(i)
+  if (corners.length < 2) return rdpSegment(points, 0, n - 1, eps)
+
+  // Шаг 2: между каждой парой соседних углов — сегмент прямой стены.
+  // Применяем RDP внутри сегмента, концы фиксированы.
+  const keep = new Uint8Array(n)
+  for (const ci of corners) keep[ci] = 1
+
+  for (let k = 0; k < corners.length; k++) {
+    const a = corners[k]
+    const b = corners[(k + 1) % corners.length]
+    // Сегмент может перематываться через 0
+    const seg = []
+    let idx = a
+    while (idx !== b) { seg.push(idx); idx = (idx + 1) % n }
+    seg.push(b)
+    if (seg.length < 3) continue
+    // Применяем RDP к этому сегменту
+    const pts = seg.map(i => points[i])
+    const kept = rdpSegment(pts, 0, pts.length - 1, eps)
+    const keptSet = new Set(kept.map(p => p[0] * 100000 + p[1]))
+    for (let s = 1; s < seg.length - 1; s++) {
+      const [px, py] = points[seg[s]]
+      if (keptSet.has(px * 100000 + py)) keep[seg[s]] = 1
+    }
+  }
+
+  const out = []
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(points[i])
+  return out.length >= 3 ? out : points.slice()
+}
+
+// Стандартный RDP для отрезка (не замкнутого), возвращает массив точек
+function rdpSegment(points, a, b, eps) {
+  if (b - a < 2) return points.slice(a, b + 1)
+  const keep = new Uint8Array(points.length)
+  keep[a] = 1; keep[b] = 1
+  const stack = [[a, b]]
   while (stack.length) {
-    const [a, b] = stack.pop()
-    if (b - a < 2) continue
+    const [i, j] = stack.pop()
+    if (j - i < 2) continue
     let maxD = 0, idx = -1
-    const [x1, y1] = points[a], [x2, y2] = points[b]
+    const [x1, y1] = points[i], [x2, y2] = points[j]
     const dxAB = x2 - x1, dyAB = y2 - y1
     const denom = dxAB * dxAB + dyAB * dyAB
-    for (let i = a + 1; i < b; i++) {
-      const [px, py] = points[i]
+    for (let k = i + 1; k < j; k++) {
+      const [px, py] = points[k]
       let d
       if (denom === 0) {
         d = Math.hypot(px - x1, py - y1)
@@ -1797,16 +1864,16 @@ function rdp(points, eps) {
         const tx = x1 + t * dxAB, ty = y1 + t * dyAB
         d = Math.hypot(px - tx, py - ty)
       }
-      if (d > maxD) { maxD = d; idx = i }
+      if (d > maxD) { maxD = d; idx = k }
     }
     if (maxD > eps && idx > 0) {
       keep[idx] = 1
-      stack.push([a, idx])
-      stack.push([idx, b])
+      stack.push([i, idx])
+      stack.push([idx, j])
     }
   }
   const out = []
-  for (let i = 0; i < points.length; i++) if (keep[i]) out.push(points[i])
+  for (let i = a; i <= b; i++) if (keep[i]) out.push(points[i])
   return out
 }
 
