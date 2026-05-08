@@ -30,7 +30,7 @@ let trainingCount    = 0        // cached count of saved training samples
 const MAX_UNDO       = 30
 let undoStack        = []       // each entry: deep copy of rooms array
 let showPolygons     = true     // toggle polygon visibility in app
-let showBWBackground = false    // show B&W processed image as background (vs original)
+let showBWBackground = false    // false = colour-adjusted view; true = full B&W conversion
 
 // ── Eraser state ───────────────────────────────────────────
 let eraserStrokes    = []       // array of strokes; each stroke = array of {x,y,r} in image coords
@@ -224,7 +224,8 @@ function makeBWCanvas(img) {
   _rawWidth  = off.width
   _rawHeight = off.height
 
-  applyBWProcessing(imageData.data)
+  applyColorAdjustments(imageData.data)
+  if (showBWBackground) applyBWConversion(imageData.data)
   c.putImageData(imageData, 0, 0)
   return off
 }
@@ -252,7 +253,8 @@ function _doRebuildBWCanvas() {
 
   // Work on a copy of raw pixels — no getImageData round-trip
   const data = new Uint8ClampedArray(_rawPixels)
-  applyBWProcessing(data)
+  applyColorAdjustments(data)          // always: Основные sliders
+  if (showBWBackground) applyBWConversion(data)  // only when B&W toggle is ON
 
   const imageData = new ImageData(data, _rawWidth, _rawHeight)
   c.putImageData(imageData, 0, 0)
@@ -272,7 +274,10 @@ function _doRebuildBWCanvas() {
   drawPlan()
 }
 
-function applyBWProcessing(d) {
+// ── Stage 1: colour adjustments (Основные sliders) ────────
+// Applies exposure, contrast, tone ranges, saturation, clarity to colour data.
+// Output stays colour — used for display in colour mode and as input for BW conversion.
+function applyColorAdjustments(d) {
   const expMult = Math.pow(2, basicAdj.exposure * 0.04)
   const contr   = basicAdj.contrast   / 100
   const hi      = basicAdj.highlights / 200
@@ -284,35 +289,9 @@ function applyBWProcessing(d) {
   const clar    = basicAdj.clarity    / 100
   const deh     = basicAdj.dehaze     / 100
 
-  // Pre-compute BW mix stop table once per call
-  const mx = bwMix
-  const stops = [
-    { h:   0, v: mx.red      / 200 },
-    { h:  30, v: mx.orange   / 200 },
-    { h:  60, v: mx.yellow   / 200 },
-    { h: 120, v: mx.green    / 200 },
-    { h: 180, v: mx.aqua     / 200 },
-    { h: 240, v: mx.blue     / 200 },
-    { h: 280, v: mx.lavender / 200 },
-    { h: 320, v: mx.magenta  / 200 },
-    { h: 360, v: mx.red      / 200 },
-  ]
-
-  // Pre-build a 360-entry hue→mixShift LUT
-  const hueLUT = new Float32Array(361)
-  for (let h = 0; h <= 360; h++) {
-    for (let s = 0; s < stops.length - 1; s++) {
-      if (h >= stops[s].h && h <= stops[s+1].h) {
-        const t = (h - stops[s].h) / (stops[s+1].h - stops[s].h)
-        hueLUT[h] = stops[s].v * (1 - t) + stops[s+1].v * t
-        break
-      }
-    }
-  }
-
   const len = d.length
   for (let i = 0; i < len; i += 4) {
-    let r = d[i] * 0.003921569   // / 255
+    let r = d[i]   * 0.003921569
     let g = d[i+1] * 0.003921569
     let b = d[i+2] * 0.003921569
 
@@ -335,7 +314,69 @@ function applyBWProcessing(d) {
       if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0
     }
 
-    // Hue & saturation for BW mix (fast path: skip if unsaturated)
+    // Tone adjustments via luminance (preserves colour)
+    let lum = 0.299*r + 0.587*g + 0.114*b
+    let lumNew = lum
+
+    if (contr !== 0) lumNew += contr * (lumNew - 0.5) * (1 - Math.abs(lumNew - 0.5)) * 2
+    if (hi !== 0 && lumNew > 0.5)  lumNew += hi * (lumNew - 0.5) * 2
+    if (sh !== 0 && lumNew <= 0.5) lumNew += sh * (0.5 - lumNew) * 2
+    if (wh !== 0 && lumNew > 0.85) lumNew += wh * (lumNew - 0.85) / 0.15
+    if (bl !== 0 && lumNew < 0.15) lumNew -= bl * (0.15 - lumNew) / 0.15
+    if (clar !== 0) {
+      const sign = lumNew > 0.5 ? 1 : -1
+      lumNew += clar * sign * Math.pow(Math.abs(lumNew - 0.5), 0.7) * 0.3
+    }
+    if (lumNew < 0) lumNew = 0; else if (lumNew > 1) lumNew = 1
+
+    if (lum > 0.001) {
+      const scale = lumNew / lum
+      r = Math.min(1, r * scale)
+      g = Math.min(1, g * scale)
+      b = Math.min(1, b * scale)
+    } else {
+      r = lumNew; g = lumNew; b = lumNew
+    }
+
+    d[i]   = r * 255 + 0.5 | 0
+    d[i+1] = g * 255 + 0.5 | 0
+    d[i+2] = b * 255 + 0.5 | 0
+  }
+}
+
+// ── Stage 2: BW conversion (Смешение Ч/Б sliders) ─────────
+// Converts colour-adjusted data to grayscale using hue-weighted BW mix.
+// Only called when the B&W toggle is ON.
+function applyBWConversion(d) {
+  const mx = bwMix
+  const stops = [
+    { h:   0, v: mx.red      / 200 },
+    { h:  30, v: mx.orange   / 200 },
+    { h:  60, v: mx.yellow   / 200 },
+    { h: 120, v: mx.green    / 200 },
+    { h: 180, v: mx.aqua     / 200 },
+    { h: 240, v: mx.blue     / 200 },
+    { h: 280, v: mx.lavender / 200 },
+    { h: 320, v: mx.magenta  / 200 },
+    { h: 360, v: mx.red      / 200 },
+  ]
+  const hueLUT = new Float32Array(361)
+  for (let h = 0; h <= 360; h++) {
+    for (let s = 0; s < stops.length - 1; s++) {
+      if (h >= stops[s].h && h <= stops[s+1].h) {
+        const t = (h - stops[s].h) / (stops[s+1].h - stops[s].h)
+        hueLUT[h] = stops[s].v * (1 - t) + stops[s+1].v * t
+        break
+      }
+    }
+  }
+
+  const len = d.length
+  for (let i = 0; i < len; i += 4) {
+    const r = d[i]   * 0.003921569
+    const g = d[i+1] * 0.003921569
+    const b = d[i+2] * 0.003921569
+
     let mixShift = 0
     const cMax = r > g ? (r > b ? r : b) : (g > b ? g : b)
     const cMin = r < g ? (r < b ? r : b) : (g < b ? g : b)
@@ -346,33 +387,20 @@ function applyBWProcessing(d) {
       else if (cMax === g) hue = 60 * ((b - r) / delta + 2)
       else                 hue = 60 * ((r - g) / delta + 4)
       if (hue < 0) hue += 360
-      const satLevel = delta / cMax
-      mixShift = hueLUT[Math.round(hue)] * satLevel
+      mixShift = hueLUT[Math.round(hue)] * (delta / cMax)
     }
 
-    // BW conversion
     let gray = 0.299*r + 0.587*g + 0.114*b + mixShift
-    if (gray < 0) gray = 0; else if (gray > 1) gray = 1
-
-    // Contrast S-curve
-    if (contr !== 0) gray += contr * (gray - 0.5) * (1 - Math.abs(gray - 0.5)) * 2
-
-    // Tone ranges
-    if (hi !== 0 && gray > 0.5)  gray += hi * (gray - 0.5) * 2
-    if (sh !== 0 && gray <= 0.5) gray += sh * (0.5 - gray) * 2
-    if (wh !== 0 && gray > 0.85) gray += wh * (gray - 0.85) / 0.15
-    if (bl !== 0 && gray < 0.15) gray -= bl * (0.15 - gray) / 0.15
-
-    // Clarity
-    if (clar !== 0) {
-      const sign = gray > 0.5 ? 1 : -1
-      gray += clar * sign * Math.pow(Math.abs(gray - 0.5), 0.7) * 0.3
-    }
-
     if (gray < 0) gray = 0; else if (gray > 1) gray = 1
     const v = gray * 255 + 0.5 | 0
     d[i] = d[i+1] = d[i+2] = v
   }
+}
+
+// Full pipeline used by local recognition (always needs grayscale)
+function applyBWProcessing(d) {
+  applyColorAdjustments(d)
+  applyBWConversion(d)
 }
 
 function resizeCanvas(img) {
@@ -416,11 +444,25 @@ function drawPlan() {
   const sx = canvas.width  / currentImageEl.naturalWidth
   const sy = canvas.height / currentImageEl.naturalHeight
 
-  // After analysis: show original colour image as background, BW only if user toggled it
-  const bgImage = (rooms.length && currentImageBW && showBWBackground)
-    ? currentImageBW
-    : currentImageEl
-  ctx.drawImage(bgImage, 0, 0, canvas.width, canvas.height)
+  // Show BW-processed view by default (sliders always active).
+  // Toggle lets user switch to original colour for reference.
+  const showBW = currentImageBW && showBWBackground
+  ctx.drawImage(showBW ? currentImageBW : currentImageEl, 0, 0, canvas.width, canvas.height)
+
+  // When showing original colour: overlay eraser strokes as white so they stay visible
+  if (!showBW && eraserStrokes.length) {
+    ctx.save()
+    ctx.fillStyle = '#ffffff'
+    for (const stroke of eraserStrokes) {
+      for (const pt of stroke) {
+        ctx.beginPath()
+        ctx.arc(pt.x * sx, pt.y * sy, pt.r * sx, 0, Math.PI * 2)
+        ctx.fill()
+      }
+    }
+    ctx.restore()
+  }
+
   if (!rooms.length) return
 
   rooms.forEach(room => {
@@ -795,6 +837,29 @@ async function analyseLocal() {
   // Убеждаемся, что BW-канвас актуален (может быть отложен через rAF)
   if (_rebuildRaf) { cancelAnimationFrame(_rebuildRaf); _rebuildRaf = null; _doRebuildBWCanvas() }
 
+  // Local CV always needs a grayscale canvas — build one with full BW pipeline
+  // regardless of the display toggle (user may be in colour mode)
+  let recognitionCanvas = currentImageBW
+  if (!showBWBackground && _rawPixels) {
+    const data = new Uint8ClampedArray(_rawPixels)
+    applyBWProcessing(data)
+    if (eraserStrokes.length) {
+      const tmp = document.createElement('canvas')
+      tmp.width = _rawWidth; tmp.height = _rawHeight
+      const tc = tmp.getContext('2d')
+      tc.putImageData(new ImageData(data, _rawWidth, _rawHeight), 0, 0)
+      tc.fillStyle = '#ffffff'
+      for (const stroke of eraserStrokes)
+        for (const pt of stroke) { tc.beginPath(); tc.arc(pt.x, pt.y, pt.r, 0, Math.PI*2); tc.fill() }
+      recognitionCanvas = tmp
+    } else {
+      const tmp = document.createElement('canvas')
+      tmp.width = _rawWidth; tmp.height = _rawHeight
+      tmp.getContext('2d').putImageData(new ImageData(data, _rawWidth, _rawHeight), 0, 0)
+      recognitionCanvas = tmp
+    }
+  }
+
   const currentHash = imageHash()   // передаём в learning-функции для взвешивания
   setProgressStep('Подготовка изображения')
   await tick()
@@ -807,7 +872,7 @@ async function analyseLocal() {
   setProgressStep('Поиск стен и помещений…')
   await tick()
 
-  rooms = await detectRoomsLocal(currentImageBW || currentImageEl, {
+  rooms = await detectRoomsLocal(recognitionCanvas || currentImageEl, {
     threshold: tManual || null,
     dilateK,
     minAreaFrac: minPct,
@@ -1001,10 +1066,8 @@ function togglePolygons() {
 function toggleBWBackground() {
   showBWBackground = !showBWBackground
   const btn = document.getElementById('toggleBWBtn')
-  if (btn) {
-    btn.textContent = showBWBackground ? '🎨 Цветной фон' : '⬛ Ч/Б фон'
-  }
-  drawPlan()
+  if (btn) btn.textContent = showBWBackground ? '🎨 Цветной' : '⬛ Ч/Б'
+  rebuildBWCanvas()   // rebuild with or without BW conversion stage
 }
 function undo() {
   const entry = undoStack.pop()
@@ -1116,9 +1179,6 @@ canvas.addEventListener('mousedown', e => {
     const [ix, iy] = canvasToImage(cx, cy)
     const r = eraserSize * currentImageEl.naturalWidth / canvas.width
     eraserCurrentStroke.push({ x: ix, y: iy, r })
-    const bwCtx = currentImageBW.getContext('2d')
-    bwCtx.fillStyle = '#ffffff'
-    bwCtx.beginPath(); bwCtx.arc(ix, iy, r, 0, Math.PI * 2); bwCtx.fill()
     drawPlan()
     e.preventDefault()
     return
@@ -1198,9 +1258,6 @@ canvas.addEventListener('mousemove', e => {
       const [ix, iy] = canvasToImage(cx, cy)
       const r = eraserSize * currentImageEl.naturalWidth / canvas.width
       eraserCurrentStroke.push({ x: ix, y: iy, r })
-      const bwCtx = currentImageBW.getContext('2d')
-      bwCtx.fillStyle = '#ffffff'
-      bwCtx.beginPath(); bwCtx.arc(ix, iy, r, 0, Math.PI * 2); bwCtx.fill()
       drawPlan()
     }
     // Draw eraser cursor ring
