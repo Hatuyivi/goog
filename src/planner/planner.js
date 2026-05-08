@@ -254,7 +254,6 @@ function _doRebuildBWCanvas() {
   // Work on a copy of raw pixels — no getImageData round-trip
   const data = new Uint8ClampedArray(_rawPixels)
   applyColorAdjustments(data)          // always: Основные sliders
-  if (showBWBackground) applyBWConversion(data)  // only when B&W toggle is ON
 
   const imageData = new ImageData(data, _rawWidth, _rawHeight)
   c.putImageData(imageData, 0, 0)
@@ -444,10 +443,10 @@ function drawPlan() {
   const sx = canvas.width  / currentImageEl.naturalWidth
   const sy = canvas.height / currentImageEl.naturalHeight
 
-  // Draw image with optional grayscale filter
+  // Draw colour-adjusted image; optionally apply B&W filter on top
   ctx.save()
   if (showBWBackground) ctx.filter = 'grayscale(1)'
-  ctx.drawImage(currentImageEl, 0, 0, canvas.width, canvas.height)
+  ctx.drawImage(currentImageBW || currentImageEl, 0, 0, canvas.width, canvas.height)
   ctx.filter = 'none'
 
   // Overlay eraser strokes as white
@@ -2176,11 +2175,23 @@ async function saveAll() {
 
 // Export canvas helpers — no labels drawn on export images
 
+// Apply grayscale to offscreen canvas pixels (for export when B&W toggle is on)
+function applyGrayscaleToCanvas(c, w, h) {
+  const id = c.getImageData(0, 0, w, h)
+  const d = id.data
+  for (let i = 0; i < d.length; i += 4) {
+    const g = Math.round(d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114)
+    d[i] = d[i+1] = d[i+2] = g
+  }
+  c.putImageData(id, 0, 0)
+}
+
 function makeRoomCanvas(room) {
   const w = currentImageEl.naturalWidth, h = currentImageEl.naturalHeight
   const off = document.createElement('canvas'); off.width = w; off.height = h
   const c = off.getContext('2d')
   c.drawImage(currentImageBW || currentImageEl, 0, 0)
+  if (showBWBackground) applyGrayscaleToCanvas(c, w, h)
   if (room.polygon?.length >= 3) {
     c.beginPath()
     c.moveTo(room.polygon[0][0], room.polygon[0][1])
@@ -2200,6 +2211,7 @@ function makeMultiRoomCanvas(roomList) {
   const off = document.createElement('canvas'); off.width = w; off.height = h
   const c = off.getContext('2d')
   c.drawImage(currentImageBW || currentImageEl, 0, 0)
+  if (showBWBackground) applyGrayscaleToCanvas(c, w, h)
   c.strokeStyle = 'transparent'; c.lineWidth = 0
   roomList.forEach(room => {
     if (!room.polygon?.length) return
@@ -2218,6 +2230,7 @@ function makeCombinedCanvas() {
   const off = document.createElement('canvas'); off.width = w; off.height = h
   const c = off.getContext('2d')
   c.drawImage(currentImageBW || currentImageEl, 0, 0)
+  if (showBWBackground) applyGrayscaleToCanvas(c, w, h)
   c.strokeStyle = 'transparent'; c.lineWidth = 0
   rooms.forEach(room => {
     if (!room.polygon?.length) return
