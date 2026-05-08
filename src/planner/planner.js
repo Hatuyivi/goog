@@ -792,6 +792,9 @@ async function analyseLocal() {
   // ── Стандартная детекция ───────────────────────────────
   // Правки пользователя — сигнал для обучения (фильтры площади и формы),
   // а не кэш результата. Детекция запускается всегда заново.
+  // Убеждаемся, что BW-канвас актуален (может быть отложен через rAF)
+  if (_rebuildRaf) { cancelAnimationFrame(_rebuildRaf); _rebuildRaf = null; _doRebuildBWCanvas() }
+
   const currentHash = imageHash()   // передаём в learning-функции для взвешивания
   setProgressStep('Подготовка изображения')
   await tick()
@@ -804,7 +807,7 @@ async function analyseLocal() {
   setProgressStep('Поиск стен и помещений…')
   await tick()
 
-  rooms = await detectRoomsLocal(currentImageEl, {
+  rooms = await detectRoomsLocal(currentImageBW || currentImageEl, {
     threshold: tManual || null,
     dilateK,
     minAreaFrac: minPct,
@@ -1396,7 +1399,9 @@ function tick() { return new Promise(r => setTimeout(r, 0)) }
 
 // ── Local CV pipeline ──────────────────────────────────────
 async function detectRoomsLocal(imageEl, opts) {
-  const W0 = imageEl.naturalWidth, H0 = imageEl.naturalHeight
+  // Поддерживаем как HTMLImageElement (naturalWidth), так и HTMLCanvasElement (width)
+  const W0 = imageEl.naturalWidth ?? imageEl.width
+  const H0 = imageEl.naturalHeight ?? imageEl.height
 
   const MAX_DIM = 2000
   const scale = Math.min(1, MAX_DIM / Math.max(W0, H0))
@@ -1514,26 +1519,54 @@ async function detectRoomsLocal(imageEl, opts) {
   }
 
   // Размер окна Саувола ≈ толщина стены × 3.
-  // Толщина стены эвристически: ~1% меньшей стороны, но не меньше 2px и не больше 40px.
-  // Окно = wallEst × 3, но не меньше 7 (иначе локальная статистика нестабильна).
   const wallEst = Math.max(2, Math.min(40, Math.round(Math.min(W, H) * 0.01)))
   const windowR = Math.max(7, wallEst * 3)
-  // k=-0.2: отрицательный → порог смещается вниз в однородных областях,
-  // что хорошо для белых комнат внутри тёмных стен
   const K_SAUVOLA = -0.2
 
+  // ── Определяем тип источника: фото или скан ──────────────────────────────
+  // Фото с телефона: неравномерный фон (тени, перспектива) — высокая локальная
+  // неоднородность яркости в фоновых зонах (пикселях светлее среднего).
+  // Скан/PDF: фон почти однородный — низкая локальная неоднородность.
+  // Метрика: среднее σ по блокам 32×32 среди светлых пикселей (фон без стен).
+  let isPhoto = false
+  if (opts.threshold == null) {
+    const BLOCK = 32
+    let blockVarSum = 0, blockCount = 0
+    for (let by = 0; by + BLOCK <= H; by += BLOCK) {
+      for (let bx = 0; bx + BLOCK <= W; bx += BLOCK) {
+        let bSum = 0, bSum2 = 0, bN = 0
+        for (let y = by; y < by + BLOCK; y++) {
+          for (let x = bx; x < bx + BLOCK; x++) {
+            const v = gray[y * W + x]
+            if (v > mean) { bSum += v; bSum2 += v * v; bN++ }
+          }
+        }
+        if (bN > 4) {
+          const bMean = bSum / bN
+          blockVarSum += Math.sqrt(Math.max(0, bSum2 / bN - bMean * bMean))
+          blockCount++
+        }
+      }
+    }
+    // Среднее σ фоновых блоков > 12 → неравномерный фон → фото
+    isPhoto = blockCount > 0 && (blockVarSum / blockCount) > 12
+  }
+
   let bin1, bin2
-  if (opts.threshold != null) {
-    // Ручной режим: глобальный порог (как раньше)
-    const T = opts.threshold
+  if (opts.threshold == null && isPhoto) {
+    // Фото: Саувола — адаптивно справляется с тенями и неравномерным освещением
+    bin1 = sauvolaThreshold(gray, W, H, windowR,     K_SAUVOLA)
+    bin2 = sauvolaThreshold(gray, W, H, windowR + 8, K_SAUVOLA - 0.05)
+  } else {
+    // Скан/PDF или ручной режим: Otsu — стабилен на чистых равномерных планах
+    const T = opts.threshold != null ? opts.threshold : otsu(gray)
+    const T_loose = Math.max(T - 30, 80)
     bin1 = new Uint8Array(W * H)
     bin2 = new Uint8Array(W * H)
-    const T_loose = Math.max(T - 30, 80)
-    for (let i = 0; i < gray.length; i++) { bin1[i] = gray[i] > T ? 1 : 0; bin2[i] = gray[i] > T_loose ? 1 : 0 }
-  } else {
-    // Автоматический режим: Саувола — один алгоритм для всех типов планов
-    bin1 = sauvolaThreshold(gray, W, H, windowR,      K_SAUVOLA)
-    bin2 = sauvolaThreshold(gray, W, H, windowR + 8,  K_SAUVOLA - 0.05) // чуть свободнее — ловит тонкие стены
+    for (let i = 0; i < gray.length; i++) {
+      bin1[i] = gray[i] > T       ? 1 : 0
+      bin2[i] = gray[i] > T_loose ? 1 : 0
+    }
   }
 
   // ── Эрозия (утолщение стен) ────────────────────────────────────────────────
