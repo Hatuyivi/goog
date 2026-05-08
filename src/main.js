@@ -256,8 +256,22 @@ function checkKillSwitch(callback) {
 // ── Main window (planner) ──────────────────────────────────
 let mainWindow = null, tray = null, history = []
 
+function showMainWindow() {
+  if (!mainWindow) return
+  // Если свёрнуто — восстанавливаем
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  // Если скрыто (например dock.hide) — показываем
+  if (!mainWindow.isVisible()) mainWindow.show()
+  // Поднимаем на передний план и передаём фокус
+  mainWindow.setAlwaysOnTop(true)
+  mainWindow.focus()
+  mainWindow.setAlwaysOnTop(false)
+  // На macOS дополнительно активируем само приложение
+  app.focus({ steal: true })
+}
+
 function createMainWindow() {
-  if (mainWindow) { mainWindow.focus(); return }
+  if (mainWindow) { showMainWindow(); return }
   mainWindow = new BrowserWindow({
     width:1020, height:680, minWidth:780, minHeight:520,
     titleBarStyle:'hiddenInset', backgroundColor:'#f5f5f7', show:false,
@@ -465,6 +479,8 @@ function parseRooms(text) {
 // ── App init ───────────────────────────────────────────────
 app.dock?.hide()
 
+const { globalShortcut } = require('electron')
+
 app.whenReady().then(() => {
   const cfg = loadConfig()
   for (const module of ['sum', 'planner']) {
@@ -472,6 +488,9 @@ app.whenReady().then(() => {
     if (p && PROVIDERS[p]) { mod[module].selectedProvider = p; mod[module].activeProvider = p }
     if (m) { mod[module].selectedModelId = m; mod[module].activeModelId = m }
   }
+
+  // Глобальная горячая клавиша для вызова планировщика из любого приложения
+  globalShortcut.register('CommandOrControl+Shift+P', () => createMainWindow())
 
   checkKillSwitch((blocked) => {
     if (blocked) {
@@ -504,6 +523,7 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {})
 app.on('before-quit', async () => {
+  globalShortcut.unregisterAll()
   if (_ocrWorker) { try { await _ocrWorker.terminate() } catch {}; _ocrWorker = null }
 })
 
@@ -560,9 +580,11 @@ function buildMenu() {
     return model ? `${PROVIDERS[s.activeProvider]?.label} · ${model.label}${fallback?' [fallback]':''}` : 'нет модели'
   }
 
+  tray.on('double-click', () => createMainWindow())  // двойной клик открывает/поднимает планировщик
+
   tray.setContextMenu(Menu.buildFromTemplate([
     { label:'Выделить область', click:capture },
-    { label:'⌂ Планировщик…',  click:createMainWindow },
+    { label:'⌂ Планировщик…',  accelerator:'CommandOrControl+Shift+P', click:createMainWindow },
     { type:'separator' },
     { label: history.length ? `История (${history.length})` : 'История', click:showHistory },
     { type:'separator' },
