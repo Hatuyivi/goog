@@ -1891,28 +1891,29 @@ async function detectRoomsLocal(imageEl, opts) {
     const out = bin.slice()
     const maxDoor = Math.max(6, Math.round(Math.min(W, H) * 0.025))  // ~2.5% of short side
 
-    // Horizontal scan: for each row, find gaps in wall=0 regions flanked by wall
+    // Horizontal scan: find FREE pixel runs (=1) flanked by walls (=0) on both sides
+    // These are doorway openings — short gaps where the wall is missing.
     for (let y = 1; y < H - 1; y++) {
       let x = 1
       while (x < W - 1) {
-        if (out[y*W+x] === 1) { x++; continue }  // free pixel, skip
-        // Find end of wall-free run
+        if (out[y*W+x] === 0) { x++; continue }  // wall pixel, skip
+        // Found a free pixel — scan the full free run
         let gapStart = x
-        while (x < W && out[y*W+x] === 0) x++
+        while (x < W && out[y*W+x] === 1) x++
         const gapEnd = x - 1
         const gapLen = gapEnd - gapStart + 1
         if (gapLen > maxDoor) continue
-        // Check both sides have a wall pixel in nearby rows
+        // Check both sides are wall pixels (=0)
         const hasWallLeft  = gapStart > 0 && out[y*W+(gapStart-1)] === 0
         const hasWallRight = gapEnd < W-1  && out[y*W+(gapEnd+1)]  === 0
-        // Close if the gap is narrow AND walls exist above/below (confirming wall direction)
+        // Close if the gap is narrow AND wall pixels exist above/below (confirms direction)
         if (hasWallLeft && hasWallRight) {
           let wallAbove = 0, wallBelow = 0
           for (let gx = gapStart; gx <= gapEnd; gx++) {
             if (y > 0   && out[(y-1)*W+gx] === 0) wallAbove++
             if (y < H-1 && out[(y+1)*W+gx] === 0) wallBelow++
           }
-          // If walls are present above/below this gap — it's a doorway, fill it
+          // If walls are present above/below this gap — it's a doorway, fill it with wall
           if (wallAbove > gapLen * 0.4 || wallBelow > gapLen * 0.4) {
             for (let gx = gapStart; gx <= gapEnd; gx++) out[y*W+gx] = 0
           }
@@ -1920,13 +1921,13 @@ async function detectRoomsLocal(imageEl, opts) {
       }
     }
 
-    // Vertical scan: same logic for columns
+    // Vertical scan: find FREE pixel runs (=1) flanked by walls (=0) on both sides
     for (let x = 1; x < W - 1; x++) {
       let y = 1
       while (y < H - 1) {
-        if (out[y*W+x] === 1) { y++; continue }
+        if (out[y*W+x] === 0) { y++; continue }  // wall pixel, skip
         let gapStart = y
-        while (y < H && out[y*W+x] === 0) y++
+        while (y < H && out[y*W+x] === 1) y++
         const gapEnd = y - 1
         const gapLen = gapEnd - gapStart + 1
         if (gapLen > maxDoor) continue
@@ -2003,7 +2004,7 @@ async function detectRoomsLocal(imageEl, opts) {
     ? Math.pow(wallInfo.wallMin * 4, 2) / total
     : 0.003
   const minArea = total * autoMinAreaFrac
-  const maxArea = total * 0.70
+  const maxArea = total * 0.85  // raised from 0.70 — large rooms can span most of image
 
   // touchesBorder — умная проверка: отбрасываем регион только если он касается
   // самого края растра (вероятно, фоновая область за пределами здания).
@@ -2104,64 +2105,102 @@ async function detectRoomsLocal(imageEl, opts) {
     }
   }
 
-  // ── PATH B: Flood-fill + contour tracing (photo mode or Hough fallback) ────
-  // Used when: (a) isPhoto mode, (b) manual threshold, or
-  // (c) Hough found < 2 rooms — complex/non-orthogonal floor plans.
-  const houghCoveredWell = rooms.length >= 2
+  // ── PATH B: Flood-fill + contour tracing ────────────────────────────────────
+  // Runs in two modes:
+  //   FULL       — Hough found < 6 rooms: flood-fill handles everything.
+  //   SUPPLEMENT — Hough found >= 6 rooms: flood-fill adds only large rooms
+  //                that Hough missed (large open spaces, lobbies, wings).
+  const houghCoveredWell = rooms.length >= 6
+
+  // Shared helper: build a room record from a flood-fill candidate region
+  function floodRoomFromRegion(r, roomIdx) {
+    const isFromLoose = !cand1.includes(r)
+    const labelsMap   = isFromLoose ? labels2 : labels1
+    const poly = traceContour(labelsMap, r.label, W, H, r)
+    if (poly.length < 4) return null
+    const dynEps = opts.epsilon > 0
+      ? opts.epsilon
+      : Math.max(2, Math.round(Math.min(W, H) * 0.005))
+    const simp0 = rdp(poly, dynEps)
+    if (simp0.length < 3) return null
+    let simp
+    if (_cannyEdges && _houghLines) {
+      const snapDist = Math.max(4, Math.round(Math.min(W, H) * 0.008))
+      const aligned  = axisAlignEdges(simp0, _houghLines.hLines, _houghLines.vLines, snapDist)
+      const snapped  = snapToRightAngles(aligned)
+      simp = cleanJaggedEdges(snapped)
+    } else {
+      simp = cleanJaggedEdges(snapToRightAngles(simp0))
+    }
+    if (simp.length < 3) return null
+    let perim = 0
+    for (let k = 0; k < simp.length; k++) {
+      const [x1,y1] = simp[k], [x2,y2] = simp[(k+1)%simp.length]
+      perim += Math.hypot(x2-x1, y2-y1)
+    }
+    const compactness = perim > 0 ? (4 * Math.PI * r.area) / (perim * perim) : 1
+    const bboxW2 = r.maxX - r.minX + 1, bboxH2 = r.maxY - r.minY + 1
+    const aspect = Math.max(bboxW2, bboxH2) / Math.max(1, Math.min(bboxW2, bboxH2))
+    return {
+      id:          `r${roomIdx}`,
+      label:       `Помещение ${roomIdx}`,
+      areaPx:      Math.round(r.area * inv * inv),
+      compactness: Math.round(compactness * 100) / 100,
+      aspect,
+      polygon:     simp.map(([x,y]) => [Math.round(x*inv), Math.round(y*inv)]),
+      _source:     'flood',
+    }
+  }
+
   if (!houghCoveredWell) {
-    // Clear any partial Hough results before adding flood-fill rooms
+    // ── FULL mode ──────────────────────────────────────────────────────────────
     rooms.length = 0
+    for (let i = 0; i < merged.length; i++) {
+      const room = floodRoomFromRegion(merged[i], i + 1)
+      if (room) rooms.push(room)
+    }
+  } else {
+    // ── SUPPLEMENT mode: add large rooms Hough missed ─────────────────────────
+    // Hough builds rooms only from adjacent H×V wall-line intersections, so it
+    // consistently misses large open spaces (entire wings, lobbies, open floors)
+    // whose boundary walls don't form clean grid pairs in the line clustering.
+    // Threshold: supplement only regions > 1.5% of image area.
+    const largeAreaThresh = total * 0.015
+
+    // Bboxes of existing Hough rooms in work-canvas coords for IoU check
+    const coveredBboxes = rooms.map(r => {
+      let x1=Infinity,y1=Infinity,x2=-Infinity,y2=-Infinity
+      for (const [px,py] of r.polygon) {
+        const wx=px*scale, wy=py*scale
+        if (wx<x1)x1=wx; if (wx>x2)x2=wx
+        if (wy<y1)y1=wy; if (wy>y2)y2=wy
+      }
+      return {x1,y1,x2,y2}
+    })
+
+    function bboxIoU(ax1,ay1,ax2,ay2, bx1,by1,bx2,by2) {
+      const ix1=Math.max(ax1,bx1), iy1=Math.max(ay1,by1)
+      const ix2=Math.min(ax2,bx2), iy2=Math.min(ay2,by2)
+      if (ix2<=ix1||iy2<=iy1) return 0
+      const inter=(ix2-ix1)*(iy2-iy1)
+      const ua=(ax2-ax1)*(ay2-ay1), ub=(bx2-bx1)*(by2-by1)
+      return inter/(ua+ub-inter)
+    }
 
     for (let i = 0; i < merged.length; i++) {
       const r = merged[i]
-      const isFromLoose = !cand1.includes(r)
-      const labelsMap   = isFromLoose ? labels2 : labels1
+      if (r.area < largeAreaThresh) continue  // small rooms already handled by Hough
 
-      const poly = traceContour(labelsMap, r.label, W, H, r)
-      if (poly.length < 4) continue
-      // ---- Dynamic epsilon: adapts to image scale ----------------------------
-      // opts.epsilon=0 -> auto: 0.5% of the shorter image dimension.
-      // Removes pixel-level staircase artefacts without blurring real corners.
-      const dynEps = opts.epsilon > 0
-        ? opts.epsilon
-        : Math.max(2, Math.round(Math.min(W, H) * 0.005))
-      const simp0 = rdp(poly, dynEps)
-      if (simp0.length < 3) continue
-      // ---- Hough snap or classic 90-degree correction -----------------------
-      // For scans: align edges to detected Hough wall lines (removes staircase),
-      // then snap residual angles to 90 and clean jagged intermediate points.
-      // For photos / manual mode: unchanged classic pipeline.
-      let simp
-      if (_cannyEdges && _houghLines) {
-        const snapDist = Math.max(4, Math.round(Math.min(W, H) * 0.008))
-        const aligned  = axisAlignEdges(simp0, _houghLines.hLines, _houghLines.vLines, snapDist)
-        const snapped  = snapToRightAngles(aligned)
-        simp = cleanJaggedEdges(snapped)
-      } else {
-        const simp1 = snapToRightAngles(simp0)
-        simp = cleanJaggedEdges(simp1)
+      const overlapHough = coveredBboxes.some(cb =>
+        bboxIoU(r.minX,r.minY,r.maxX,r.maxY, cb.x1,cb.y1,cb.x2,cb.y2) > 0.35
+      )
+      if (overlapHough) continue  // already well-covered
+
+      const room = floodRoomFromRegion(r, rooms.length + 1)
+      if (room) {
+        rooms.push(room)
+        coveredBboxes.push({x1:r.minX,y1:r.minY,x2:r.maxX,y2:r.maxY})
       }
-      if (simp.length < 3) continue
-
-      // Compactness = 4π·Area / Perimeter² (1 = круг, → 0 = очень вытянутый)
-      let perim = 0
-      for (let k = 0; k < simp.length; k++) {
-        const [x1,y1] = simp[k], [x2,y2] = simp[(k+1)%simp.length]
-        perim += Math.hypot(x2-x1, y2-y1)
-      }
-      const compactness = perim > 0 ? (4 * Math.PI * r.area) / (perim * perim) : 1
-      const bboxW = r.maxX - r.minX + 1, bboxH = r.maxY - r.minY + 1
-      const aspect = Math.max(bboxW, bboxH) / Math.max(1, Math.min(bboxW, bboxH))
-
-      rooms.push({
-        id:          `r${i+1}`,
-        label:       `Помещение ${i+1}`,
-        areaPx:      Math.round(r.area * inv * inv),
-        compactness: Math.round(compactness * 100) / 100,
-        aspect,
-        polygon:     simp.map(([x,y]) => [Math.round(x*inv), Math.round(y*inv)]),
-        _source:     'flood',
-      })
     }
   }
 
