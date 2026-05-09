@@ -100,8 +100,8 @@ const paramMinArea   = document.getElementById('paramMinArea')
 const vThr = document.getElementById('vThr')
 const vEps = document.getElementById('vEps')
 
-paramThreshold.oninput = () => vThr.textContent = paramThreshold.value === '0' ? 'авто' : paramThreshold.value
-paramEpsilon  .oninput = () => vEps.textContent = `${paramEpsilon.value} px`
+if (paramThreshold) paramThreshold.oninput = () => { if (vThr) vThr.textContent = paramThreshold.value === '0' ? 'авто' : paramThreshold.value }
+if (paramEpsilon)   paramEpsilon.oninput   = () => { if (vEps) vEps.textContent = `${paramEpsilon.value} px` }
 
 // ── Init ───────────────────────────────────────────────────
 async function init() {
@@ -826,10 +826,10 @@ async function analyseLocal() {
   setProgressStep('Подготовка изображения')
   await tick()
 
-  const tManual = Number(paramThreshold.value)         // 0 = auto (Otsu)
-  const dilateK = Number(paramDilate.value)            // 0..5
-  const minPct  = Number(paramMinArea.value) / 1000    // /10 -> percent then /100 -> fraction
-  const epsilon = Number(paramEpsilon.value)           // px in display scale
+  const tManual = paramThreshold ? Number(paramThreshold.value) : 0
+  const dilateK = paramDilate    ? Number(paramDilate.value)    : 2
+  const minPct  = paramMinArea   ? Number(paramMinArea.value) / 1000 : 0.005
+  const epsilon = paramEpsilon   ? Number(paramEpsilon.value)   : 2
 
   setProgressStep('Поиск стен и помещений…')
   await tick()
@@ -1271,6 +1271,8 @@ function writeCanvas(off, filePath) {
 function sanitizeFilename(name) {
   return name.replace(/[\/\\:*?"<>|]/g, '_').slice(0, 60)
 }
+
+function tick() { return new Promise(r => setTimeout(r, 0)) }
 
 // ── Progress ───────────────────────────────────────────────
 function showProgress(text, step) {
