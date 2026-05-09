@@ -905,25 +905,29 @@ function _wrapPxToImagePx(wx, wy) {
   if (!currentImageEl) return [0, 0]
   const wrap = document.querySelector('.canvas-wrap')
   const wRect = wrap.getBoundingClientRect()
-  // centre of canvas-wrap in wrap coords
   const cxW = wRect.width  / 2 + panX
   const cyW = wRect.height / 2 + panY
-  // canvas CSS size (before zoom scale)
-  const cvsCssW = canvas.width   // canvas physical px (== CSS px because no CSS size override)
-  const cvsCssH = canvas.height
-  // top-left of canvas in wrap coords
+  // Use offsetWidth/Height — actual CSS rendered size, may differ from canvas.width if max-width kicks in
+  const cvsCssW = canvas.offsetWidth
+  const cvsCssH = canvas.offsetHeight
   const canvasLeft = cxW - cvsCssW / 2 * zoomLevel
   const canvasTop  = cyW - cvsCssH / 2 * zoomLevel
-  // position within canvas in CSS px (accounting for zoom)
   const relX = (wx - canvasLeft) / zoomLevel
   const relY = (wy - canvasTop)  / zoomLevel
-  // canvas CSS px → image px
   const imgX = relX * currentImageEl.naturalWidth  / cvsCssW
   const imgY = relY * currentImageEl.naturalHeight / cvsCssH
   return [imgX, imgY]
 }
 
-// Clamp crop box to canvas-wrap bounds
+// Returns canvas bounds in canvas-wrap-relative CSS px (respects zoom/pan)
+function _canvasBoundsInWrap() {
+  const wrap  = document.querySelector('.canvas-wrap')
+  const wRect = wrap.getBoundingClientRect()
+  const cRect = canvas.getBoundingClientRect()
+  return { x: cRect.left - wRect.left, y: cRect.top - wRect.top, w: cRect.width, h: cRect.height }
+}
+
+// Clamp crop box to canvas-wrap bounds — user can extend frame beyond image (white fill handles it)
 function _clampCrop(x, y, w, h) {
   const wrap = document.querySelector('.canvas-wrap')
   const maxW = wrap.clientWidth, maxH = wrap.clientHeight
@@ -945,12 +949,13 @@ function _applyRatio(w, h) {
 function initCropBox() {
   const wrap = document.querySelector('.canvas-wrap')
   if (!wrap) return
-  // Default: 80% of canvas area centred in wrap
-  const W = wrap.clientWidth, H = wrap.clientHeight
-  let w = Math.round(W * 0.8), h = Math.round(H * 0.8)
+  // Default: 80% of canvas area, centred on canvas (not on wrap)
+  const cb = _canvasBoundsInWrap()
+  let w = Math.round(cb.w * 0.8), h = Math.round(cb.h * 0.8)
   const applied = _applyRatio(w, h)
   w = applied.w; h = applied.h
-  const x = Math.round((W - w) / 2), y = Math.round((H - h) / 2)
+  const x = Math.round(cb.x + (cb.w - w) / 2)
+  const y = Math.round(cb.y + (cb.h - h) / 2)
   _setCropBox(x, y, w, h)
 
   // Wire ratio buttons
