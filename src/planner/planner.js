@@ -1755,277 +1755,38 @@ async function detectRoomsLocal(imageEl, opts) {
     })
   }
 
-  // ── Shape fitting ───────────────────────────────────────
-  // For each room polygon try to fit simple shapes (square, rect, circle,
-  // L/T/U) and replace the polygon if the fit is good enough (IoU ≥ 0.85).
-  // Curved walls are respected: if no simple shape fits well we keep the
-  // original traced polygon.
+  return postProcessRooms(rooms)
+}
 
-  ;(function fitShapes() {
+// ── postProcessRooms ────────────────────────────────────────
+// NEW_BLOCK_START — replaced by postProcessRooms
+function postProcessRooms(rooms) {
 
-    // ── Helpers ─────────────────────────────────────────
-    function sfBbox(poly) {
-      let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity
-      for (const [x, y] of poly) {
-        if (x < x1) x1 = x; if (x > x2) x2 = x
-        if (y < y1) y1 = y; if (y > y2) y2 = y
-      }
-      return { x1, y1, x2, y2, w: x2 - x1, h: y2 - y1 }
-    }
-
-    function sfArea(poly) {
-      let a = 0
-      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-        a += (poly[j][0] + poly[i][0]) * (poly[j][1] - poly[i][1])
-      }
-      return Math.abs(a) / 2
-    }
-
-    function sfCentroid(poly) {
-      let cx = 0, cy = 0
-      for (const [x, y] of poly) { cx += x; cy += y }
-      return [cx / poly.length, cy / poly.length]
-    }
-
-    function sfPtInPoly(px, py, poly) {
-      let inside = false
-      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-        const [xi, yi] = poly[i], [xj, yj] = poly[j]
-        if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi)
-          inside = !inside
-      }
-      return inside
-    }
-
-    // Rasterised IoU between a polygon and a candidate shape.
-    // `inShape(x, y)` — function returning true if point is inside candidate.
-    function rasterIoU(poly, inShape) {
-      const b = sfBbox(poly)
-      const step = Math.max(1, Math.round(Math.sqrt(b.w * b.h) / 12))
-      let inter = 0, union = 0
-      for (let y = b.y1; y <= b.y2; y += step) {
-        for (let x = b.x1; x <= b.x2; x += step) {
-          const inP = sfPtInPoly(x, y, poly)
-          const inS = inShape(x, y)
-          if (inP && inS) inter++
-          if (inP || inS) union++
-        }
-      }
-      return union === 0 ? 0 : inter / union
-    }
-
-    // Rect polygon from axis-aligned box
-    function rectPoly(x1, y1, x2, y2) {
-      return [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
-    }
-
-    // L/T/U shape: union of two axis-aligned rects.
-    // Returns a polygon (up to 8 vertices) or null if degenerate.
-    function lShapePoly(r1, r2) {
-      // Build the outline of the union of two non-overlapping (or touching) rects.
-      // We use a simple scanline approach: collect all unique X and Y coords,
-      // then trace the outer boundary.
-      const xs = [...new Set([r1.x1, r1.x2, r2.x1, r2.x2])].sort((a,b)=>a-b)
-      const ys = [...new Set([r1.y1, r1.y2, r2.y1, r2.y2])].sort((a,b)=>a-b)
-      // Collect filled cells
-      const filled = []
-      for (let yi = 0; yi < ys.length - 1; yi++) {
-        for (let xi = 0; xi < xs.length - 1; xi++) {
-          const cx = (xs[xi] + xs[xi+1]) / 2
-          const cy = (ys[yi] + ys[yi+1]) / 2
-          const inR1 = cx >= r1.x1 && cx <= r1.x2 && cy >= r1.y1 && cy <= r1.y2
-          const inR2 = cx >= r2.x1 && cx <= r2.x2 && cy >= r2.y1 && cy <= r2.y2
-          if (inR1 || inR2) filled.push([xi, yi])
-        }
-      }
-      if (filled.length === 0) return null
-      // Build inShape function for the union
-      const inUnion = (x, y) =>
-        (x >= r1.x1 && x <= r1.x2 && y >= r1.y1 && y <= r1.y2) ||
-        (x >= r2.x1 && x <= r2.x2 && y >= r2.y1 && y <= r2.y2)
-      // Trace outer polygon: walk grid boundary
-      // For simplicity return the convex-hull-like outline via corner enumeration.
-      // We enumerate all 4-connected boundary corners of the union grid.
-      const pts = []
-      // Top edge left-to-right
-      for (let xi = 0; xi < xs.length - 1; xi++) {
-        for (let yi = 0; yi < ys.length - 1; yi++) {
-          const cx = (xs[xi]+xs[xi+1])/2, cy = (ys[yi]+ys[yi+1])/2
-          if (!inUnion(cx, cy)) continue
-          // Check if top neighbour is outside
-          const topOut = yi === 0 || !inUnion(cx, (ys[yi-1]+ys[yi])/2)
-          if (topOut) { pts.push([xs[xi], ys[yi]]); pts.push([xs[xi+1], ys[yi]]) }
-        }
-      }
-      // Right edge top-to-bottom
-      for (let yi = 0; yi < ys.length - 1; yi++) {
-        for (let xi = xs.length - 2; xi >= 0; xi--) {
-          const cx = (xs[xi]+xs[xi+1])/2, cy = (ys[yi]+ys[yi+1])/2
-          if (!inUnion(cx, cy)) continue
-          const rightOut = xi === xs.length - 2 || !inUnion((xs[xi+1]+xs[xi+2])/2, cy)
-          if (rightOut) { pts.push([xs[xi+1], ys[yi]]); pts.push([xs[xi+1], ys[yi+1]]) }
-        }
-      }
-      // Bottom edge right-to-left
-      for (let xi = xs.length - 2; xi >= 0; xi--) {
-        for (let yi = ys.length - 2; yi >= 0; yi--) {
-          const cx = (xs[xi]+xs[xi+1])/2, cy = (ys[yi]+ys[yi+1])/2
-          if (!inUnion(cx, cy)) continue
-          const botOut = yi === ys.length - 2 || !inUnion(cx, (ys[yi+1]+ys[yi+2])/2)
-          if (botOut) { pts.push([xs[xi+1], ys[yi+1]]); pts.push([xs[xi], ys[yi+1]]) }
-        }
-      }
-      // Left edge bottom-to-top
-      for (let yi = ys.length - 2; yi >= 0; yi--) {
-        for (let xi = 0; xi < xs.length - 1; xi++) {
-          const cx = (xs[xi]+xs[xi+1])/2, cy = (ys[yi]+ys[yi+1])/2
-          if (!inUnion(cx, cy)) continue
-          const leftOut = xi === 0 || !inUnion((xs[xi-1]+xs[xi])/2, cy)
-          if (leftOut) { pts.push([xs[xi], ys[yi+1]]); pts.push([xs[xi], ys[yi]]) }
-        }
-      }
-      // Deduplicate consecutive duplicates and return
-      const out = []
-      for (const p of pts) {
-        if (!out.length || out[out.length-1][0] !== p[0] || out[out.length-1][1] !== p[1])
-          out.push(p)
-      }
-      return out.length >= 6 ? out : null
-    }
-
-    // ── Fit each room ────────────────────────────────────
-    const FIT_THRESHOLD = 0.85   // minimum IoU to accept a fitted shape
-    const CIRCLE_STEPS  = 48     // polygon approximation for circle IoU
-
-    for (const room of rooms) {
-      const poly = room.polygon
-      if (poly.length < 3) continue
-      const b    = sfBbox(poly)
-      const area = sfArea(poly)
-      if (area < 4) continue
-
-      let bestIoU  = FIT_THRESHOLD - 0.001   // must beat this to replace
-      let bestPoly = null
-
-      // ── 1. Rectangle (axis-aligned) ──────────────────
-      {
-        const candidate = rectPoly(b.x1, b.y1, b.x2, b.y2)
-        const iou = rasterIoU(poly, (x, y) => x >= b.x1 && x <= b.x2 && y >= b.y1 && y <= b.y2)
-        if (iou > bestIoU) { bestIoU = iou; bestPoly = candidate }
-      }
-
-      // ── 2. Square (centred on bbox centre, side = max(w,h)) ──
-      {
-        const side = Math.max(b.w, b.h)
-        const cx   = (b.x1 + b.x2) / 2
-        const cy   = (b.y1 + b.y2) / 2
-        const sx1  = cx - side / 2, sy1 = cy - side / 2
-        const sx2  = cx + side / 2, sy2 = cy + side / 2
-        const iou  = rasterIoU(poly, (x, y) => x >= sx1 && x <= sx2 && y >= sy1 && y <= sy2)
-        if (iou > bestIoU) {
-          bestIoU  = iou
-          bestPoly = rectPoly(Math.round(sx1), Math.round(sy1), Math.round(sx2), Math.round(sy2))
-        }
-      }
-
-      // ── 3. Circle ────────────────────────────────────
-      {
-        const [cx, cy] = sfCentroid(poly)
-        // Radius: average distance from centroid to all vertices
-        let rSum = 0
-        for (const [x, y] of poly) rSum += Math.hypot(x - cx, y - cy)
-        const r = rSum / poly.length
-        const iou = rasterIoU(poly, (x, y) => (x-cx)**2 + (y-cy)**2 <= r*r)
-        if (iou > bestIoU) {
-          bestIoU = iou
-          // Approximate circle as polygon
-          const circlePoly = []
-          for (let k = 0; k < CIRCLE_STEPS; k++) {
-            const a = (k / CIRCLE_STEPS) * Math.PI * 2
-            circlePoly.push([Math.round(cx + Math.cos(a) * r), Math.round(cy + Math.sin(a) * r)])
-          }
-          bestPoly = circlePoly
-        }
-      }
-
-      // ── 4. L / T / U shape ───────────────────────────
-      // Try all horizontal and vertical splits of the bbox into two rects.
-      // The two rects together form an L/T/U shape.
-      {
-        const splits = []
-        // Horizontal splits: top rect + bottom rect, varying split Y
-        const ySteps = Math.max(2, Math.round(b.h / 8))
-        for (let s = 1; s < ySteps; s++) {
-          const sy = b.y1 + Math.round(b.h * s / ySteps)
-          // Left-aligned top, right-aligned bottom (and vice versa)
-          // We try 4 combinations per split line
-          const midX = Math.round((b.x1 + b.x2) / 2)
-          splits.push(
-            // Top-left + bottom-full
-            [{ x1:b.x1, y1:b.y1, x2:midX, y2:sy }, { x1:b.x1, y1:sy, x2:b.x2, y2:b.y2 }],
-            // Top-right + bottom-full
-            [{ x1:midX, y1:b.y1, x2:b.x2, y2:sy }, { x1:b.x1, y1:sy, x2:b.x2, y2:b.y2 }],
-            // Top-full + bottom-left
-            [{ x1:b.x1, y1:b.y1, x2:b.x2, y2:sy }, { x1:b.x1, y1:sy, x2:midX, y2:b.y2 }],
-            // Top-full + bottom-right
-            [{ x1:b.x1, y1:b.y1, x2:b.x2, y2:sy }, { x1:midX, y1:sy, x2:b.x2, y2:b.y2 }],
-          )
-        }
-        // Vertical splits
-        const xSteps = Math.max(2, Math.round(b.w / 8))
-        for (let s = 1; s < xSteps; s++) {
-          const sx = b.x1 + Math.round(b.w * s / xSteps)
-          const midY = Math.round((b.y1 + b.y2) / 2)
-          splits.push(
-            [{ x1:b.x1, y1:b.y1, x2:sx, y2:midY }, { x1:sx, y1:b.y1, x2:b.x2, y2:b.y2 }],
-            [{ x1:b.x1, y1:midY, x2:sx, y2:b.y2 }, { x1:sx, y1:b.y1, x2:b.x2, y2:b.y2 }],
-            [{ x1:b.x1, y1:b.y1, x2:sx, y2:b.y2 }, { x1:sx, y1:b.y1, x2:b.x2, y2:midY }],
-            [{ x1:b.x1, y1:b.y1, x2:sx, y2:b.y2 }, { x1:sx, y1:midY, x2:b.x2, y2:b.y2 }],
-          )
-        }
-
-        for (const [r1, r2] of splits) {
-          const inUnion = (x, y) =>
-            (x >= r1.x1 && x <= r1.x2 && y >= r1.y1 && y <= r1.y2) ||
-            (x >= r2.x1 && x <= r2.x2 && y >= r2.y1 && y <= r2.y2)
-          const iou = rasterIoU(poly, inUnion)
-          if (iou > bestIoU) {
-            bestIoU = iou
-            bestPoly = lShapePoly(r1, r2)
-          }
-        }
-      }
-
-      // ── Apply best fit ────────────────────────────────
-      if (bestPoly && bestPoly.length >= 3) {
-        room.polygon = bestPoly
-        room.areaPx  = Math.round(sfArea(bestPoly))
-      }
-      // Otherwise keep original traced polygon (curved walls etc.)
-    }
-  })()
-
-  // ── Remove nested polygons ──────────────────────────────
-  // If a polygon's centroid lies inside another polygon, it's a nested
-  // (contained) room — drop it. We also drop if bbox IoU > 0.85 and
-  // the smaller region is fully enclosed by the larger one.
-  function polyCentroid(poly) {
-    let cx = 0, cy = 0
-    for (const [x, y] of poly) { cx += x; cy += y }
-    return [cx / poly.length, cy / poly.length]
-  }
-
-  function polyBbox(poly) {
+  // ── Shared geometry helpers ─────────────────────────────
+  function pgBbox(poly) {
     let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity
     for (const [x, y] of poly) {
       if (x < x1) x1 = x; if (x > x2) x2 = x
       if (y < y1) y1 = y; if (y > y2) y2 = y
     }
-    return { x1, y1, x2, y2 }
+    return { x1, y1, x2, y2, w: x2 - x1, h: y2 - y1 }
   }
 
-  // Check if point is inside polygon (ray casting)
-  function ptInPoly(px, py, poly) {
+  function pgArea(poly) {
+    let a = 0
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      a += (poly[j][0] + poly[i][0]) * (poly[j][1] - poly[i][1])
+    }
+    return Math.abs(a) / 2
+  }
+
+  function pgCentroid(poly) {
+    let cx = 0, cy = 0
+    for (const [x, y] of poly) { cx += x; cy += y }
+    return [cx / poly.length, cy / poly.length]
+  }
+
+  function pgPtIn(px, py, poly) {
     let inside = false
     for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
       const [xi, yi] = poly[i], [xj, yj] = poly[j]
@@ -2035,43 +1796,249 @@ async function detectRoomsLocal(imageEl, opts) {
     return inside
   }
 
-  // Sample N points from polygon bbox and count how many are inside
-  function overlapFraction(inner, outer) {
-    const b = polyBbox(inner)
-    const step = Math.max(1, Math.round(Math.sqrt((b.x2 - b.x1) * (b.y2 - b.y1)) / 8))
+  function bboxOverlap(a, b) {
+    return a.x1 < b.x2 && a.x2 > b.x1 && a.y1 < b.y2 && a.y2 > b.y1
+  }
+
+  // Rasterised IoU — scans union of poly bbox and optional shapeBbox
+  function rasterIoU(poly, inShape, shapeBbox) {
+    const pb = pgBbox(poly)
+    const x1 = shapeBbox ? Math.min(pb.x1, shapeBbox.x1) : pb.x1
+    const y1 = shapeBbox ? Math.min(pb.y1, shapeBbox.y1) : pb.y1
+    const x2 = shapeBbox ? Math.max(pb.x2, shapeBbox.x2) : pb.x2
+    const y2 = shapeBbox ? Math.max(pb.y2, shapeBbox.y2) : pb.y2
+    const step = Math.max(2, Math.round(Math.sqrt((x2 - x1) * (y2 - y1)) / 12))
+    let inter = 0, union = 0
+    for (let y = y1; y <= y2; y += step) {
+      for (let x = x1; x <= x2; x += step) {
+        const inP = pgPtIn(x, y, poly)
+        const inS = inShape(x, y)
+        if (inP && inS) inter++
+        if (inP || inS) union++
+      }
+    }
+    return union === 0 ? 0 : inter / union
+  }
+
+  // Fraction of `subject` area that lies inside `clip`
+  function overlapFraction(subject, clip) {
+    const b = pgBbox(subject)
+    const step = Math.max(2, Math.round(Math.sqrt(b.w * b.h) / 10))
     let total = 0, inside = 0
     for (let y = b.y1; y <= b.y2; y += step) {
       for (let x = b.x1; x <= b.x2; x += step) {
-        if (ptInPoly(x, y, inner)) {
+        if (pgPtIn(x, y, subject)) {
           total++
-          if (ptInPoly(x, y, outer)) inside++
+          if (pgPtIn(x, y, clip)) inside++
         }
       }
     }
     return total === 0 ? 0 : inside / total
   }
 
-  const filtered = rooms.filter((room, i) => {
-    const [cx, cy] = polyCentroid(room.polygon)
-    for (let j = 0; j < rooms.length; j++) {
-      if (i === j) continue
-      const other = rooms[j]
-      // Skip if other is smaller — we only check if current is inside a larger one
-      if (other.areaPx <= room.areaPx) continue
-      // Quick bbox containment check first
-      const rb = polyBbox(room.polygon)
-      const ob = polyBbox(other.polygon)
-      if (rb.x1 < ob.x1 || rb.y1 < ob.y1 || rb.x2 > ob.x2 || rb.y2 > ob.y2) continue
-      // Centroid inside the other polygon?
-      if (!ptInPoly(cx, cy, other.polygon)) continue
-      // Confirm: >70% of sampled points are inside the outer polygon
-      if (overlapFraction(room.polygon, other.polygon) > 0.70) return false
-    }
-    return true
-  })
+  function rectPoly(x1, y1, x2, y2) {
+    return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+  }
 
-  return filtered
+  // Build L/T/U outline polygon from union of two rects
+  function lShapeOutline(r1, r2) {
+    const xs = [...new Set([r1.x1, r1.x2, r2.x1, r2.x2])].sort((a, b) => a - b)
+    const ys = [...new Set([r1.y1, r1.y2, r2.y1, r2.y2])].sort((a, b) => a - b)
+    const inU = (x, y) =>
+      (x >= r1.x1 && x <= r1.x2 && y >= r1.y1 && y <= r1.y2) ||
+      (x >= r2.x1 && x <= r2.x2 && y >= r2.y1 && y <= r2.y2)
+    const pts = []
+    for (let xi = 0; xi < xs.length - 1; xi++)
+      for (let yi = 0; yi < ys.length - 1; yi++) {
+        const cx = (xs[xi] + xs[xi+1]) / 2, cy = (ys[yi] + ys[yi+1]) / 2
+        if (inU(cx, cy) && (yi === 0 || !inU(cx, (ys[yi-1]+ys[yi])/2)))
+          { pts.push([xs[xi], ys[yi]]); pts.push([xs[xi+1], ys[yi]]) }
+      }
+    for (let yi = 0; yi < ys.length - 1; yi++)
+      for (let xi = xs.length - 2; xi >= 0; xi--) {
+        const cx = (xs[xi]+xs[xi+1])/2, cy = (ys[yi]+ys[yi+1])/2
+        if (inU(cx, cy) && (xi === xs.length-2 || !inU((xs[xi+1]+xs[xi+2])/2, cy)))
+          { pts.push([xs[xi+1], ys[yi]]); pts.push([xs[xi+1], ys[yi+1]]) }
+      }
+    for (let xi = xs.length - 2; xi >= 0; xi--)
+      for (let yi = ys.length - 2; yi >= 0; yi--) {
+        const cx = (xs[xi]+xs[xi+1])/2, cy = (ys[yi]+ys[yi+1])/2
+        if (inU(cx, cy) && (yi === ys.length-2 || !inU(cx, (ys[yi+1]+ys[yi+2])/2)))
+          { pts.push([xs[xi+1], ys[yi+1]]); pts.push([xs[xi], ys[yi+1]]) }
+      }
+    for (let yi = ys.length - 2; yi >= 0; yi--)
+      for (let xi = 0; xi < xs.length - 1; xi++) {
+        const cx = (xs[xi]+xs[xi+1])/2, cy = (ys[yi]+ys[yi+1])/2
+        if (inU(cx, cy) && (xi === 0 || !inU((xs[xi-1]+xs[xi])/2, cy)))
+          { pts.push([xs[xi], ys[yi+1]]); pts.push([xs[xi], ys[yi]]) }
+      }
+    const out = []
+    for (const p of pts)
+      if (!out.length || out[out.length-1][0] !== p[0] || out[out.length-1][1] !== p[1]) out.push(p)
+    return out.length >= 6 ? out : null
+  }
+
+  // ── 1. Shape fitting ────────────────────────────────────
+  const FIT_THRESHOLD = 0.85
+  const CIRCLE_STEPS  = 48
+  const MAX_L_SPLITS  = 5
+
+  for (const room of rooms) {
+    const poly = room.polygon
+    if (poly.length < 3) continue
+    const b = pgBbox(poly)
+    if (pgArea(poly) < 4) continue
+
+    let bestIoU  = FIT_THRESHOLD - 0.001
+    let bestPoly = null
+
+    // Rectangle
+    {
+      const iou = rasterIoU(poly, (x, y) => x >= b.x1 && x <= b.x2 && y >= b.y1 && y <= b.y2, b)
+      if (iou > bestIoU) { bestIoU = iou; bestPoly = rectPoly(b.x1, b.y1, b.x2, b.y2) }
+    }
+
+    // Square (centred, side = max(w,h))
+    {
+      const side = Math.max(b.w, b.h)
+      const cx = (b.x1 + b.x2) / 2, cy = (b.y1 + b.y2) / 2
+      const sx1 = cx - side/2, sy1 = cy - side/2, sx2 = cx + side/2, sy2 = cy + side/2
+      const sb = { x1: sx1, y1: sy1, x2: sx2, y2: sy2 }
+      const iou = rasterIoU(poly, (x, y) => x >= sx1 && x <= sx2 && y >= sy1 && y <= sy2, sb)
+      if (iou > bestIoU) {
+        bestIoU  = iou
+        bestPoly = rectPoly(Math.round(sx1), Math.round(sy1), Math.round(sx2), Math.round(sy2))
+      }
+    }
+
+    // Circle
+    {
+      const [cx, cy] = pgCentroid(poly)
+      let rSum = 0
+      for (const [x, y] of poly) rSum += Math.hypot(x - cx, y - cy)
+      const r = rSum / poly.length
+      const cb = { x1: cx-r, y1: cy-r, x2: cx+r, y2: cy+r }
+      const iou = rasterIoU(poly, (x, y) => (x-cx)**2 + (y-cy)**2 <= r*r, cb)
+      if (iou > bestIoU) {
+        bestIoU = iou
+        const cp = []
+        for (let k = 0; k < CIRCLE_STEPS; k++) {
+          const a = (k / CIRCLE_STEPS) * Math.PI * 2
+          cp.push([Math.round(cx + Math.cos(a) * r), Math.round(cy + Math.sin(a) * r)])
+        }
+        bestPoly = cp
+      }
+    }
+
+    // L / T / U shape
+    {
+      const midX = Math.round((b.x1 + b.x2) / 2)
+      const midY = Math.round((b.y1 + b.y2) / 2)
+      const tryPair = (r1, r2) => {
+        const inU = (x, y) =>
+          (x >= r1.x1 && x <= r1.x2 && y >= r1.y1 && y <= r1.y2) ||
+          (x >= r2.x1 && x <= r2.x2 && y >= r2.y1 && y <= r2.y2)
+        const ub = { x1: Math.min(r1.x1,r2.x1), y1: Math.min(r1.y1,r2.y1),
+                     x2: Math.max(r1.x2,r2.x2), y2: Math.max(r1.y2,r2.y2) }
+        const iou = rasterIoU(poly, inU, ub)
+        if (iou > bestIoU) {
+          const outline = lShapeOutline(r1, r2)
+          if (outline) { bestIoU = iou; bestPoly = outline }
+        }
+      }
+      for (let s = 1; s <= MAX_L_SPLITS; s++) {
+        const sy = b.y1 + Math.round(b.h * s / (MAX_L_SPLITS + 1))
+        const sx = b.x1 + Math.round(b.w * s / (MAX_L_SPLITS + 1))
+        tryPair({ x1:b.x1, y1:b.y1, x2:midX, y2:sy   }, { x1:b.x1, y1:sy,   x2:b.x2, y2:b.y2 })
+        tryPair({ x1:midX, y1:b.y1, x2:b.x2, y2:sy   }, { x1:b.x1, y1:sy,   x2:b.x2, y2:b.y2 })
+        tryPair({ x1:b.x1, y1:b.y1, x2:b.x2, y2:sy   }, { x1:b.x1, y1:sy,   x2:midX, y2:b.y2 })
+        tryPair({ x1:b.x1, y1:b.y1, x2:b.x2, y2:sy   }, { x1:midX, y1:sy,   x2:b.x2, y2:b.y2 })
+        tryPair({ x1:b.x1, y1:b.y1, x2:sx,   y2:midY }, { x1:sx,   y1:b.y1, x2:b.x2, y2:b.y2 })
+        tryPair({ x1:b.x1, y1:midY, x2:sx,   y2:b.y2 }, { x1:sx,   y1:b.y1, x2:b.x2, y2:b.y2 })
+        tryPair({ x1:b.x1, y1:b.y1, x2:sx,   y2:b.y2 }, { x1:sx,   y1:b.y1, x2:b.x2, y2:midY })
+        tryPair({ x1:b.x1, y1:b.y1, x2:sx,   y2:b.y2 }, { x1:sx,   y1:midY, x2:b.x2, y2:b.y2 })
+      }
+    }
+
+    if (bestPoly && bestPoly.length >= 3) {
+      room.polygon = bestPoly
+      room.areaPx  = Math.round(pgArea(bestPoly))
+    }
+  }
+
+  // ── 2. Overlap resolution ───────────────────────────────
+  // Sutherland-Hodgman: keep part of `subject` OUTSIDE `clipPoly`
+  function suthHodgman(subject, clipPoly) {
+    function intersect(a, b, c, d) {
+      const a1=b[1]-a[1], b1=a[0]-b[0], c1=a1*a[0]+b1*a[1]
+      const a2=d[1]-c[1], b2=c[0]-d[0], c2=a2*c[0]+b2*c[1]
+      const det=a1*b2-a2*b1
+      if (Math.abs(det)<1e-10) return null
+      return [(b2*c1-b1*c2)/det, (a1*c2-a2*c1)/det]
+    }
+    let signedArea=0
+    for (let i=0,j=clipPoly.length-1; i<clipPoly.length; j=i++)
+      signedArea+=(clipPoly[j][0]-clipPoly[i][0])*(clipPoly[j][1]+clipPoly[i][1])
+    const cw=signedArea>0
+    const outside=(p,c,d)=>{
+      const cross=(d[0]-c[0])*(p[1]-c[1])-(d[1]-c[1])*(p[0]-c[0])
+      return cw ? cross>0 : cross<0
+    }
+    let out=subject.slice()
+    for (let i=0; i<clipPoly.length && out.length; i++) {
+      const c=clipPoly[i], d=clipPoly[(i+1)%clipPoly.length]
+      const inp=out; out=[]
+      for (let k=0; k<inp.length; k++) {
+        const cur=inp[k], prev=inp[(k+inp.length-1)%inp.length]
+        const curOut=outside(cur,c,d), prevOut=outside(prev,c,d)
+        if (curOut) {
+          if (!prevOut) { const pt=intersect(prev,cur,c,d); if(pt) out.push(pt) }
+          out.push(cur)
+        } else if (prevOut) {
+          const pt=intersect(prev,cur,c,d); if(pt) out.push(pt)
+        }
+      }
+    }
+    return out
+  }
+
+  const byArea = [...rooms].sort((a, b) => b.areaPx - a.areaPx)
+  const dropped = new Set()
+
+  for (let i = 0; i < byArea.length; i++) {
+    if (dropped.has(i)) continue
+    for (let j = i + 1; j < byArea.length; j++) {
+      if (dropped.has(j)) continue
+      const big = byArea[i], small = byArea[j]
+      const rb = pgBbox(big.polygon), ob = pgBbox(small.polygon)
+      if (!bboxOverlap(rb, ob)) continue
+      const frac = overlapFraction(small.polygon, big.polygon)
+      if (frac > 0.70) {
+        dropped.add(j)
+      } else if (frac > 0.05) {
+        const clipped = suthHodgman(small.polygon, big.polygon)
+        if (clipped.length < 3 || pgArea(clipped) < 100) {
+          dropped.add(j)
+        } else {
+          byArea[j] = { ...small,
+            polygon: clipped.map(([x, y]) => [Math.round(x), Math.round(y)]),
+            areaPx:  Math.round(pgArea(clipped)) }
+        }
+      }
+    }
+  }
+
+  return byArea
+    .filter((_, i) => !dropped.has(i))
+    .sort((a, b) => {
+      const [cxa, cya] = pgCentroid(a.polygon)
+      const [cxb, cyb] = pgCentroid(b.polygon)
+      if (Math.abs(cya - cyb) > 20) return cya - cyb
+      return cxa - cxb
+    })
+    .map((r, i) => ({ ...r, id: `r${i+1}`, label: `Помещение ${i+1}` }))
 }
+
 
 // Otsu threshold
 function otsu(gray) {
