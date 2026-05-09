@@ -58,18 +58,12 @@ const saveEditsBtn      = document.getElementById('saveEditsBtn')
 const trainingBadge     = document.getElementById('trainingBadge')
 
 const paramThreshold = document.getElementById('paramThreshold')
-const paramDilate    = document.getElementById('paramDilate')
-const paramMinArea   = document.getElementById('paramMinArea')
 const paramEpsilon   = document.getElementById('paramEpsilon')
 const vThr = document.getElementById('vThr')
-const vDil = document.getElementById('vDil')
-const vMin = document.getElementById('vMin')
 const vEps = document.getElementById('vEps')
 
-paramThreshold.oninput = () => vThr.textContent = paramThreshold.value === '0' ? 'авто' : paramThreshold.value
-paramDilate   .oninput = () => vDil.textContent = `${paramDilate.value} px`
-paramMinArea  .oninput = () => vMin.textContent = `${(Number(paramMinArea.value)/10).toFixed(1)}%`
-paramEpsilon  .oninput = () => vEps.textContent = `${paramEpsilon.value} px`
+if (paramThreshold) paramThreshold.oninput = () => { if (vThr) vThr.textContent = paramThreshold.value === '0' ? 'авто' : paramThreshold.value }
+if (paramEpsilon)   paramEpsilon.oninput   = () => { if (vEps) vEps.textContent = `${paramEpsilon.value} px` }
 
 // ── Init ───────────────────────────────────────────────────
 async function init() {
@@ -406,10 +400,10 @@ async function analyseLocal() {
   showProgress('Локальный анализ…', 'Подготовка изображения')
   await tick()
 
-  const tManual = Number(paramThreshold.value)         // 0 = auto (Otsu)
-  const dilateK = Number(paramDilate.value)            // 0..5
-  const minPct  = Number(paramMinArea.value) / 1000    // /10 -> percent then /100 -> fraction
-  const epsilon = Number(paramEpsilon.value)           // px in display scale
+  const tManual = paramThreshold ? Number(paramThreshold.value) : 0
+  const dilateK = 2
+  const minPct  = 0.003
+  const epsilon = paramEpsilon ? Number(paramEpsilon.value) : 3
 
   setProgressStep('Поиск стен и помещений…')
   await tick()
