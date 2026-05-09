@@ -1936,6 +1936,75 @@ async function detectRoomsLocal(imageEl, opts) {
     return out
   }
 
+  // ---- Close dashed-wall gaps ------------------------------------------------
+  // Architectural plans use dashed lines for zone/administrative boundaries.
+  // These appear in the binary as repeating dark-light-dark patterns with gaps
+  // larger than typical doorways (closeDoorGaps uses ~1.2% of short side, which
+  // is too small for dash spacing). We detect the dash pattern and fill the gaps
+  // so flood fill treats them as solid walls.
+  function closeDashedWalls(bin, W, H) {
+    const out = bin.slice()
+    // Max gap between dashes: ~2.5% of short side (scales with resolution)
+    const maxGap  = Math.max(18, Math.round(Math.min(W, H) * 0.025))
+    const minDash = 3   // min dark-pixel run to qualify as a "dash"
+
+    // Horizontal scan
+    for (let y = 1; y < H - 1; y++) {
+      let x = 1
+      while (x < W - 1) {
+        if (out[y*W+x] === 0) { x++; continue }
+        const gapStart = x
+        while (x < W && out[y*W+x] === 1) x++
+        const gapLen = x - gapStart
+        if (gapLen < 1 || gapLen > maxGap) continue
+        const hasWallLeft  = gapStart > 0 && out[y*W+(gapStart-1)] === 0
+        const hasWallRight = x < W        && out[y*W+x]             === 0
+        if (!hasWallLeft || !hasWallRight) continue
+        let leftDark = 0
+        for (let lx = gapStart - 1; lx >= Math.max(0, gapStart - 20); lx--) {
+          if (out[y*W+lx] === 0) leftDark++; else break
+        }
+        let rightDark = 0
+        for (let rx = x; rx < Math.min(W, x + 20); rx++) {
+          if (out[y*W+rx] === 0) rightDark++; else break
+        }
+        if (leftDark >= minDash && rightDark >= minDash) {
+          for (let gx = gapStart; gx < x; gx++) out[y*W+gx] = 0
+        }
+      }
+    }
+
+    // Vertical scan
+    for (let x = 1; x < W - 1; x++) {
+      let y = 1
+      while (y < H - 1) {
+        if (out[y*W+x] === 0) { y++; continue }
+        const gapStart = y
+        while (y < H && out[y*W+x] === 1) y++
+        const gapLen = y - gapStart
+        if (gapLen < 1 || gapLen > maxGap) continue
+        const hasWallAbove = gapStart > 0 && out[(gapStart-1)*W+x] === 0
+        const hasWallBelow = y < H        && out[y*W+x]             === 0
+        if (!hasWallAbove || !hasWallBelow) continue
+        let aboveDark = 0
+        for (let ay = gapStart - 1; ay >= Math.max(0, gapStart - 20); ay--) {
+          if (out[ay*W+x] === 0) aboveDark++; else break
+        }
+        let belowDark = 0
+        for (let by = y; by < Math.min(H, y + 20); by++) {
+          if (out[by*W+x] === 0) belowDark++; else break
+        }
+        if (aboveDark >= minDash && belowDark >= minDash) {
+          for (let gy = gapStart; gy < y; gy++) out[gy*W+x] = 0
+        }
+      }
+    }
+    return out
+  }
+
+  bin1 = closeDashedWalls(bin1, W, H)
+  bin2 = closeDashedWalls(bin2, W, H)
+
   // closeDoorGaps is only meaningful on the Canny-inverted binary (bin1) where
   // "free" pixels are gaps in wall lines.  bin2 is Otsu-brightness-based — its
   // large open rooms are wide white blobs; running closeDoorGaps on them with a
@@ -1996,7 +2065,7 @@ async function detectRoomsLocal(imageEl, opts) {
     ? Math.pow(wallInfo.wallMin * 4, 2) / total
     : 0.003
   const minArea = total * autoMinAreaFrac
-  const maxArea = total * 0.85  // raised from 0.70 — large rooms can span most of image
+  const maxArea = total * 0.92  // raised from 0.85 — very large rooms can span most of image
 
   // touchesBorder — умная проверка: отбрасываем регион только если он касается
   // самого края растра (вероятно, фоновая область за пределами здания).
@@ -2011,7 +2080,7 @@ async function detectRoomsLocal(imageEl, opts) {
       // Отбрасываем граничные регионы только если они маленькие ИЛИ некомпактные
       // Большие компактные регионы у края — это легитимные комнаты у внешней стены
       if (r.touchesBorder) {
-        const isBigAndCompact = r.area > total * 0.01 && fillRatio > 0.45
+        const isBigAndCompact = r.area > total * 0.005 && fillRatio > 0.35
         if (!isBigAndCompact) return false
       }
       return true
