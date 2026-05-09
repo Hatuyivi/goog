@@ -791,7 +791,7 @@ async function analyseLocal() {
 
   const tManual = paramThreshold ? Number(paramThreshold.value) : 0          // 0 = auto (Otsu)
   const dilateK = paramDilate    ? Number(paramDilate.value)    : 0          // 0..5
-  const minPct  = paramMinArea   ? Number(paramMinArea.value) / 1000 : 0.002 // fraction
+  const minPct  = paramMinArea   ? Number(paramMinArea.value) / 1000 : 0.0015 // снижено с 0.002 (0.2% → 0.15%)
   const epsilon = paramEpsilon   ? Number(paramEpsilon.value)   : 3          // px
 
   setProgressStep('Поиск стен и помещений…')
@@ -1619,12 +1619,16 @@ async function detectRoomsLocal(imageEl, opts) {
   }
 
   // ── Multi-level threshold ──────────────────────────────
-  // Run two passes: global Otsu + a slightly lower threshold to catch
-  // rooms whose walls are lighter (partial walls, dashed lines).
+  // Run three passes to catch rooms with different wall darkness:
+  // 1. Global Otsu (main structure)
+  // 2. Slightly lower threshold (semi-dark boundaries)
+  // 3. Even lower for very light walls (dashed lines, thin walls)
   const T_otsu   = otsu(gray)
   const T_global = opts.threshold != null ? opts.threshold : T_otsu
   // Second threshold slightly lower catches semi-dark boundaries
   const T_loose  = Math.max(T_global - 30, 80)
+  // Third threshold for very light walls
+  const T_veryLoose = Math.max(T_global - 50, 60)
 
   // Binary pass 1: strict (main structure)
   const binStrict = new Uint8Array(W * H)
@@ -1636,21 +1640,33 @@ async function detectRoomsLocal(imageEl, opts) {
   let looseBgCount = 0
   for (let i = 0; i < gray.length; i++) { binLoose[i] = gray[i] > T_loose ? 1 : 0; if (binLoose[i]) looseBgCount++ }
 
+  // Binary pass 3: very loose (very light walls)
+  const binVeryLoose = new Uint8Array(W * H)
+  let veryLooseBgCount = 0
+  for (let i = 0; i < gray.length; i++) { binVeryLoose[i] = gray[i] > T_veryLoose ? 1 : 0; if (binVeryLoose[i]) veryLooseBgCount++ }
+
   console.log('[wallSens] image:', { W0, H0, scaledW: W, scaledH: H, scale: scale.toFixed(3) })
   console.log('[wallSens] threshold:', {
     optsThreshold: opts.threshold,
     T_otsu,
     T_global,
     T_loose,
+    T_veryLoose,
     strictBgFrac: (strictBgCount / (W * H)).toFixed(3),
     looseBgFrac:  (looseBgCount / (W * H)).toFixed(3),
+    veryLooseBgFrac: (veryLooseBgCount / (W * H)).toFixed(3),
   })
 
-  // Erode to thicken walls on both
-  let bin1 = binStrict, bin2 = binLoose
-  for (let i = 0; i < opts.dilateK; i++) { bin1 = erode4(bin1, W, H); bin2 = erode4(bin2, W, H) }
-  // Extra erode pass on loose to ensure walls are solid
+  // Erode to thicken walls on all three
+  let bin1 = binStrict, bin2 = binLoose, bin3 = binVeryLoose
+  for (let i = 0; i < opts.dilateK; i++) { 
+    bin1 = erode4(bin1, W, H)
+    bin2 = erode4(bin2, W, H)
+    bin3 = erode4(bin3, W, H)
+  }
+  // Extra erode pass on loose passes to ensure walls are solid
   bin2 = erode4(bin2, W, H)
+  bin3 = erode4(erode4(bin3, W, H), W, H)  // два дополнительных прохода для очень светлых стен
 
   // ── Connected components ────────────────────────────────
   function floodFill(bin) {
@@ -1692,12 +1708,15 @@ async function detectRoomsLocal(imageEl, opts) {
 
   const { labels: labels1, regions: regions1 } = floodFill(bin1)
   const { labels: labels2, regions: regions2 } = floodFill(bin2)
+  const { labels: labels3, regions: regions3 } = floodFill(bin3)
 
   console.log('[wallSens] floodFill regions:', {
     strict: regions1.length,
     loose:  regions2.length,
+    veryLoose: regions3.length,
     strictBiggest: regions1.length ? Math.max(...regions1.map(r => r.area)) : 0,
     looseBiggest:  regions2.length ? Math.max(...regions2.map(r => r.area)) : 0,
+    veryLooseBiggest: regions3.length ? Math.max(...regions3.map(r => r.area)) : 0,
     dilateK: opts.dilateK,
   })
 
@@ -1713,32 +1732,58 @@ async function detectRoomsLocal(imageEl, opts) {
 
   function filterRegions(regions, fillRatioMin) {
     return regions.filter(r => {
-      if (r.touchesBorder) return false
+      // УЛУЧШЕНИЕ 1: Разрешаем помещения у границ, если они не слишком большие
+      // (часто план обрезан и реальные помещения касаются краёв)
+      if (r.touchesBorder && r.area > total * 0.40) return false
+      
       if (r.area < minArea || r.area > maxArea) return false
       const bboxArea = (r.maxX - r.minX + 1) * (r.maxY - r.minY + 1)
-      // Small rooms can have lower fill ratio (irregular shapes, notched walls)
-      if (bboxArea > 0 && r.area / bboxArea < fillRatioMin) return false
+      
+      // УЛУЧШЕНИЕ 2: Адаптивный fillRatio в зависимости от размера
+      // Маленькие помещения могут иметь более низкий fillRatio (сложная форма)
+      // Большие помещения должны быть более компактными
+      let adaptiveFillRatio = fillRatioMin
+      if (r.area < total * 0.01) {
+        // Очень маленькие помещения (< 1% площади) — снижаем требования
+        adaptiveFillRatio = Math.max(0.15, fillRatioMin - 0.10)
+      } else if (r.area < total * 0.05) {
+        // Маленькие помещения (< 5% площади)
+        adaptiveFillRatio = Math.max(0.18, fillRatioMin - 0.05)
+      }
+      
+      if (bboxArea > 0 && r.area / bboxArea < adaptiveFillRatio) return false
       return true
     })
   }
 
-  // Strict pass: normal fill threshold
-  const cand1 = filterRegions(regions1, 0.30)
-  // Loose pass: allow slightly lower fill ratio for small rooms
-  const cand2 = filterRegions(regions2, 0.20)
+  // Strict pass: нормальный порог заполнения
+  const cand1 = filterRegions(regions1, 0.25)  // снижено с 0.30
+  // Loose pass: более низкий порог для маленьких помещений
+  const cand2 = filterRegions(regions2, 0.15)  // снижено с 0.20
+  // Very loose pass: очень низкий порог для очень маленьких помещений
+  const cand3 = filterRegions(regions3, 0.12)
 
-  // Diagnostic: count rejection reasons for both passes
+  // Diagnostic: count rejection reasons for all passes
   function rejectionStats(regions, fillRatioMin) {
     const s = { border: 0, tooSmall: 0, tooBig: 0, fillRatio: 0, kept: 0 }
     const nearMiss = [] // regions just below thresholds — likely the "lost" rooms
     for (const r of regions) {
       const bboxArea = (r.maxX - r.minX + 1) * (r.maxY - r.minY + 1)
       const fill = bboxArea > 0 ? r.area / bboxArea : 0
+      
+      // Адаптивный fillRatio (как в filterRegions)
+      let adaptiveFillRatio = fillRatioMin
+      if (r.area < total * 0.01) {
+        adaptiveFillRatio = Math.max(0.15, fillRatioMin - 0.10)
+      } else if (r.area < total * 0.05) {
+        adaptiveFillRatio = Math.max(0.18, fillRatioMin - 0.05)
+      }
+      
       const reason =
-        r.touchesBorder       ? 'border'    :
+        (r.touchesBorder && r.area > total * 0.40) ? 'border'    :
         r.area < minArea      ? 'tooSmall'  :
         r.area > maxArea      ? 'tooBig'    :
-        fill   < fillRatioMin ? 'fillRatio' : 'kept'
+        fill   < adaptiveFillRatio ? 'fillRatio' : 'kept'
       s[reason]++
       // Capture "almost-room" rejects (size within 30%-2x of minArea, or fill ratio close)
       if (reason !== 'kept' && reason !== 'border' &&
@@ -1749,25 +1794,30 @@ async function detectRoomsLocal(imageEl, opts) {
           areaFrac: +(r.area / total).toFixed(4),
           bbox:  `${r.maxX-r.minX+1}x${r.maxY-r.minY+1}`,
           fill:  +fill.toFixed(2),
+          adaptiveFill: +adaptiveFillRatio.toFixed(2),
         })
       }
     }
     nearMiss.sort((a, b) => b.area - a.area)
     return { s, nearMiss: nearMiss.slice(0, 10) }
   }
-  const strictRej = rejectionStats(regions1, 0.30)
-  const looseRej  = rejectionStats(regions2, 0.20)
+  const strictRej = rejectionStats(regions1, 0.25)  // обновлено с 0.30
+  const looseRej  = rejectionStats(regions2, 0.15)  // обновлено с 0.20
+  const veryLooseRej = rejectionStats(regions3, 0.12)
   console.log('[wallSens] candidates:', {
     minArea: Math.round(minArea),
     maxArea: Math.round(maxArea),
     minAreaFrac: opts.minAreaFrac,
     cand1: cand1.length,
     cand2: cand2.length,
+    cand3: cand3.length,
     strictReasons: strictRej.s,
     looseReasons:  looseRej.s,
+    veryLooseReasons: veryLooseRej.s,
   })
   if (strictRej.nearMiss.length) console.log('[wallSens] strict near-miss rejects (top10):', strictRej.nearMiss)
   if (looseRej.nearMiss.length)   console.log('[wallSens] loose  near-miss rejects (top10):', looseRej.nearMiss)
+  if (veryLooseRej.nearMiss.length) console.log('[wallSens] veryLoose near-miss rejects (top10):', veryLooseRej.nearMiss)
 
   // ── Merge and deduplicate ───────────────────────────────
   // Prefer strict candidates; add loose ones that don't overlap with any strict.
@@ -1783,15 +1833,44 @@ async function detectRoomsLocal(imageEl, opts) {
   }
 
   const merged = [...cand1]
-  const strictBoxes = cand1.map(bbox)
+  const allBoxes = cand1.map(bbox)
+  
+  // Добавляем loose кандидатов, которые не пересекаются
   let looseAdded = 0, looseDropped = 0
   for (const r of cand2) {
     const rb = bbox(r)
-    const overlaps = strictBoxes.some(sb => iou(sb, rb) > 0.4)
-    if (!overlaps) { merged.push(r); looseAdded++ }
-    else looseDropped++
+    const overlaps = allBoxes.some(sb => iou(sb, rb) > 0.4)
+    if (!overlaps) { 
+      merged.push(r)
+      allBoxes.push(rb)
+      looseAdded++
+    } else {
+      looseDropped++
+    }
   }
-  console.log('[wallSens] merge:', { fromStrict: cand1.length, looseAdded, looseDropped, total: merged.length })
+  
+  // Добавляем veryLoose кандидатов, которые не пересекаются с уже добавленными
+  let veryLooseAdded = 0, veryLooseDropped = 0
+  for (const r of cand3) {
+    const rb = bbox(r)
+    const overlaps = allBoxes.some(sb => iou(sb, rb) > 0.3)  // более низкий порог IoU для очень маленьких
+    if (!overlaps) { 
+      merged.push(r)
+      allBoxes.push(rb)
+      veryLooseAdded++
+    } else {
+      veryLooseDropped++
+    }
+  }
+  
+  console.log('[wallSens] merge:', { 
+    fromStrict: cand1.length, 
+    looseAdded, 
+    looseDropped, 
+    veryLooseAdded,
+    veryLooseDropped,
+    total: merged.length 
+  })
 
   // ── Sort top-to-bottom, left-to-right ──────────────────
   merged.sort((a, b) => {
@@ -1809,9 +1888,13 @@ async function detectRoomsLocal(imageEl, opts) {
 
   for (let i = 0; i < merged.length; i++) {
     const r = merged[i]
-    // Use the label map that produced this candidate
-    const isFromLoose = !cand1.includes(r)
-    const labelsMap   = isFromLoose ? labels2 : labels1
+    // Определяем, из какого прохода пришёл кандидат
+    const isFromStrict = cand1.includes(r)
+    const isFromLoose = cand2.includes(r)
+    const isFromVeryLoose = cand3.includes(r)
+    
+    // Выбираем соответствующую карту меток
+    const labelsMap = isFromStrict ? labels1 : isFromLoose ? labels2 : labels3
 
     const poly = traceContour(labelsMap, r.label, W, H, r)
     if (poly.length < 4) { polyTooShort++; continue }
