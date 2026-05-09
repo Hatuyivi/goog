@@ -1618,13 +1618,90 @@ async function detectRoomsLocal(imageEl, opts) {
     gray[j] = (px[i] * 0.299 + px[i+1] * 0.587 + px[i+2] * 0.114) | 0
   }
 
+  // ── Detect plan type: thick walls vs thin lines ────────
+  // Анализируем гистограмму: если много пикселей близко к белому/чёрному,
+  // но мало средних тонов → это план с тонкими линиями
+  const hist = new Uint32Array(256)
+  for (let i = 0; i < gray.length; i++) hist[gray[i]]++
+  
+  const darkPixels = hist.slice(0, 50).reduce((a, b) => a + b, 0)   // очень тёмные (0-49)
+  const lightPixels = hist.slice(200, 256).reduce((a, b) => a + b, 0) // очень светлые (200-255)
+  const midPixels = hist.slice(50, 200).reduce((a, b) => a + b, 0)   // средние тона
+  
+  const darkRatio = darkPixels / gray.length
+  const lightRatio = lightPixels / gray.length
+  const midRatio = midPixels / gray.length
+  
+  // Если тёмных пикселей мало (< 15%) и светлых много (> 70%) → тонкие линии
+  const isThinLines = darkRatio < 0.15 && lightRatio > 0.70 && midRatio < 0.25
+  
+  console.log('[wallSens] plan type analysis:', {
+    darkRatio: darkRatio.toFixed(3),
+    lightRatio: lightRatio.toFixed(3),
+    midRatio: midRatio.toFixed(3),
+    isThinLines,
+  })
+
+  // ── Утолщение тонких линий (морфологическое закрытие) ──
+  let processedGray = gray
+  if (isThinLines) {
+    console.log('[wallSens] detected thin-line plan, applying line thickening')
+    
+    // Дилатация на grayscale: берём минимум в окрестности (затемняем линии)
+    // Это утолщает тёмные линии
+    let dilated = new Uint8Array(gray)
+    for (let pass = 0; pass < 2; pass++) {
+      const temp = new Uint8Array(W * H)
+      for (let y = 1; y < H - 1; y++) {
+        const off = y * W
+        for (let x = 1; x < W - 1; x++) {
+          const i = off + x
+          // Берём минимум в окрестности 3x3 (затемняем)
+          temp[i] = Math.min(
+            dilated[i], dilated[i-1], dilated[i+1],
+            dilated[i-W], dilated[i+W],
+            dilated[i-W-1], dilated[i-W+1],
+            dilated[i+W-1], dilated[i+W+1]
+          )
+        }
+      }
+      dilated = temp
+    }
+    
+    processedGray = dilated
+    console.log('[wallSens] line thickening complete')
+  }
+
   // ── Multi-level threshold ──────────────────────────────
   // Run three passes to catch rooms with different wall darkness:
   // 1. Global Otsu (main structure)
   // 2. Slightly lower threshold (semi-dark boundaries)
   // 3. Even lower for very light walls (dashed lines, thin walls)
-  const T_otsu   = otsu(gray)
-  const T_global = opts.threshold != null ? opts.threshold : T_otsu
+  const T_otsu   = otsu(processedGray)
+  
+  // УЛУЧШЕНИЕ: Умный выбор порога на основе статистики
+  // Otsu часто даёт слишком низкий или слишком высокий порог.
+  // Эмпирически лучший диапазон: 150-220 для большинства планов.
+  let T_smart = T_otsu
+  
+  // Если Otsu вне оптимального диапазона, корректируем
+  if (T_otsu < 120) {
+    // Слишком тёмный порог → много шума будет считаться стенами
+    T_smart = Math.max(T_otsu, 140)
+    console.log(`[wallSens] Otsu too low (${T_otsu}), adjusted to ${T_smart}`)
+  } else if (T_otsu > 230) {
+    // Слишком светлый порог → потеряем тонкие стены
+    T_smart = Math.min(T_otsu, 210)
+    console.log(`[wallSens] Otsu too high (${T_otsu}), adjusted to ${T_smart}`)
+  }
+  
+  // Для планов с тонкими линиями часто нужен более высокий порог
+  if (isThinLines && T_smart < 160) {
+    T_smart = Math.max(T_smart, 170)
+    console.log(`[wallSens] thin-line plan, threshold raised to ${T_smart}`)
+  }
+  
+  const T_global = opts.threshold != null ? opts.threshold : T_smart
   // Second threshold slightly lower catches semi-dark boundaries
   const T_loose  = Math.max(T_global - 30, 80)
   // Third threshold for very light walls
@@ -1633,22 +1710,23 @@ async function detectRoomsLocal(imageEl, opts) {
   // Binary pass 1: strict (main structure)
   const binStrict = new Uint8Array(W * H)
   let strictBgCount = 0
-  for (let i = 0; i < gray.length; i++) { binStrict[i] = gray[i] > T_global ? 1 : 0; if (binStrict[i]) strictBgCount++ }
+  for (let i = 0; i < processedGray.length; i++) { binStrict[i] = processedGray[i] > T_global ? 1 : 0; if (binStrict[i]) strictBgCount++ }
 
   // Binary pass 2: loose (small rooms inside thick walls)
   const binLoose = new Uint8Array(W * H)
   let looseBgCount = 0
-  for (let i = 0; i < gray.length; i++) { binLoose[i] = gray[i] > T_loose ? 1 : 0; if (binLoose[i]) looseBgCount++ }
+  for (let i = 0; i < processedGray.length; i++) { binLoose[i] = processedGray[i] > T_loose ? 1 : 0; if (binLoose[i]) looseBgCount++ }
 
   // Binary pass 3: very loose (very light walls)
   const binVeryLoose = new Uint8Array(W * H)
   let veryLooseBgCount = 0
-  for (let i = 0; i < gray.length; i++) { binVeryLoose[i] = gray[i] > T_veryLoose ? 1 : 0; if (binVeryLoose[i]) veryLooseBgCount++ }
+  for (let i = 0; i < processedGray.length; i++) { binVeryLoose[i] = processedGray[i] > T_veryLoose ? 1 : 0; if (binVeryLoose[i]) veryLooseBgCount++ }
 
   console.log('[wallSens] image:', { W0, H0, scaledW: W, scaledH: H, scale: scale.toFixed(3) })
   console.log('[wallSens] threshold:', {
     optsThreshold: opts.threshold,
     T_otsu,
+    T_smart,
     T_global,
     T_loose,
     T_veryLoose,
@@ -1658,8 +1736,10 @@ async function detectRoomsLocal(imageEl, opts) {
   })
 
   // Erode to thicken walls on all three
+  // Для планов с тонкими линиями нужно больше проходов эрозии
+  const erodeCount = isThinLines ? Math.max(opts.dilateK, 2) : opts.dilateK
   let bin1 = binStrict, bin2 = binLoose, bin3 = binVeryLoose
-  for (let i = 0; i < opts.dilateK; i++) { 
+  for (let i = 0; i < erodeCount; i++) { 
     bin1 = erode4(bin1, W, H)
     bin2 = erode4(bin2, W, H)
     bin3 = erode4(bin3, W, H)
@@ -1667,6 +1747,14 @@ async function detectRoomsLocal(imageEl, opts) {
   // Extra erode pass on loose passes to ensure walls are solid
   bin2 = erode4(bin2, W, H)
   bin3 = erode4(erode4(bin3, W, H), W, H)  // два дополнительных прохода для очень светлых стен
+  
+  // Для планов с тонкими линиями добавляем ещё проходы
+  if (isThinLines) {
+    bin1 = erode4(bin1, W, H)
+    bin2 = erode4(bin2, W, H)
+    bin3 = erode4(bin3, W, H)
+    console.log('[wallSens] applied extra erosion for thin-line plan')
+  }
 
   // ── Connected components ────────────────────────────────
   function floodFill(bin) {
@@ -1913,7 +2001,215 @@ async function detectRoomsLocal(imageEl, opts) {
   const beforePost = rooms.length
   const finalRooms = postProcessRooms(rooms)
   console.log('[wallSens] postProcess:', { before: beforePost, after: finalRooms.length, removed: beforePost - finalRooms.length })
+  
+  // ── АЛЬТЕРНАТИВНЫЙ МЕТОД: если ничего не найдено или принудительно включён ───────
+  const useAltMethodCheckbox = document.getElementById('useAltMethod')
+  const forceAltMethod = useAltMethodCheckbox && useAltMethodCheckbox.checked
+  
+  if (finalRooms.length === 0 || forceAltMethod) {
+    if (forceAltMethod) {
+      console.log('[wallSens] alternative method forced by user')
+    } else {
+      console.log('[wallSens] standard method failed, trying alternative: find whole layout + split by walls')
+    }
+    
+    const altRooms = await detectRoomsAlternative(processedGray, W, H, opts, scale)
+    if (altRooms.length > 0) {
+      console.log('[wallSens] alternative method found:', altRooms.length, 'rooms')
+      return altRooms
+    }
+  }
+  
   return finalRooms
+}
+
+// ── АЛЬТЕРНАТИВНЫЙ МЕТОД: поиск планировки + разделение по стенам ──
+async function detectRoomsAlternative(gray, W, H, opts, scale) {
+  console.log('[altMethod] starting alternative detection')
+  
+  // Шаг 1: Найти всю планировку целиком (самая большая белая область)
+  // Используем более низкий порог, чтобы захватить всё
+  const T_low = 180  // высокий порог = только очень светлые области
+  const binWhole = new Uint8Array(W * H)
+  for (let i = 0; i < gray.length; i++) {
+    binWhole[i] = gray[i] > T_low ? 1 : 0
+  }
+  
+  // Flood fill для поиска всех белых областей
+  const labels = new Int32Array(W * H)
+  const regions = []
+  let nextLabel = 1
+  const stack = new Int32Array(W * H)
+  
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const idx = y * W + x
+      if (binWhole[idx] !== 1 || labels[idx] !== 0) continue
+      
+      let minX = x, maxX = x, minY = y, maxY = y, area = 0
+      let touchesBorder = false
+      let sp = 0
+      stack[sp++] = idx
+      labels[idx] = nextLabel
+      
+      while (sp > 0) {
+        const p = stack[--sp]
+        const py = (p / W) | 0
+        const px = p - py * W
+        area++
+        if (px < minX) minX = px; if (px > maxX) maxX = px
+        if (py < minY) minY = py; if (py > maxY) maxY = py
+        if (px === 0 || py === 0 || px === W - 1 || py === H - 1) touchesBorder = true
+        
+        if (px > 0)     { const n = p-1; if (binWhole[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
+        if (px < W - 1) { const n = p+1; if (binWhole[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
+        if (py > 0)     { const n = p-W; if (binWhole[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
+        if (py < H - 1) { const n = p+W; if (binWhole[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
+      }
+      
+      regions.push({ label: nextLabel, minX, maxX, minY, maxY, area, touchesBorder })
+      nextLabel++
+    }
+  }
+  
+  console.log('[altMethod] found', regions.length, 'white regions')
+  
+  // Находим самую большую область (это должна быть вся планировка)
+  if (regions.length === 0) return []
+  
+  const layoutRegion = regions.reduce((max, r) => r.area > max.area ? r : max, regions[0])
+  console.log('[altMethod] layout region:', {
+    area: layoutRegion.area,
+    bbox: `${layoutRegion.maxX - layoutRegion.minX}x${layoutRegion.maxY - layoutRegion.minY}`,
+    areaFrac: (layoutRegion.area / (W * H)).toFixed(3)
+  })
+  
+  // Шаг 2: Внутри планировки ищем тёмные линии (стены)
+  // Создаём маску только для области планировки
+  const layoutMask = new Uint8Array(W * H)
+  for (let i = 0; i < labels.length; i++) {
+    if (labels[i] === layoutRegion.label) layoutMask[i] = 1
+  }
+  
+  // Ищем тёмные пиксели внутри планировки (стены)
+  const T_walls = 120  // порог для стен (тёмные линии)
+  const walls = new Uint8Array(W * H)
+  for (let i = 0; i < gray.length; i++) {
+    if (layoutMask[i] === 1 && gray[i] < T_walls) {
+      walls[i] = 1  // это стена
+    }
+  }
+  
+  // Утолщаем стены (дилатация)
+  let thickWalls = walls
+  for (let pass = 0; pass < 2; pass++) {
+    const temp = new Uint8Array(W * H)
+    for (let y = 1; y < H - 1; y++) {
+      const off = y * W
+      for (let x = 1; x < W - 1; x++) {
+        const i = off + x
+        temp[i] = (thickWalls[i] || thickWalls[i-1] || thickWalls[i+1] || 
+                   thickWalls[i-W] || thickWalls[i+W]) ? 1 : 0
+      }
+    }
+    thickWalls = temp
+  }
+  
+  console.log('[altMethod] walls thickened')
+  
+  // Шаг 3: Инвертируем — теперь стены = 0, помещения = 1
+  const roomsArea = new Uint8Array(W * H)
+  for (let i = 0; i < W * H; i++) {
+    if (layoutMask[i] === 1 && thickWalls[i] === 0) {
+      roomsArea[i] = 1
+    }
+  }
+  
+  // Шаг 4: Flood fill для поиска отдельных помещений
+  const roomLabels = new Int32Array(W * H)
+  const roomRegions = []
+  let roomLabel = 1
+  
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const idx = y * W + x
+      if (roomsArea[idx] !== 1 || roomLabels[idx] !== 0) continue
+      
+      let minX = x, maxX = x, minY = y, maxY = y, area = 0
+      let sp = 0
+      stack[sp++] = idx
+      roomLabels[idx] = roomLabel
+      
+      while (sp > 0) {
+        const p = stack[--sp]
+        const py = (p / W) | 0
+        const px = p - py * W
+        area++
+        if (px < minX) minX = px; if (px > maxX) maxX = px
+        if (py < minY) minY = py; if (py > maxY) maxY = py
+        
+        if (px > 0)     { const n = p-1; if (roomsArea[n]===1 && roomLabels[n]===0) { roomLabels[n]=roomLabel; stack[sp++]=n } }
+        if (px < W - 1) { const n = p+1; if (roomsArea[n]===1 && roomLabels[n]===0) { roomLabels[n]=roomLabel; stack[sp++]=n } }
+        if (py > 0)     { const n = p-W; if (roomsArea[n]===1 && roomLabels[n]===0) { roomLabels[n]=roomLabel; stack[sp++]=n } }
+        if (py < H - 1) { const n = p+W; if (roomsArea[n]===1 && roomLabels[n]===0) { roomLabels[n]=roomLabel; stack[sp++]=n } }
+      }
+      
+      roomRegions.push({ label: roomLabel, minX, maxX, minY, maxY, area })
+      roomLabel++
+    }
+  }
+  
+  console.log('[altMethod] found', roomRegions.length, 'room candidates')
+  
+  // Шаг 5: Фильтрация
+  const total = W * H
+  const minArea = total * (opts.minAreaFrac || 0.0015)
+  const maxArea = total * 0.50
+  
+  const filtered = roomRegions.filter(r => {
+    // Минимальная/максимальная площадь
+    if (r.area < minArea || r.area > maxArea) return false
+    
+    // НОВОЕ: Убираем узкие коридоры (соотношение сторон > 1:5)
+    const w = r.maxX - r.minX + 1
+    const h = r.maxY - r.minY + 1
+    const aspectRatio = Math.max(w / h, h / w)
+    if (aspectRatio > 5) {
+      console.log('[altMethod] rejected corridor:', { w, h, aspectRatio: aspectRatio.toFixed(1) })
+      return false
+    }
+    
+    // Проверка заполнения bbox
+    const bboxArea = w * h
+    const fillRatio = r.area / bboxArea
+    if (fillRatio < 0.20) return false
+    
+    return true
+  })
+  
+  console.log('[altMethod] after filtering:', filtered.length, 'rooms')
+  
+  // Шаг 6: Построение полигонов
+  const inv = 1 / scale
+  const rooms = []
+  
+  for (let i = 0; i < filtered.length; i++) {
+    const r = filtered[i]
+    const poly = traceContour(roomLabels, r.label, W, H, r)
+    if (poly.length < 4) continue
+    const simp = rdp(poly, opts.epsilon || 2)
+    if (simp.length < 3) continue
+    
+    rooms.push({
+      id:      `r${i + 1}`,
+      label:   `Помещение ${i + 1}`,
+      areaPx:  Math.round(r.area * inv * inv),
+      polygon: simp.map(([x, y]) => [Math.round(x * inv), Math.round(y * inv)]),
+    })
+  }
+  
+  console.log('[altMethod] built', rooms.length, 'room polygons')
+  return postProcessRooms(rooms)
 }
 
 // ── postProcessRooms ────────────────────────────────────────
@@ -2228,6 +2524,19 @@ function erode4(bin, W, H) {
     for (let x = 1; x < W - 1; x++) {
       const i = off + x
       out[i] = (bin[i] && bin[i-1] && bin[i+1] && bin[i-W] && bin[i+W]) ? 1 : 0
+    }
+  }
+  return out
+}
+
+// 4-connected dilation of value=1 (expands white regions)
+function dilate4(bin, W, H) {
+  const out = new Uint8Array(bin.length)
+  for (let y = 1; y < H - 1; y++) {
+    const off = y * W
+    for (let x = 1; x < W - 1; x++) {
+      const i = off + x
+      out[i] = (bin[i] || bin[i-1] || bin[i+1] || bin[i-W] || bin[i+W]) ? 1 : 0
     }
   }
   return out
