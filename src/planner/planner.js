@@ -64,6 +64,7 @@ const DRAW_ROOM_STROKE = 'rgba(0,100,220,0.55)'
 const canvas            = document.getElementById('planCanvas')
 const ctx               = canvas.getContext('2d')
 const planSVG           = document.getElementById('planSVG')
+const canvasGroup       = document.getElementById('canvasGroup')
 const dropzone          = document.getElementById('dropzone')
 const previewThumb      = document.getElementById('previewThumb')
 const previewImg        = document.getElementById('previewImg')
@@ -188,8 +189,7 @@ function loadFile(filePath) {
       eraserStrokes = []
       resizeCanvas(img)
       drawPlan()
-      canvas.style.display = 'block'
-      planSVG.style.display = 'block'
+      canvasGroup.style.display = 'block'
       canvasPlaceholder.style.display = 'none'
       viewLabel.textContent = 'Нажми «Распознать помещения»'
       resetZoom()
@@ -388,7 +388,7 @@ function clearPlan() {
   _rawPixels = null; _rawWidth = 0; _rawHeight = 0
   if (_rebuildRaf) { cancelAnimationFrame(_rebuildRaf); _rebuildRaf = null }
   previewThumb.style.display = 'none'; dropzone.style.display = 'block'
-  canvas.style.display = 'none'; planSVG.style.display = 'none'; canvasPlaceholder.style.display = 'flex'
+  canvasGroup.style.display = 'none'; canvasPlaceholder.style.display = 'flex'
   analyseBtn.disabled = true
   viewLabel.textContent = 'Загрузи план слева'
   viewAllBtn.style.display = 'none'; viewSelBtn.style.display = 'none'
@@ -443,8 +443,6 @@ function drawPlan() {
   planSVG.setAttribute('viewBox', `0 0 ${cw} ${ch}`)
   planSVG.setAttribute('width',   cw)
   planSVG.setAttribute('height',  ch)
-  planSVG.style.marginLeft = (-cw / 2) + 'px'
-  planSVG.style.marginTop  = (-ch / 2) + 'px'
   planSVG.innerHTML = ''
 
   // ── Room polygons + labels ─────────────────────────────
@@ -1050,28 +1048,48 @@ function applyCrop() {
 
   // cropRect is in CSS px relative to the wrap element.
   // Convert top-left and bottom-right corners to image coords.
+  // These can be negative or exceed image dimensions (crop extends beyond image → white fill).
   const [x0img, y0img] = _wrapPxToImagePx(cropRect.x, cropRect.y)
   const [x1img, y1img] = _wrapPxToImagePx(cropRect.x + cropRect.w, cropRect.y + cropRect.h)
 
   const iw = currentImageEl.naturalWidth
   const ih = currentImageEl.naturalHeight
 
-  const sx = Math.max(0, Math.round(x0img))
-  const sy = Math.max(0, Math.round(y0img))
-  const sw = Math.min(iw - sx, Math.round(x1img - x0img))
-  const sh = Math.min(ih - sy, Math.round(y1img - y0img))
+  // Desired output size in image px (may extend outside [0,0,iw,ih])
+  const outX = Math.round(x0img)   // can be negative
+  const outY = Math.round(y0img)   // can be negative
+  const outW = Math.round(x1img - x0img)
+  const outH = Math.round(y1img - y0img)
 
-  if (sw < 4 || sh < 4) {
+  if (outW < 4 || outH < 4) {
     alert('Область обрезки слишком мала.')
     return
   }
 
-  // Render cropped region from the current BW canvas (or original)
+  // Render: white background, then blit the image only in the overlapping region
   const src = currentImageBW || currentImageEl
   const off = document.createElement('canvas')
-  off.width = sw; off.height = sh
+  off.width = outW; off.height = outH
   const c = off.getContext('2d')
-  c.drawImage(src, sx, sy, sw, sh, 0, 0, sw, sh)
+
+  // White fill (visible where crop extends beyond image)
+  c.fillStyle = '#ffffff'
+  c.fillRect(0, 0, outW, outH)
+
+  // Intersection of crop rect with image rect (in image coords)
+  const clipX = Math.max(0, outX)
+  const clipY = Math.max(0, outY)
+  const clipX2 = Math.min(iw, outX + outW)
+  const clipY2 = Math.min(ih, outY + outH)
+
+  if (clipX2 > clipX && clipY2 > clipY) {
+    // Source rect within image
+    const srcX = clipX, srcY = clipY
+    const srcW = clipX2 - clipX, srcH = clipY2 - clipY
+    // Destination offset within output canvas
+    const dstX = clipX - outX, dstY = clipY - outY
+    c.drawImage(src, srcX, srcY, srcW, srcH, dstX, dstY, srcW, srcH)
+  }
 
   // Commit: replace working image state
   const newImg = new Image()
@@ -1080,26 +1098,25 @@ function applyCrop() {
     currentImageEl = newImg
     currentImageBW = (() => {
       const bw = document.createElement('canvas')
-      bw.width = sw; bw.height = sh
+      bw.width = outW; bw.height = outH
       bw.getContext('2d').drawImage(off, 0, 0)
       return bw
     })()
     // Re-cache raw pixels
-    const tmpCtx = document.createElement('canvas').getContext('2d')
     const tmp = document.createElement('canvas')
-    tmp.width = sw; tmp.height = sh
+    tmp.width = outW; tmp.height = outH
     tmp.getContext('2d').drawImage(newImg, 0, 0)
-    const id = tmp.getContext('2d').getImageData(0, 0, sw, sh)
+    const id = tmp.getContext('2d').getImageData(0, 0, outW, outH)
     _rawPixels = new Uint8ClampedArray(id.data)
-    _rawWidth  = sw; _rawHeight = sh
+    _rawWidth  = outW; _rawHeight = outH
 
     // Shift polygons into cropped coordinate space
     rooms = rooms.map(r => ({
       ...r,
       polygon: r.polygon
         ? r.polygon.map(([px, py]) => [
-            Math.max(0, Math.min(sw, Math.round(px - sx))),
-            Math.max(0, Math.min(sh, Math.round(py - sy))),
+            Math.max(0, Math.min(outW, Math.round(px - outX))),
+            Math.max(0, Math.min(outH, Math.round(py - outY))),
           ])
         : r.polygon,
     }))
@@ -1268,10 +1285,8 @@ function getCanvasXY(e) {
 // ── Zoom helpers ───────────────────────────────────────────
 function applyZoomTransform() {
   const t = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`
-  canvas.style.transform    = t
-  canvas.style.transformOrigin = '50% 50%'
-  planSVG.style.transform   = t
-  planSVG.style.transformOrigin = '50% 50%'
+  canvasGroup.style.transform       = t
+  canvasGroup.style.transformOrigin = '50% 50%'
   updateZoomLabel()
 }
 
@@ -2042,7 +2057,11 @@ document.querySelector('.canvas-wrap').addEventListener('mousedown', e => {
   const isMiddle = e.button === 1
   const isAlt    = e.button === 0 && e.altKey
   const isSpace  = e.button === 0 && _spaceDown
-  if (isMiddle || isAlt || isSpace) {
+  // In view mode, plain left-drag also pans (only when not hitting a room —
+  // the canvas mousedown handler for view-mode room-select fires first and
+  // returns without preventDefault, so the event bubbles here).
+  const isViewDrag = e.button === 0 && editMode === 'view' && !_spaceDown && !e.altKey
+  if (isMiddle || isAlt || isSpace || isViewDrag) {
     e.preventDefault()
     isPanning = true
     panStart = { x: e.clientX, y: e.clientY, panX, panY }
@@ -2053,6 +2072,7 @@ window.addEventListener('mousemove', e => {
   if (!isPanning || !panStart) return
   panX = panStart.panX + (e.clientX - panStart.x)
   panY = panStart.panY + (e.clientY - panStart.y)
+  panStart._moved = true
   applyZoomTransform()
 })
 window.addEventListener('mouseup', e => {
