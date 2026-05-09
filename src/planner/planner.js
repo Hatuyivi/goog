@@ -97,10 +97,10 @@ const vDil = document.getElementById('vDil')
 const vMin = document.getElementById('vMin')
 const vEps = document.getElementById('vEps')
 
-paramThreshold.oninput = () => vThr.textContent = paramThreshold.value === '0' ? 'авто' : paramThreshold.value
-paramDilate   .oninput = () => vDil.textContent = `${paramDilate.value} px`
-paramMinArea  .oninput = () => vMin.textContent = `${(Number(paramMinArea.value)/10).toFixed(2)}%`
-paramEpsilon  .oninput = () => vEps.textContent = `${paramEpsilon.value} px`
+if (paramThreshold) paramThreshold.oninput = () => { if (vThr) vThr.textContent = paramThreshold.value === '0' ? 'авто' : paramThreshold.value }
+if (paramDilate)    paramDilate   .oninput = () => { if (vDil) vDil.textContent = `${paramDilate.value} px` }
+if (paramMinArea)   paramMinArea  .oninput = () => { if (vMin) vMin.textContent = `${(Number(paramMinArea.value)/10).toFixed(2)}%` }
+if (paramEpsilon)   paramEpsilon  .oninput = () => { if (vEps) vEps.textContent = `${paramEpsilon.value} px` }
 
 // ── Init ───────────────────────────────────────────────────
 async function init() {
@@ -751,10 +751,10 @@ async function analyseLocal() {
   setProgressStep('Подготовка изображения')
   await tick()
 
-  const tManual = Number(paramThreshold.value)         // 0 = auto (Otsu)
-  const dilateK = Number(paramDilate.value)            // 0..5
-  const minPct  = Number(paramMinArea.value) / 1000    // /10 -> percent then /100 -> fraction
-  const epsilon = Number(paramEpsilon.value)           // px in display scale
+  const tManual = paramThreshold ? Number(paramThreshold.value) : 0          // 0 = auto (Otsu)
+  const dilateK = paramDilate    ? Number(paramDilate.value)    : 0          // 0..5
+  const minPct  = paramMinArea   ? Number(paramMinArea.value) / 1000 : 0.002 // fraction
+  const epsilon = paramEpsilon   ? Number(paramEpsilon.value)   : 3          // px
 
   setProgressStep('Поиск стен и помещений…')
   await tick()
