@@ -11,8 +11,7 @@ const path = require('path')
 let currentImageB64  = null
 let currentMime      = 'image/jpeg'
 let currentImageEl   = null
-let currentImageBW   = null   // offscreen B&W canvas (BW mix applied)
-let currentImageColor = null   // offscreen colour-adjusted canvas
+let currentImageBW   = null   // offscreen B&W canvas (for export)
 let rooms            = []
 let originalRooms    = []     // snapshot at recognition time — for training diff
 let selectedRoomId   = null   // single highlighted room (click)
@@ -27,14 +26,10 @@ let hoverState       = null     // { roomId, ptIdx, edgeIdx } — what cursor is
 let hasUnsavedEdits  = false
 let trainingCount    = 0        // cached count of saved training samples
 
-// ── Wall detection state ────────────────────────────────────
-let _analyseRunCount = 0   // increments per recognition run; drives valley→k-means switch
-
 // ── Undo history ───────────────────────────────────────────
 const MAX_UNDO       = 30
 let undoStack        = []       // each entry: deep copy of rooms array
 let showPolygons     = true     // toggle polygon visibility in app
-let showBWBackground = false    // false = colour-adjusted view; true = full B&W conversion
 
 // ── Eraser state ───────────────────────────────────────────
 let eraserStrokes    = []       // array of strokes; each stroke = array of {x,y,r} in image coords
@@ -48,9 +43,9 @@ let panX             = 0        // pan offset in screen px
 let panY             = 0        // pan offset in screen px
 let isPanning        = false    // is user currently panning (middle-btn drag)
 let panStart         = null     // {x, y, panX, panY}
-const ZOOM_MIN       = 0.1
-const ZOOM_MAX       = 12.0
-const ZOOM_STEP      = 0.12
+const ZOOM_MIN       = 0.5
+const ZOOM_MAX       = 8.0
+const ZOOM_STEP      = 0.15
 
 // ── Room drawing state ──────────────────────────────────────
 // Users can draw rectangular rooms manually on the canvas.
@@ -94,14 +89,18 @@ const undoBtn           = document.getElementById('undoBtn')
 const trainingBadge     = document.getElementById('trainingBadge')
 
 const paramThreshold = document.getElementById('paramThreshold')
-const paramEpsilon   = document.getElementById('paramEpsilon')
 const paramDilate    = document.getElementById('paramDilate')
 const paramMinArea   = document.getElementById('paramMinArea')
+const paramEpsilon   = document.getElementById('paramEpsilon')
 const vThr = document.getElementById('vThr')
+const vDil = document.getElementById('vDil')
+const vMin = document.getElementById('vMin')
 const vEps = document.getElementById('vEps')
 
-if (paramThreshold) paramThreshold.oninput = () => { if (vThr) vThr.textContent = paramThreshold.value === '0' ? 'авто' : paramThreshold.value }
-if (paramEpsilon)   paramEpsilon.oninput   = () => { if (vEps) vEps.textContent = `${paramEpsilon.value} px` }
+paramThreshold.oninput = () => vThr.textContent = paramThreshold.value === '0' ? 'авто' : paramThreshold.value
+paramDilate   .oninput = () => vDil.textContent = `${paramDilate.value} px`
+paramMinArea  .oninput = () => vMin.textContent = `${(Number(paramMinArea.value)/10).toFixed(2)}%`
+paramEpsilon  .oninput = () => vEps.textContent = `${paramEpsilon.value} px`
 
 // ── Init ───────────────────────────────────────────────────
 async function init() {
@@ -224,14 +223,7 @@ function makeBWCanvas(img) {
   _rawWidth  = off.width
   _rawHeight = off.height
 
-  applyColorAdjustments(imageData.data)
-  // Build colour-adjusted canvas
-  const colOff = document.createElement('canvas')
-  colOff.width = off.width; colOff.height = off.height
-  colOff.getContext('2d').putImageData(imageData, 0, 0)
-  currentImageColor = colOff
-  // Build BW canvas (colour adjustments + BW mix)
-  applyBWConversion(imageData.data)
+  applyBWProcessing(imageData.data)
   c.putImageData(imageData, 0, 0)
   return off
 }
@@ -259,17 +251,7 @@ function _doRebuildBWCanvas() {
 
   // Work on a copy of raw pixels — no getImageData round-trip
   const data = new Uint8ClampedArray(_rawPixels)
-  applyColorAdjustments(data)          // always: Основные sliders
-  // Rebuild colour-adjusted canvas
-  if (!currentImageColor) { currentImageColor = document.createElement('canvas'); currentImageColor.width = _rawWidth; currentImageColor.height = _rawHeight }
-  currentImageColor.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(data), _rawWidth, _rawHeight), 0, 0)
-  // Re-apply eraser strokes on colour canvas too
-  if (eraserStrokes.length) {
-    const cc = currentImageColor.getContext('2d')
-    cc.fillStyle = '#ffffff'
-    for (const stroke of eraserStrokes) for (const pt of stroke) { cc.beginPath(); cc.arc(pt.x, pt.y, pt.r, 0, Math.PI*2); cc.fill() }
-  }
-  applyBWConversion(data)              // Смешение ч/б sliders baked into BW canvas
+  applyBWProcessing(data)
 
   const imageData = new ImageData(data, _rawWidth, _rawHeight)
   c.putImageData(imageData, 0, 0)
@@ -289,10 +271,7 @@ function _doRebuildBWCanvas() {
   drawPlan()
 }
 
-// ── Stage 1: colour adjustments (Основные sliders) ────────
-// Applies exposure, contrast, tone ranges, saturation, clarity to colour data.
-// Output stays colour — used for display in colour mode and as input for BW conversion.
-function applyColorAdjustments(d) {
+function applyBWProcessing(d) {
   const expMult = Math.pow(2, basicAdj.exposure * 0.04)
   const contr   = basicAdj.contrast   / 100
   const hi      = basicAdj.highlights / 200
@@ -304,9 +283,35 @@ function applyColorAdjustments(d) {
   const clar    = basicAdj.clarity    / 100
   const deh     = basicAdj.dehaze     / 100
 
+  // Pre-compute BW mix stop table once per call
+  const mx = bwMix
+  const stops = [
+    { h:   0, v: mx.red      / 200 },
+    { h:  30, v: mx.orange   / 200 },
+    { h:  60, v: mx.yellow   / 200 },
+    { h: 120, v: mx.green    / 200 },
+    { h: 180, v: mx.aqua     / 200 },
+    { h: 240, v: mx.blue     / 200 },
+    { h: 280, v: mx.lavender / 200 },
+    { h: 320, v: mx.magenta  / 200 },
+    { h: 360, v: mx.red      / 200 },
+  ]
+
+  // Pre-build a 360-entry hue→mixShift LUT
+  const hueLUT = new Float32Array(361)
+  for (let h = 0; h <= 360; h++) {
+    for (let s = 0; s < stops.length - 1; s++) {
+      if (h >= stops[s].h && h <= stops[s+1].h) {
+        const t = (h - stops[s].h) / (stops[s+1].h - stops[s].h)
+        hueLUT[h] = stops[s].v * (1 - t) + stops[s+1].v * t
+        break
+      }
+    }
+  }
+
   const len = d.length
   for (let i = 0; i < len; i += 4) {
-    let r = d[i]   * 0.003921569
+    let r = d[i] * 0.003921569   // / 255
     let g = d[i+1] * 0.003921569
     let b = d[i+2] * 0.003921569
 
@@ -329,69 +334,7 @@ function applyColorAdjustments(d) {
       if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0
     }
 
-    // Tone adjustments via luminance (preserves colour)
-    let lum = 0.299*r + 0.587*g + 0.114*b
-    let lumNew = lum
-
-    if (contr !== 0) lumNew += contr * (lumNew - 0.5) * (1 - Math.abs(lumNew - 0.5)) * 2
-    if (hi !== 0 && lumNew > 0.5)  lumNew += hi * (lumNew - 0.5) * 2
-    if (sh !== 0 && lumNew <= 0.5) lumNew += sh * (0.5 - lumNew) * 2
-    if (wh !== 0 && lumNew > 0.85) lumNew += wh * (lumNew - 0.85) / 0.15
-    if (bl !== 0 && lumNew < 0.15) lumNew -= bl * (0.15 - lumNew) / 0.15
-    if (clar !== 0) {
-      const sign = lumNew > 0.5 ? 1 : -1
-      lumNew += clar * sign * Math.pow(Math.abs(lumNew - 0.5), 0.7) * 0.3
-    }
-    if (lumNew < 0) lumNew = 0; else if (lumNew > 1) lumNew = 1
-
-    if (lum > 0.001) {
-      const scale = lumNew / lum
-      r = Math.min(1, r * scale)
-      g = Math.min(1, g * scale)
-      b = Math.min(1, b * scale)
-    } else {
-      r = lumNew; g = lumNew; b = lumNew
-    }
-
-    d[i]   = r * 255 + 0.5 | 0
-    d[i+1] = g * 255 + 0.5 | 0
-    d[i+2] = b * 255 + 0.5 | 0
-  }
-}
-
-// ── Stage 2: BW conversion (Смешение Ч/Б sliders) ─────────
-// Converts colour-adjusted data to grayscale using hue-weighted BW mix.
-// Only called when the B&W toggle is ON.
-function applyBWConversion(d) {
-  const mx = bwMix
-  const stops = [
-    { h:   0, v: mx.red      / 200 },
-    { h:  30, v: mx.orange   / 200 },
-    { h:  60, v: mx.yellow   / 200 },
-    { h: 120, v: mx.green    / 200 },
-    { h: 180, v: mx.aqua     / 200 },
-    { h: 240, v: mx.blue     / 200 },
-    { h: 280, v: mx.lavender / 200 },
-    { h: 320, v: mx.magenta  / 200 },
-    { h: 360, v: mx.red      / 200 },
-  ]
-  const hueLUT = new Float32Array(361)
-  for (let h = 0; h <= 360; h++) {
-    for (let s = 0; s < stops.length - 1; s++) {
-      if (h >= stops[s].h && h <= stops[s+1].h) {
-        const t = (h - stops[s].h) / (stops[s+1].h - stops[s].h)
-        hueLUT[h] = stops[s].v * (1 - t) + stops[s+1].v * t
-        break
-      }
-    }
-  }
-
-  const len = d.length
-  for (let i = 0; i < len; i += 4) {
-    const r = d[i]   * 0.003921569
-    const g = d[i+1] * 0.003921569
-    const b = d[i+2] * 0.003921569
-
+    // Hue & saturation for BW mix (fast path: skip if unsaturated)
     let mixShift = 0
     const cMax = r > g ? (r > b ? r : b) : (g > b ? g : b)
     const cMin = r < g ? (r < b ? r : b) : (g < b ? g : b)
@@ -402,20 +345,33 @@ function applyBWConversion(d) {
       else if (cMax === g) hue = 60 * ((b - r) / delta + 2)
       else                 hue = 60 * ((r - g) / delta + 4)
       if (hue < 0) hue += 360
-      mixShift = hueLUT[Math.round(hue)] * (delta / cMax)
+      const satLevel = delta / cMax
+      mixShift = hueLUT[Math.round(hue)] * satLevel
     }
 
+    // BW conversion
     let gray = 0.299*r + 0.587*g + 0.114*b + mixShift
+    if (gray < 0) gray = 0; else if (gray > 1) gray = 1
+
+    // Contrast S-curve
+    if (contr !== 0) gray += contr * (gray - 0.5) * (1 - Math.abs(gray - 0.5)) * 2
+
+    // Tone ranges
+    if (hi !== 0 && gray > 0.5)  gray += hi * (gray - 0.5) * 2
+    if (sh !== 0 && gray <= 0.5) gray += sh * (0.5 - gray) * 2
+    if (wh !== 0 && gray > 0.85) gray += wh * (gray - 0.85) / 0.15
+    if (bl !== 0 && gray < 0.15) gray -= bl * (0.15 - gray) / 0.15
+
+    // Clarity
+    if (clar !== 0) {
+      const sign = gray > 0.5 ? 1 : -1
+      gray += clar * sign * Math.pow(Math.abs(gray - 0.5), 0.7) * 0.3
+    }
+
     if (gray < 0) gray = 0; else if (gray > 1) gray = 1
     const v = gray * 255 + 0.5 | 0
     d[i] = d[i+1] = d[i+2] = v
   }
-}
-
-// Full pipeline used by local recognition (always needs grayscale)
-function applyBWProcessing(d) {
-  applyColorAdjustments(d)
-  applyBWConversion(d)
 }
 
 function resizeCanvas(img) {
@@ -426,7 +382,7 @@ function resizeCanvas(img) {
 }
 
 function clearPlan() {
-  currentImageB64 = null; currentImageEl = null; currentImageBW = null; currentImageColor = null
+  currentImageB64 = null; currentImageEl = null; currentImageBW = null
   _rawPixels = null; _rawWidth = 0; _rawHeight = 0
   if (_rebuildRaf) { cancelAnimationFrame(_rebuildRaf); _rebuildRaf = null }
   previewThumb.style.display = 'none'; dropzone.style.display = 'block'
@@ -444,9 +400,6 @@ function clearResults() {
   undoStack = []
   if (undoBtn) undoBtn.disabled = true
   eraserStrokes = []; eraserActive = false
-  _analyseRunCount = 0   // reset method choice for new image
-  const wib = document.getElementById('wallInfoBox')
-  if (wib) wib.style.display = 'none'
   saveBar.classList.remove('visible')
   editToolbar.classList.remove('visible')
   roomsTitle.style.display = 'none'; roomsDivider.style.display = 'none'
@@ -462,26 +415,12 @@ function drawPlan() {
   const sx = canvas.width  / currentImageEl.naturalWidth
   const sy = canvas.height / currentImageEl.naturalHeight
 
-  // Colour mode: draw original (currentImageBW has BW mix baked in — not suitable for colour)
-  // B&W mode: draw currentImageBW which has colour adjustments + BW mix sliders applied
-  ctx.save()
-  const srcImg = showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl)
-  ctx.drawImage(srcImg, 0, 0, canvas.width, canvas.height)
-
-  // Overlay eraser strokes as white
-  if (eraserStrokes.length) {
-    ctx.fillStyle = '#ffffff'
-    for (const stroke of eraserStrokes) {
-      for (const pt of stroke) {
-        ctx.beginPath()
-        ctx.arc(pt.x * sx, pt.y * sy, pt.r * sx, 0, Math.PI * 2)
-        ctx.fill()
-      }
-    }
+  if (rooms.length && currentImageBW) {
+    ctx.drawImage(currentImageBW, 0, 0, canvas.width, canvas.height)
+  } else {
+    ctx.drawImage(currentImageEl, 0, 0, canvas.width, canvas.height)
+    return
   }
-  ctx.restore()
-
-  if (!rooms.length) return
 
   rooms.forEach(room => {
     if (!showPolygons) return
@@ -504,18 +443,16 @@ function drawPlan() {
 
     ctx.globalAlpha = 1
     ctx.strokeStyle = isSelected ? 'rgba(30,120,60,0.95)' : isChecked ? 'rgba(0,100,220,0.85)' : STROKE_COLOR
-    // Обводка и шрифт делятся на zoomLevel — остаются постоянными на экране
-    const iz = 1 / zoomLevel
-    ctx.lineWidth   = (isSelected ? 3 : isChecked ? 2.5 : STROKE_WIDTH) * iz
+    ctx.lineWidth   = isSelected ? 3 : isChecked ? 2.5 : STROKE_WIDTH
     ctx.stroke()
 
     // label
     const cx = pts.reduce((s,p)=>s+p[0],0) / pts.length
     const cy = pts.reduce((s,p)=>s+p[1],0) / pts.length
-    const fontSize = Math.max(11, Math.min(16, Math.round(canvas.width / 80))) * iz
+    const fontSize = Math.max(11, Math.min(16, Math.round(canvas.width / 80)))
     ctx.font = `600 ${fontSize}px -apple-system, sans-serif`
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
-    const tw = ctx.measureText(room.label).width + 10 * iz
+    const tw = ctx.measureText(room.label).width + 10
     ctx.fillStyle = 'rgba(255,255,255,0.92)'
     ctx.fillRect(cx - tw/2, cy - fontSize*0.7, tw, fontSize*1.4)
     ctx.fillStyle = '#1d1d1f'
@@ -529,17 +466,13 @@ function drawPlan() {
       if (currentView === 'selected' && room.id !== selectedRoomId) continue
       const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
 
-      // Точки рисуются в canvas-px, но canvas масштабируется через CSS transform scale(zoomLevel).
-      // Делим радиусы и lineWidth на zoomLevel — точки остаются одного размера на экране.
-      const iz = 1 / zoomLevel
-
       // Draw edge midpoints as faint add-points
       for (let i = 0; i < pts.length; i++) {
         const j = (i+1) % pts.length
         const mx = (pts[i][0]+pts[j][0])/2, my = (pts[i][1]+pts[j][1])/2
         const isHovered = hoverState?.roomId===room.id && hoverState?.edgeIdx===i
         ctx.globalAlpha = isHovered ? 1 : 0.35
-        ctx.beginPath(); ctx.arc(mx, my, (isHovered ? 5 : 3) * iz, 0, Math.PI*2)
+        ctx.beginPath(); ctx.arc(mx, my, isHovered ? 5 : 3, 0, Math.PI*2)
         ctx.fillStyle = '#007aff'; ctx.fill()
       }
 
@@ -549,35 +482,23 @@ function drawPlan() {
         const isDragging = dragState?.roomId===room.id && dragState?.ptIdx===i
         const r = (isHovered || isDragging) ? 7 : 5
         ctx.globalAlpha = 1
-        ctx.beginPath(); ctx.arc(pts[i][0], pts[i][1], r * iz, 0, Math.PI*2)
+        ctx.beginPath(); ctx.arc(pts[i][0], pts[i][1], r, 0, Math.PI*2)
         ctx.fillStyle = isDragging ? '#ff9500' : isHovered ? '#ff3b30' : '#fff'
         ctx.fill()
         ctx.strokeStyle = isDragging ? '#ff6a00' : isHovered ? '#cc1000' : 'rgba(30,120,60,0.9)'
-        ctx.lineWidth = 2 * iz; ctx.stroke()
+        ctx.lineWidth = 2; ctx.stroke()
       }
     }
   }
 
   ctx.globalAlpha = 1
 
-  // Draw in-progress room rectangle (draw mode or rescan zone)
+  // Draw in-progress room rectangle (draw mode)
   if (roomDraw) {
     const csx = canvas.width  / currentImageEl.naturalWidth
     const csy = canvas.height / currentImageEl.naturalHeight
     const x0 = roomDraw.x0 * csx, y0 = roomDraw.y0 * csy
     const x1 = roomDraw.x1 * csx, y1 = roomDraw.y1 * csy
-    if (editMode === 'rescan') {
-      const iz = 1 / zoomLevel
-      ctx.save()
-      ctx.strokeStyle = '#007aff'
-      ctx.lineWidth   = 2 * iz
-      ctx.setLineDash([6 * iz, 4 * iz])
-      ctx.strokeRect(Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0))
-      ctx.fillStyle = 'rgba(0,122,255,0.08)'
-      ctx.fillRect(Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0))
-      ctx.restore()
-      return
-    }
     ctx.globalAlpha = 1
     ctx.fillStyle = DRAW_ROOM_COLOR
     ctx.fillRect(Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0))
@@ -745,15 +666,16 @@ async function analyseAI() {
 // диапазоны нормализованной площади (доля от площади изображения),
 // которые стоит сохранять или отбрасывать.
 function computeLocalLearning(trainingData) {
-  // Берём только локальные образцы
+  // Берём только локальные образцы (обратная совместимость: mode отсутствует → тоже считаем local)
   const localSamples = trainingData.filter(s => !s.mode || s.mode === 'local')
   if (!localSamples.length) return null
 
-  const keptFracs    = []
-  const deletedFracs = []
-  const addedFracs   = []
+  const keptFracs    = []   // нормализованные площади оставленных комнат
+  const deletedFracs = []   // нормализованные площади удалённых комнат
+  const addedFracs   = []   // нормализованные площади добавленных пользователем комнат
 
   for (const sample of localSamples) {
+    // imageHash формат: "WxH_<первые 80 символов b64>"
     const m = (sample.imageHash || '').match(/^(\d+)x(\d+)_/)
     if (!m) continue
     const imgArea = Number(m[1]) * Number(m[2])
@@ -769,8 +691,11 @@ function computeLocalLearning(trainingData) {
       else                       keptFracs.push(frac)
     }
 
+    // Добавленные пользователем помещения — явный позитивный сигнал:
+    // пользователь счёл нужным нарисовать именно такой размер → расширяем диапазон
     for (const r of (sample.edited || [])) {
-      if (!addedSet.has(r.id) || typeof r.areaPx !== 'number') continue
+      if (!addedSet.has(r.id)) continue
+      if (typeof r.areaPx !== 'number') continue
       const frac = r.areaPx / imgArea
       addedFracs.push(frac)
       keptFracs.push(frac)   // тоже входит в «правильный» диапазон
@@ -826,10 +751,10 @@ async function analyseLocal() {
   setProgressStep('Подготовка изображения')
   await tick()
 
-  const tManual = paramThreshold ? Number(paramThreshold.value) : 0
-  const dilateK = paramDilate    ? Number(paramDilate.value)    : 2
-  const minPct  = paramMinArea   ? Number(paramMinArea.value) / 1000 : 0.005
-  const epsilon = paramEpsilon   ? Number(paramEpsilon.value)   : 2
+  const tManual = Number(paramThreshold.value)         // 0 = auto (Otsu)
+  const dilateK = Number(paramDilate.value)            // 0..5
+  const minPct  = Number(paramMinArea.value) / 1000    // /10 -> percent then /100 -> fraction
+  const epsilon = Number(paramEpsilon.value)           // px in display scale
 
   setProgressStep('Поиск стен и помещений…')
   await tick()
@@ -868,6 +793,495 @@ async function analyseLocal() {
     viewLabel.textContent += ` · ✦ обучение: ${learned.sampleCount} образц.${filterNote}${addedNote}${accNote}`
   }
 }
+
+function finishAnalysis() {
+  // Snapshot for training diff
+  originalRooms = rooms.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) }))
+  hasUnsavedEdits = false
+  undoStack = []
+  if (undoBtn) undoBtn.disabled = true
+  buildRoomList()
+  drawPlan()
+  saveBar.classList.add('visible')
+  viewAllBtn.style.display = ''; viewSelBtn.style.display = ''
+  viewLabel.textContent = `Найдено: ${rooms.length} помещений — кликни для выбора`
+  editToolbar.classList.add('visible')
+  saveEditsBtn.style.display = 'none'
+  setEditMode('view')
+  updateTrainingBadge()
+}
+
+// ── Edit mode ──────────────────────────────────────────────
+function setEditMode(m) {
+  editMode = m
+  document.getElementById('emodeView').classList.toggle('active',     m === 'view')
+  document.getElementById('emodeEdit').classList.toggle('active',     m === 'edit')
+  document.getElementById('emodeDelete').classList.toggle('active',   m === 'delete')
+  document.getElementById('emodeDraw').classList.toggle('active',     m === 'collider')
+  document.getElementById('emodeEraser')?.classList.toggle('active',  m === 'eraser')
+  canvas.className = m === 'eraser' ? 'mode-eraser' : m !== 'view' ? `mode-${m}` : ''
+  hoverState = null
+  dragState  = null
+  roomDraw   = null
+  drawPlan()
+}
+
+// ── Canvas hit testing ─────────────────────────────────────
+const VERTEX_HIT_R  = 8   // px on screen
+const EDGE_HIT_R    = 6
+
+function canvasToImage(cx, cy) {
+  if (!currentImageEl) return [cx, cy]
+  return [
+    cx * currentImageEl.naturalWidth  / canvas.width,
+    cy * currentImageEl.naturalHeight / canvas.height,
+  ]
+}
+function imageToCanvas(ix, iy) {
+  if (!currentImageEl) return [ix, iy]
+  return [
+    ix * canvas.width  / currentImageEl.naturalWidth,
+    iy * canvas.height / currentImageEl.naturalHeight,
+  ]
+}
+
+function ptDistSq(ax, ay, bx, by) { return (ax-bx)**2 + (ay-by)**2 }
+
+function segDistSq(px, py, ax, ay, bx, by) {
+  const dx = bx-ax, dy = by-ay
+  const lenSq = dx*dx + dy*dy
+  if (lenSq === 0) return ptDistSq(px, py, ax, ay)
+  const t = Math.max(0, Math.min(1, ((px-ax)*dx + (py-ay)*dy) / lenSq))
+  return ptDistSq(px, py, ax + t*dx, ay + t*dy)
+}
+
+// Returns {roomId, ptIdx} for nearest vertex, or {roomId, edgeIdx} for nearest edge, or null
+function hitTest(cx, cy) {
+  if (!rooms.length || !currentImageEl) return null
+  const sx = canvas.width  / currentImageEl.naturalWidth
+  const sy = canvas.height / currentImageEl.naturalHeight
+  let bestVDist = VERTEX_HIT_R * VERTEX_HIT_R
+  let bestEDist = EDGE_HIT_R * EDGE_HIT_R
+  let bestV = null, bestE = null
+
+  for (const room of rooms) {
+    if (!room.polygon) continue
+    const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
+    // Check vertices
+    for (let i = 0; i < pts.length; i++) {
+      const d = ptDistSq(cx, cy, pts[i][0], pts[i][1])
+      if (d < bestVDist) { bestVDist = d; bestV = { roomId: room.id, ptIdx: i } }
+    }
+    // Check edges
+    for (let i = 0; i < pts.length; i++) {
+      const j = (i+1) % pts.length
+      const d = segDistSq(cx, cy, pts[i][0], pts[i][1], pts[j][0], pts[j][1])
+      if (d < bestEDist) { bestEDist = d; bestE = { roomId: room.id, edgeIdx: i } }
+    }
+  }
+  return bestV || bestE || null
+}
+
+// ── Polygon editing ────────────────────────────────────────
+function deepCopyRooms(src) {
+  return src.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) }))
+}
+
+function snapshotBW() {
+  if (!currentImageBW) return null
+  const snap = document.createElement('canvas')
+  snap.width = currentImageBW.width
+  snap.height = currentImageBW.height
+  snap.getContext('2d').drawImage(currentImageBW, 0, 0)
+  return snap
+}
+
+function pushUndo() {
+  // Deep-copy eraserStrokes: each stroke is an array of {x,y,r} objects
+  const eraserSnap = eraserStrokes.map(stroke => stroke.map(pt => ({ ...pt })))
+  undoStack.push({ rooms: deepCopyRooms(rooms), bw: snapshotBW(), eraserStrokes: eraserSnap })
+  if (undoStack.length > MAX_UNDO) undoStack.shift()
+  if (undoBtn) undoBtn.disabled = false
+}
+
+function togglePolygons() {
+  showPolygons = !showPolygons
+  const btn = document.getElementById('togglePolygonsBtn')
+  if (btn) {
+    if (showPolygons) {
+      btn.textContent = '🔲 Скрыть полигоны'
+      btn.style.background = '#e8e8ed'
+      btn.style.color = '#555'
+    } else {
+      btn.textContent = '🔳 Показать полигоны'
+      btn.style.background = '#ff9500'
+      btn.style.color = '#fff'
+    }
+  }
+  drawPlan()
+}
+
+function undo() {
+  const entry = undoStack.pop()
+  rooms = entry.rooms
+  // Restore eraser strokes snapshot so rebuildBWCanvas won't re-apply removed strokes
+  if (entry.eraserStrokes !== undefined) {
+    eraserStrokes = entry.eraserStrokes
+  }
+  if (entry.bw && currentImageBW) {
+    currentImageBW.getContext('2d').drawImage(entry.bw, 0, 0)
+  }
+  if (undoBtn) undoBtn.disabled = undoStack.length === 0
+  buildRoomList()
+  drawPlan()
+  hasUnsavedEdits = undoStack.length > 0
+  saveEditsBtn.style.display = hasUnsavedEdits ? '' : 'none'
+}
+
+function markEdited() {
+  hasUnsavedEdits = true
+  saveEditsBtn.style.display = ''
+}
+
+function deleteRoom(id) {
+  pushUndo()
+  rooms = rooms.filter(r => r.id !== id)
+  if (selectedRoomId === id) selectedRoomId = null
+  buildRoomList()
+  drawPlan()
+  markEdited()
+}
+
+function addVertexOnEdge(roomId, edgeIdx, cx, cy) {
+  pushUndo()
+  const room = rooms.find(r => r.id === roomId)
+  if (!room) return
+  const [ix, iy] = canvasToImage(cx, cy)
+  const pt = [Math.round(ix), Math.round(iy)]
+  room.polygon.splice(edgeIdx + 1, 0, pt)
+  markEdited()
+}
+
+function removeVertex(roomId, ptIdx) {
+  const room = rooms.find(r => r.id === roomId)
+  if (!room || room.polygon.length <= 3) return  // keep minimum 3 pts
+  pushUndo()
+  room.polygon.splice(ptIdx, 1)
+  markEdited()
+}
+
+// ── Canvas mouse events ────────────────────────────────────
+function getCanvasXY(e) {
+  const rect = canvas.getBoundingClientRect()
+  return [
+    (e.clientX - rect.left) * (canvas.width  / rect.width),
+    (e.clientY - rect.top)  * (canvas.height / rect.height),
+  ]
+}
+
+// ── Zoom helpers ───────────────────────────────────────────
+function applyZoomTransform() {
+  canvas.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`
+  canvas.style.transformOrigin = '50% 50%'
+  updateZoomLabel()
+}
+
+function updateZoomLabel() {
+  const lbl = document.getElementById('zoomLabel')
+  if (lbl) lbl.textContent = Math.round(zoomLevel * 100) + '%'
+}
+
+function zoomBy(delta, originX, originY) {
+  // originX/Y are screen coords relative to canvas-wrap centre
+  const wrap = document.querySelector('.canvas-wrap')
+  const wRect = wrap.getBoundingClientRect()
+  // point in canvas space before zoom
+  const ox = originX !== undefined ? originX - wRect.left - wRect.width / 2 : 0
+  const oy = originY !== undefined ? originY - wRect.top  - wRect.height / 2 : 0
+
+  const oldZoom = zoomLevel
+  zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel * (1 + delta)))
+
+  // Adjust pan so the point under cursor stays fixed
+  const ratio = zoomLevel / oldZoom
+  panX = ox + (panX - ox) * ratio
+  panY = oy + (panY - oy) * ratio
+
+  applyZoomTransform()
+}
+
+function resetZoom() {
+  zoomLevel = 1.0; panX = 0; panY = 0
+  applyZoomTransform()
+}
+
+function zoomIn()  { zoomBy(ZOOM_STEP) }
+function zoomOut() { zoomBy(-ZOOM_STEP) }
+
+canvas.addEventListener('mousedown', e => {
+  if (!currentImageEl) return
+  const [cx, cy] = getCanvasXY(e)
+
+  // ── Eraser ─────────────────────────────────────────────
+  if (editMode === 'eraser') {
+    pushUndo()
+    eraserActive = true
+    eraserCurrentStroke = []
+    eraserStrokes.push(eraserCurrentStroke)
+    const [ix, iy] = canvasToImage(cx, cy)
+    const r = eraserSize * currentImageEl.naturalWidth / canvas.width
+    eraserCurrentStroke.push({ x: ix, y: iy, r })
+    const bwCtx = currentImageBW.getContext('2d')
+    bwCtx.fillStyle = '#ffffff'
+    bwCtx.beginPath(); bwCtx.arc(ix, iy, r, 0, Math.PI * 2); bwCtx.fill()
+    drawPlan()
+    e.preventDefault()
+    return
+  }
+
+  // ── Room drawing ───────────────────────────────────────
+  if (editMode === 'collider') {
+    const [ix, iy] = canvasToImage(cx, cy)
+    roomDraw = { x0: ix, y0: iy, x1: ix, y1: iy }
+    e.preventDefault()
+    return
+  }
+
+  if (!rooms.length) return
+
+  if (editMode === 'delete') {
+    // Delete whole room on click
+    const sx = canvas.width  / currentImageEl.naturalWidth
+    const sy = canvas.height / currentImageEl.naturalHeight
+    for (const room of [...rooms].reverse()) {
+      if (!room.polygon) continue
+      const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
+      if (pointInPolygon(cx, cy, pts)) { deleteRoom(room.id); return }
+    }
+    return
+  }
+
+  if (editMode === 'edit') {
+    const hit = hitTest(cx, cy)
+    if (!hit) return
+    if (hit.ptIdx !== undefined) {
+      // Start dragging vertex
+      pushUndo()
+      dragState = { roomId: hit.roomId, ptIdx: hit.ptIdx }
+      selectRoom(hit.roomId)
+      e.preventDefault()
+    } else if (hit.edgeIdx !== undefined) {
+      // Insert vertex on edge then start dragging it
+      addVertexOnEdge(hit.roomId, hit.edgeIdx, cx, cy)
+      const room = rooms.find(r => r.id === hit.roomId)
+      dragState = { roomId: hit.roomId, ptIdx: hit.edgeIdx + 1 }
+      selectRoom(hit.roomId)
+      e.preventDefault()
+    }
+    return
+  }
+
+  // view mode: click selects room
+  const sx = canvas.width  / currentImageEl.naturalWidth
+  const sy = canvas.height / currentImageEl.naturalHeight
+
+  for (const room of [...rooms].reverse()) {
+    if (!room.polygon) continue
+    const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
+    if (pointInPolygon(cx, cy, pts)) { selectRoom(room.id); return }
+  }
+  selectedRoomId = null
+  document.querySelectorAll('.room-item').forEach(el => el.classList.remove('selected'))
+  drawPlan()
+})
+
+canvas.addEventListener('mousemove', e => {
+  if (!currentImageEl) return
+  const [cx, cy] = getCanvasXY(e)
+
+  // ── Eraser drag ────────────────────────────────────────
+  if (editMode === 'eraser') {
+    canvas.style.cursor = 'none'
+    drawPlan()  // redraw to show eraser cursor preview
+    if (eraserActive && currentImageBW) {
+      const [ix, iy] = canvasToImage(cx, cy)
+      const r = eraserSize * currentImageEl.naturalWidth / canvas.width
+      eraserCurrentStroke.push({ x: ix, y: iy, r })
+      const bwCtx = currentImageBW.getContext('2d')
+      bwCtx.fillStyle = '#ffffff'
+      bwCtx.beginPath(); bwCtx.arc(ix, iy, r, 0, Math.PI * 2); bwCtx.fill()
+      drawPlan()
+    }
+    // Draw eraser cursor ring
+    const r = eraserSize
+    ctx.save()
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 1.5
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke()
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke()
+    ctx.restore()
+    return
+  }
+
+  // ── Room draw drag ─────────────────────────────────────
+  if (editMode === 'collider') {
+    canvas.style.cursor = 'crosshair'
+    if (roomDraw) {
+      const [ix, iy] = canvasToImage(cx, cy)
+      roomDraw.x1 = ix; roomDraw.y1 = iy
+      drawPlan()
+    }
+    return
+  }
+
+  if (!rooms.length) return
+
+  if (dragState) {
+    // Move dragged vertex
+    const room = rooms.find(r => r.id === dragState.roomId)
+    if (room) {
+      const [ix, iy] = canvasToImage(cx, cy)
+      room.polygon[dragState.ptIdx] = [Math.round(ix), Math.round(iy)]
+      drawPlan()
+    }
+    return
+  }
+
+  if (editMode === 'edit') {
+    const prevHover = JSON.stringify(hoverState)
+    hoverState = hitTest(cx, cy)
+    if (JSON.stringify(hoverState) !== prevHover) drawPlan()
+    // Cursor
+    if (hoverState?.ptIdx !== undefined) canvas.style.cursor = 'grab'
+    else if (hoverState?.edgeIdx !== undefined) canvas.style.cursor = 'cell'
+    else canvas.style.cursor = 'crosshair'
+    return
+  }
+
+  if (editMode === 'delete') {
+    const sx = canvas.width  / currentImageEl.naturalWidth
+    const sy = canvas.height / currentImageEl.naturalHeight
+    for (const room of rooms) {
+      if (!room.polygon) continue
+      const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
+      if (pointInPolygon(cx, cy, pts)) { canvas.style.cursor = 'not-allowed'; return }
+    }
+    canvas.style.cursor = 'default'; return
+  }
+})
+
+canvas.addEventListener('mouseup', e => {
+  // ── Finish eraser stroke ───────────────────────────────
+  if (editMode === 'eraser') {
+    eraserActive = false
+    eraserCurrentStroke = []
+    return
+  }
+
+  // ── Finish room draw ───────────────────────────────────
+  if (editMode === 'collider' && roomDraw) {
+    const { x0, y0, x1, y1 } = roomDraw
+    roomDraw = null
+    const minW = Math.abs(x1 - x0), minH = Math.abs(y1 - y0)
+    if (minW > 5 && minH > 5) {
+      const lx = Math.min(x0, x1), ly = Math.min(y0, y1)
+      const rx = Math.max(x0, x1), ry = Math.max(y0, y1)
+      drawnRoomCount++
+      pushUndo()
+      const newRoom = {
+        id:      `drawn${Date.now()}`,
+        label:   `Помещение ${rooms.length + 1}`,
+        areaPx:  Math.round(minW * minH),
+        polygon: [[lx,ly],[rx,ly],[rx,ry],[lx,ry]],
+        drawn:   true,
+      }
+      rooms.push(newRoom)
+      markEdited()
+      buildRoomList()
+      selectRoom(newRoom.id)
+    }
+    drawPlan()
+    return
+  }
+
+  if (dragState) {
+    markEdited()
+    dragState = null
+    drawPlan()
+  }
+})
+
+canvas.addEventListener('mouseleave', () => {
+  if (editMode === 'collider' && roomDraw) {
+    roomDraw = null; drawPlan()
+  }
+  if (dragState) { markEdited(); dragState = null }
+  hoverState = null
+  if (editMode !== 'view') canvas.style.cursor = editMode === 'delete' ? 'not-allowed' : 'crosshair'
+  drawPlan()
+})
+
+canvas.addEventListener('dblclick', e => {
+  if (editMode !== 'edit') return
+  const [cx, cy] = getCanvasXY(e)
+  const hit = hitTest(cx, cy)
+  if (hit?.ptIdx !== undefined) {
+    removeVertex(hit.roomId, hit.ptIdx)
+    hoverState = null
+    drawPlan()
+  }
+})
+
+// ── Training ───────────────────────────────────────────────
+async function updateTrainingBadge() {
+  const data = await ipcRenderer.invoke('get-training-data')
+  trainingCount = data.length
+  trainingBadge.textContent = `✦ ${trainingCount} образц${trainingCount === 1 ? '' : trainingCount < 5 ? 'а' : 'ов'}`
+  trainingBadge.classList.toggle('visible', trainingCount > 0)
+}
+
+function imageHash() {
+  // Simple hash from first 200 chars of b64 + image dimensions
+  if (!currentImageB64) return 'none'
+  return `${currentImageEl?.naturalWidth}x${currentImageEl?.naturalHeight}_${currentImageB64.slice(0, 80)}`
+}
+
+async function saveEdits() {
+  const hash = imageHash()
+  const deletedIds = originalRooms
+    .filter(o => !rooms.find(r => r.id === o.id))
+    .map(o => o.id)
+
+  // Track rooms added by the user (not in original set)
+  const addedIds = rooms
+    .filter(r => !originalRooms.find(o => o.id === r.id))
+    .map(r => r.id)
+
+  const sample = {
+    imageHash:  hash,
+    savedAt:    new Date().toISOString(),
+    mode,                 // 'local' | 'ai' — чтобы отделить локальные образцы при обучении CV
+    original:   originalRooms,
+    edited:     rooms.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) })),
+    deletedIds,
+    addedIds,
+  }
+
+  const count = await ipcRenderer.invoke('save-training-sample', sample)
+  hasUnsavedEdits = false
+  undoStack = []
+  if (undoBtn) undoBtn.disabled = true
+  saveEditsBtn.style.display = 'none'
+  trainingCount = count
+  await updateTrainingBadge()
+
+  // Brief visual confirmation
+  const orig = trainingBadge.style.background
+  trainingBadge.style.background = '#d4f8df'
+  setTimeout(() => { trainingBadge.style.background = orig }, 800)
+}
+
+function tick() { return new Promise(r => setTimeout(r, 0)) }
 
 // ── Local CV pipeline ──────────────────────────────────────
 async function detectRoomsLocal(imageEl, opts) {
@@ -1195,22 +1609,11 @@ async function saveAll() {
 
 // Export canvas helpers — no labels drawn on export images
 
-// Apply grayscale to offscreen canvas pixels (for export when B&W toggle is on)
-function applyGrayscaleToCanvas(c, w, h) {
-  const id = c.getImageData(0, 0, w, h)
-  const d = id.data
-  for (let i = 0; i < d.length; i += 4) {
-    const g = Math.round(d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114)
-    d[i] = d[i+1] = d[i+2] = g
-  }
-  c.putImageData(id, 0, 0)
-}
-
 function makeRoomCanvas(room) {
   const w = currentImageEl.naturalWidth, h = currentImageEl.naturalHeight
   const off = document.createElement('canvas'); off.width = w; off.height = h
   const c = off.getContext('2d')
-  c.drawImage(showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl), 0, 0)
+  c.drawImage(currentImageBW || currentImageEl, 0, 0)
   if (room.polygon?.length >= 3) {
     c.beginPath()
     c.moveTo(room.polygon[0][0], room.polygon[0][1])
@@ -1229,7 +1632,7 @@ function makeMultiRoomCanvas(roomList) {
   const w = currentImageEl.naturalWidth, h = currentImageEl.naturalHeight
   const off = document.createElement('canvas'); off.width = w; off.height = h
   const c = off.getContext('2d')
-  c.drawImage(showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl), 0, 0)
+  c.drawImage(currentImageBW || currentImageEl, 0, 0)
   c.strokeStyle = 'transparent'; c.lineWidth = 0
   roomList.forEach(room => {
     if (!room.polygon?.length) return
@@ -1247,7 +1650,7 @@ function makeCombinedCanvas() {
   const w = currentImageEl.naturalWidth, h = currentImageEl.naturalHeight
   const off = document.createElement('canvas'); off.width = w; off.height = h
   const c = off.getContext('2d')
-  c.drawImage(showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl), 0, 0)
+  c.drawImage(currentImageBW || currentImageEl, 0, 0)
   c.strokeStyle = 'transparent'; c.lineWidth = 0
   rooms.forEach(room => {
     if (!room.polygon?.length) return
@@ -1272,8 +1675,6 @@ function sanitizeFilename(name) {
   return name.replace(/[\/\\:*?"<>|]/g, '_').slice(0, 60)
 }
 
-function tick() { return new Promise(r => setTimeout(r, 0)) }
-
 // ── Progress ───────────────────────────────────────────────
 function showProgress(text, step) {
   progressText.textContent = text; progressStep.textContent = step || ''
@@ -1282,43 +1683,24 @@ function showProgress(text, step) {
 function setProgressStep(s) { progressStep.textContent = s }
 function hideProgress() { progressOverlay.classList.remove('visible') }
 
-// ── Zoom & Pan ─────────────────────────────────────────────
-// Плавный зум: накапливаем deltaY и применяем через rAF (инерция трекпада)
-let _wheelAccum   = 0      // накопленная «сырая» дельта (px / line / page)
-let _wheelRafId   = null
-let _wheelOriginX = 0
-let _wheelOriginY = 0
-const WHEEL_SENSITIVITY = 0.0008   // px→ratio: меньше = мягче
-const WHEEL_MAX_STEP    = 0.18     // максимальный шаг за один кадр
-
-function _flushWheel() {
-  _wheelRafId = null
-  if (_wheelAccum === 0) return
-  // Нормализуем дельту — трекпад даёт маленькие дроби, мышь — 100/120/3
-  const clamped = Math.max(-WHEEL_MAX_STEP, Math.min(WHEEL_MAX_STEP, _wheelAccum * WHEEL_SENSITIVITY))
-  zoomBy(-clamped, _wheelOriginX, _wheelOriginY)
-  _wheelAccum = 0
-}
-
+// ── Mouse wheel: zoom canvas or change eraser size ─────────
 document.querySelector('.canvas-wrap').addEventListener('wheel', e => {
   e.preventDefault()
   if (editMode === 'eraser') {
-    // В режиме ластика колесо меняет размер
+    // In eraser mode: wheel changes eraser size
     eraserSize = Math.max(5, Math.min(150, eraserSize - Math.sign(e.deltaY) * 3))
-    const sizeEl  = document.getElementById('eraserSizeVal');   if (sizeEl)  sizeEl.textContent  = eraserSize
-    const sizeEl2 = document.getElementById('eraserSizeVal2');  if (sizeEl2) sizeEl2.textContent = eraserSize
-    const slider  = document.getElementById('eraserSizeSlider');if (slider)  slider.value        = eraserSize
+    const sizeEl = document.getElementById('eraserSizeVal')
+    if (sizeEl) sizeEl.textContent = eraserSize
+    const sizeEl2 = document.getElementById('eraserSizeVal2')
+    if (sizeEl2) sizeEl2.textContent = eraserSize
+    const slider = document.getElementById('eraserSizeSlider')
+    if (slider) slider.value = eraserSize
     drawPlan()
-    return
+  } else {
+    // Normal mode: wheel zooms, centred on cursor
+    const delta = e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP
+    zoomBy(delta, e.clientX, e.clientY)
   }
-  // Нормализуем единицы: DOM_DELTA_LINE ≈ 16px, DOM_DELTA_PAGE ≈ 400px
-  let delta = e.deltaY
-  if (e.deltaMode === 1) delta *= 16
-  if (e.deltaMode === 2) delta *= 400
-  _wheelAccum   += delta
-  _wheelOriginX  = e.clientX
-  _wheelOriginY  = e.clientY
-  if (!_wheelRafId) _wheelRafId = requestAnimationFrame(_flushWheel)
 }, { passive: false })
 
 // ── Touch pinch-to-zoom ────────────────────────────────────
@@ -1336,7 +1718,8 @@ document.querySelector('.canvas-wrap').addEventListener('touchmove', e => {
     const ratio = dist / _lastPinchDist
     const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2
     const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2
-    zoomBy(ratio - 1, cx, cy)
+    const delta = ratio - 1
+    zoomBy(delta, cx, cy)
   }
   _lastPinchDist = dist
 }, { passive: false })
@@ -1346,38 +1729,15 @@ document.querySelector('.canvas-wrap').addEventListener('touchend', () => { _las
 document.querySelector('.canvas-wrap').addEventListener('gesturestart', e => e.preventDefault(), { passive: false })
 document.querySelector('.canvas-wrap').addEventListener('gesturechange', e => {
   e.preventDefault()
-  zoomBy((e.scale - 1) * 0.08)
+  const delta = (e.scale - 1) * 0.08
+  zoomBy(delta)
 }, { passive: false })
-
-// ── Пanning ────────────────────────────────────────────────
-// Способы начать панорамирование:
-//   1. Средняя кнопка мыши (MMB)
-//   2. Alt + ЛКМ
-//   3. Пробел + ЛКМ (Figma/Sketch стиль)
-//   4. Левая кнопка мыши в режиме просмотра (editMode === 'view') вне комнат
-let _spaceDown = false
-
-window.addEventListener('keydown', e => {
-  if (e.code === 'Space' && !e.repeat && !['INPUT','TEXTAREA'].includes(document.activeElement?.tagName)) {
-    e.preventDefault()
-    _spaceDown = true
-    document.querySelector('.canvas-wrap').style.cursor = 'grab'
-  }
-})
-window.addEventListener('keyup', e => {
-  if (e.code === 'Space') {
-    _spaceDown = false
-    if (!isPanning) document.querySelector('.canvas-wrap').style.cursor = ''
-  }
-})
-
 document.querySelector('.canvas-wrap').addEventListener('mousedown', e => {
-  const startPan = e.button === 1 || (e.button === 0 && e.altKey) || (e.button === 0 && _spaceDown)
-  if (startPan) {
+  if (e.button === 1 || (e.button === 0 && e.altKey)) {
     e.preventDefault()
     isPanning = true
     panStart = { x: e.clientX, y: e.clientY, panX, panY }
-    document.querySelector('.canvas-wrap').style.cursor = 'grabbing'
+    document.querySelector('.canvas-wrap').style.cursor = 'grab'
   }
 })
 window.addEventListener('mousemove', e => {
@@ -1385,12 +1745,11 @@ window.addEventListener('mousemove', e => {
   panX = panStart.panX + (e.clientX - panStart.x)
   panY = panStart.panY + (e.clientY - panStart.y)
   applyZoomTransform()
-  document.querySelector('.canvas-wrap').style.cursor = 'grabbing'
 })
 window.addEventListener('mouseup', e => {
   if (isPanning) {
     isPanning = false; panStart = null
-    document.querySelector('.canvas-wrap').style.cursor = _spaceDown ? 'grab' : ''
+    document.querySelector('.canvas-wrap').style.cursor = ''
   }
 })
 
@@ -1424,205 +1783,3 @@ document.addEventListener('keydown', e => {
 })
 init()
 updateTrainingBadge()
-
-// ── Crop ───────────────────────────────────────────────────
-let cropRect    = null   // { x, y, w, h } in canvas-overlay px
-let cropRatio   = 'free' // 'free' | '4:3' | '3:4' | '16:9' | '1:1'
-let _cropDrag   = null   // { type: 'move'|handle, startX, startY, origRect }
-
-const RATIOS = { 'free': null, '4:3': 4/3, '3:4': 3/4, '16:9': 16/9, '1:1': 1 }
-
-function initCropMode() {
-  const overlay = document.getElementById('cropOverlay')
-  const wrap    = document.querySelector('.canvas-wrap')
-  const wrapRect = wrap.getBoundingClientRect()
-
-  // Default crop: full canvas area, or 4:3 centred
-  const cRect = canvas.getBoundingClientRect()
-  const cx = cRect.left - wrapRect.left
-  const cy = cRect.top  - wrapRect.top
-  const cw = cRect.width
-  const ch = cRect.height
-
-  let bx, by, bw, bh
-  const r = RATIOS[cropRatio]
-  if (r) {
-    if (cw / ch > r) { bh = ch * 0.9; bw = bh * r } else { bw = cw * 0.9; bh = bw / r }
-  } else { bw = cw * 0.85; bh = ch * 0.85 }
-  bx = cx + (cw - bw) / 2
-  by = cy + (ch - bh) / 2
-
-  cropRect = { x: bx, y: by, w: bw, h: bh }
-  overlay.style.display = 'block'
-  updateCropBox()
-
-  // Ratio buttons
-  document.querySelectorAll('.crop-ratio-btn').forEach(btn => {
-    btn.onclick = () => {
-      cropRatio = btn.dataset.ratio
-      document.querySelectorAll('.crop-ratio-btn').forEach(b => b.classList.toggle('active', b === btn))
-      enforceRatio()
-      updateCropBox()
-    }
-  })
-
-  // Drag on cropBox (move) and handles (resize)
-  const cropBox = document.getElementById('cropBox')
-  cropBox.onmousedown = e => {
-    if (e.target.classList.contains('crop-handle')) return
-    e.preventDefault()
-    _cropDrag = { type: 'move', startX: e.clientX, startY: e.clientY, origRect: { ...cropRect } }
-  }
-  document.querySelectorAll('.crop-handle').forEach(h => {
-    h.onmousedown = e => {
-      e.preventDefault(); e.stopPropagation()
-      _cropDrag = { type: h.dataset.h, startX: e.clientX, startY: e.clientY, origRect: { ...cropRect } }
-    }
-  })
-
-  window.addEventListener('mousemove', onCropMouseMove)
-  window.addEventListener('mouseup',   onCropMouseUp)
-}
-
-function onCropMouseMove(e) {
-  if (!_cropDrag) return
-  const wrap = document.querySelector('.canvas-wrap')
-  const wrapRect = wrap.getBoundingClientRect()
-  const dx = e.clientX - _cropDrag.startX
-  const dy = e.clientY - _cropDrag.startY
-  const o  = _cropDrag.origRect
-  let { x, y, w, h } = o
-  const MIN = 30
-
-  if (_cropDrag.type === 'move') {
-    x = o.x + dx; y = o.y + dy
-  } else {
-    const t = _cropDrag.type
-    if (t.includes('e')) w = Math.max(MIN, o.w + dx)
-    if (t.includes('s')) h = Math.max(MIN, o.h + dy)
-    if (t.includes('w')) { const nw = Math.max(MIN, o.w - dx); x = o.x + o.w - nw; w = nw }
-    if (t.includes('n')) { const nh = Math.max(MIN, o.h - dy); y = o.y + o.h - nh; h = nh }
-  }
-
-  cropRect = { x, y, w, h }
-  enforceRatio()
-  updateCropBox()
-}
-
-function onCropMouseUp() {
-  _cropDrag = null
-}
-
-function enforceRatio() {
-  const r = RATIOS[cropRatio]
-  if (!r) return
-  // Keep width, adjust height
-  cropRect.h = cropRect.w / r
-}
-
-function updateCropBox() {
-  const box = document.getElementById('cropBox')
-  box.style.left   = cropRect.x + 'px'
-  box.style.top    = cropRect.y + 'px'
-  box.style.width  = cropRect.w + 'px'
-  box.style.height = cropRect.h + 'px'
-}
-
-function exitCropMode() {
-  document.getElementById('cropOverlay').style.display = 'none'
-  window.removeEventListener('mousemove', onCropMouseMove)
-  window.removeEventListener('mouseup',   onCropMouseUp)
-  _cropDrag = null
-}
-
-function applyCrop() {
-  if (!currentImageEl || !cropRect) return
-
-  const wrap    = document.querySelector('.canvas-wrap')
-  const wrapRect = wrap.getBoundingClientRect()
-  const cRect   = canvas.getBoundingClientRect()
-
-  // Convert overlay px → image px
-  // cropRect is in wrap coords; canvas is positioned inside wrap
-  const scaleX = currentImageEl.naturalWidth  / cRect.width
-  const scaleY = currentImageEl.naturalHeight / cRect.height
-
-  // offset of canvas inside wrap
-  const offX = cRect.left - wrapRect.left
-  const offY = cRect.top  - wrapRect.top
-
-  // crop box in canvas-element px
-  const bx = (cropRect.x - offX)
-  const by = (cropRect.y - offY)
-  const bw = cropRect.w
-  const bh = cropRect.h
-
-  // crop in image px (may extend outside image bounds)
-  const ix = Math.round(bx * scaleX)
-  const iy = Math.round(by * scaleY)
-  const iw = Math.round(bw * scaleX)
-  const ih = Math.round(bh * scaleY)
-
-  // Build new canvas with white background (handles out-of-bounds)
-  const off = document.createElement('canvas')
-  off.width  = iw
-  off.height = ih
-  const c = off.getContext('2d')
-  c.fillStyle = '#ffffff'
-  c.fillRect(0, 0, iw, ih)
-
-  // Draw source image offset so crop origin aligns
-  const srcImg = showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl)
-  c.drawImage(srcImg, -ix, -iy, currentImageEl.naturalWidth, currentImageEl.naturalHeight)
-
-  // Convert to data URL and reload as new image
-  const dataUrl = off.toDataURL('image/jpeg', 0.95)
-  const newImg = new Image()
-  newImg.onload = () => {
-    pushUndo()
-    currentImageEl = newImg
-    currentImageB64 = dataUrl.split(',')[1]
-    currentMime = 'image/jpeg'
-
-    // Сдвигаем полигоны всех помещений на величину кропа (ix, iy) в image px.
-    // Точки за пределами нового изображения зажимаем по границе.
-    // Комнаты, полностью вышедшие за кадр, удаляем.
-    function shiftPolygons(roomList) {
-      return roomList.map(room => {
-        if (!room.polygon?.length) return room
-        const newPoly = room.polygon.map(([x, y]) => [
-          Math.max(0, Math.min(iw, Math.round(x - ix))),
-          Math.max(0, Math.min(ih, Math.round(y - iy))),
-        ])
-        const inside = newPoly.some(([x, y]) => x > 0 && x < iw && y > 0 && y < ih)
-        if (!inside) return null
-        return { ...room, polygon: newPoly }
-      }).filter(Boolean)
-    }
-    rooms = shiftPolygons(rooms)
-    originalRooms = shiftPolygons(originalRooms)
-
-    // Rebuild adjusted canvases
-    currentImageBW    = null
-    currentImageColor = null
-    _rawPixels = null
-
-    const rebuildOff = document.createElement('canvas')
-    rebuildOff.width  = newImg.naturalWidth
-    rebuildOff.height = newImg.naturalHeight
-    const rc = rebuildOff.getContext('2d')
-    rc.drawImage(newImg, 0, 0)
-    const id = rc.getImageData(0, 0, rebuildOff.width, rebuildOff.height)
-    _rawPixels = new Uint8ClampedArray(id.data)
-    _rawWidth  = rebuildOff.width
-    _rawHeight = rebuildOff.height
-
-    currentImageBW = makeBWCanvas(newImg)
-    resizeCanvas(newImg)
-    buildRoomList()
-    exitCropMode()
-    setEditMode('view')
-    drawPlan()
-  }
-  newImg.src = dataUrl
-}
