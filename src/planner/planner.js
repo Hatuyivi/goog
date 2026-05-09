@@ -1805,61 +1805,46 @@ async function detectRoomsLocal(imageEl, opts) {
   let _cannyEdges  = null  // Canny edges — kept for Hough snap/align (scan mode)
   let _houghRooms  = null  // Polygons built from Probabilistic Hough intersections
 
-  if (opts.threshold == null && isPhoto) {
-    bin1 = sauvolaThreshold(gray, W, H, windowR,     K_SAUVOLA)
-    bin2 = sauvolaThreshold(gray, W, H, windowR + 8, K_SAUVOLA - 0.05)
-  } else if (opts.threshold == null && !isPhoto) {
-    // ── New pipeline: Gaussian blur → Canny → Morphological Closing →
-    //   Probabilistic Hough Transform → Line intersections → Room polygons
-    // ─────────────────────────────────────────────────────────────────────────
-    // Step 1: Canny edge detection (includes 3×3 Gaussian blur internally)
-    _cannyEdges = cannyEdges(gray, W, H)
+  // ── DETECTION: Otsu brightness threshold (primary, all modes) ───────────────
+  // Rooms are light pixels, walls are dark pixels.  Otsu finds the optimal
+  // threshold automatically.  This is robust for any plan with dark walls on a
+  // light background — thick or thin, CAD or photo.
+  //
+  // Canny is kept ONLY for boundary refinement (step 7 below: snap polygon
+  // vertices to real wall edges).  It is NOT used for room detection anymore
+  // because Canny-inverted binaries treat thick-wall interiors as free space,
+  // merging every room into one giant blob.
 
-    // Step 2: Morphological Closing — close gaps between broken wall edges.
-    // Radius = ~half wall thickness so thin walls become solid closed contours.
+  if (opts.threshold == null && !isPhoto) {
+    // ── Scan / CAD mode: compute Canny now so it's ready for polygon refinement.
+    // Canny is NOT used to build bin1/bin2 — only stored in _cannyEdges for the
+    // axisAlignEdges + snapToRightAngles refinement steps later.
+    _cannyEdges = cannyEdges(gray, W, H)
     const closeR = Math.max(1, Math.round(wallEst * 0.6))
     const closedEdges = morphClose(_cannyEdges, W, H, closeR)
 
-    // Step 3: Probabilistic Hough Transform — extract wall line segments.
+    // Hough line segments — used in axisAlignEdges to snap polygon edges to
+    // detected wall lines.  Also feeds buildRoomsFromLines (PATH A supplement).
     const houghSegs = probabilisticHough(closedEdges, W, H, {
-      threshold:  Math.max(25, Math.min(W, H) * 0.05),
-      minLength:  Math.max(15, Math.min(W, H) * 0.03),
-      maxGap:     Math.max(4,  Math.min(W, H) * 0.006),
+      threshold: Math.max(25, Math.min(W, H) * 0.05),
+      minLength: Math.max(15, Math.min(W, H) * 0.03),
+      maxGap:    Math.max(4,  Math.min(W, H) * 0.006),
     })
-
-    // Step 4: Build room polygons from line intersections (H/V grid approach).
-    // This computes all rectangle vertices from pairs of H-wall × V-wall lines.
     _houghRooms = buildRoomsFromLines(houghSegs, W, H, closedEdges)
+  }
 
-    // Step 5: Fall back to flood-fill if Hough found too few rooms (complex plans).
-    // Also build binary maps for the flood-fill fallback path.
-    const dilR = Math.max(1, wallEst >> 1)
-    const dilated = new Uint8Array(W * H)
-    for (let y = dilR; y < H - dilR; y++) {
-      for (let x = dilR; x < W - dilR; x++) {
-        let has = 0
-        outer: for (let dy2 = -dilR; dy2 <= dilR && !has; dy2++)
-          for (let dx2 = -dilR; dx2 <= dilR; dx2++)
-            if (_cannyEdges[(y+dy2)*W+(x+dx2)]) { has = 1; break outer }
-        dilated[y*W+x] = has
-      }
-    }
-
-    // Invert: 1 = free space (room)
-    bin1 = new Uint8Array(W * H)
-    bin2 = new Uint8Array(W * H)
-    for (let i = 0; i < gray.length; i++) bin1[i] = dilated[i] ? 0 : 1
-
-    // bin2 = Otsu-loose as fallback (catches rooms with imperfect edges)
-    const T_otsu = otsu(gray)
-    const T_loose = Math.max(T_otsu - 30, 80)
-    for (let i = 0; i < gray.length; i++) bin2[i] = (bin1[i] || gray[i] > T_loose) ? 1 : 0
+  // ── bin1 (strict) and bin2 (loose) — pure brightness, no Canny ───────────
+  if (isPhoto && opts.threshold == null) {
+    // Photo mode: Sauvola adaptive threshold handles uneven lighting
+    bin1 = sauvolaThreshold(gray, W, H, windowR,     K_SAUVOLA)
+    bin2 = sauvolaThreshold(gray, W, H, windowR + 8, K_SAUVOLA - 0.05)
   } else {
-    // Manual threshold or fallback
-    const T = opts.threshold != null ? opts.threshold : otsu(gray)
+    // Scan / CAD / manual mode: global Otsu or user-supplied threshold.
+    // Pure brightness — correctly marks thick black wall interiors as wall (=0).
+    const T      = opts.threshold != null ? opts.threshold : otsu(gray)
     const T_loose = Math.max(T - 30, 80)
-    bin1 = new Uint8Array(W * H)
-    bin2 = new Uint8Array(W * H)
+    bin1 = new Uint8Array(gray.length)
+    bin2 = new Uint8Array(gray.length)
     for (let i = 0; i < gray.length; i++) {
       bin1[i] = gray[i] > T       ? 1 : 0
       bin2[i] = gray[i] > T_loose ? 1 : 0
@@ -1889,43 +1874,45 @@ async function detectRoomsLocal(imageEl, opts) {
   // are treated as separate connected components.
   function closeDoorGaps(bin, W, H) {
     const out = bin.slice()
-    const maxDoor = Math.max(6, Math.round(Math.min(W, H) * 0.025))  // ~2.5% of short side
+    // maxDoor: typical doorway at floor-plan scale.
+    // 1.2% of short side ≈ 24 px at 2000 px → ~90 cm at 1:50 scale.
+    // 2.5% was too large — it closed interior passages in large rooms.
+    const maxDoor = Math.max(6, Math.round(Math.min(W, H) * 0.012))
 
-    // Horizontal scan: find FREE pixel runs (=1) flanked by walls (=0) on both sides
-    // These are doorway openings — short gaps where the wall is missing.
+    // Horizontal scan: free pixel runs flanked by wall on BOTH left AND right,
+    // AND wall pixels present BOTH above AND below (confirms this is a doorway gap
+    // cutting through a wall, not an open interior space).
     for (let y = 1; y < H - 1; y++) {
       let x = 1
       while (x < W - 1) {
-        if (out[y*W+x] === 0) { x++; continue }  // wall pixel, skip
-        // Found a free pixel — scan the full free run
+        if (out[y*W+x] === 0) { x++; continue }
         let gapStart = x
         while (x < W && out[y*W+x] === 1) x++
         const gapEnd = x - 1
         const gapLen = gapEnd - gapStart + 1
         if (gapLen > maxDoor) continue
-        // Check both sides are wall pixels (=0)
         const hasWallLeft  = gapStart > 0 && out[y*W+(gapStart-1)] === 0
         const hasWallRight = gapEnd < W-1  && out[y*W+(gapEnd+1)]  === 0
-        // Close if the gap is narrow AND wall pixels exist above/below (confirms direction)
         if (hasWallLeft && hasWallRight) {
           let wallAbove = 0, wallBelow = 0
           for (let gx = gapStart; gx <= gapEnd; gx++) {
             if (y > 0   && out[(y-1)*W+gx] === 0) wallAbove++
             if (y < H-1 && out[(y+1)*W+gx] === 0) wallBelow++
           }
-          // If walls are present above/below this gap — it's a doorway, fill it with wall
-          if (wallAbove > gapLen * 0.4 || wallBelow > gapLen * 0.4) {
+          // Require walls BOTH above AND below — doorway cuts through a wall.
+          // OR logic caused false closures inside large open rooms.
+          if (wallAbove > gapLen * 0.4 && wallBelow > gapLen * 0.4) {
             for (let gx = gapStart; gx <= gapEnd; gx++) out[y*W+gx] = 0
           }
         }
       }
     }
 
-    // Vertical scan: find FREE pixel runs (=1) flanked by walls (=0) on both sides
+    // Vertical scan: same logic — require walls on BOTH left AND right sides.
     for (let x = 1; x < W - 1; x++) {
       let y = 1
       while (y < H - 1) {
-        if (out[y*W+x] === 0) { y++; continue }  // wall pixel, skip
+        if (out[y*W+x] === 0) { y++; continue }
         let gapStart = y
         while (y < H && out[y*W+x] === 1) y++
         const gapEnd = y - 1
@@ -1939,7 +1926,8 @@ async function detectRoomsLocal(imageEl, opts) {
             if (x > 0   && out[gy*W+(x-1)] === 0) wallLeft++
             if (x < W-1 && out[gy*W+(x+1)] === 0) wallRight++
           }
-          if (wallLeft > gapLen * 0.4 || wallRight > gapLen * 0.4) {
+          // Require walls BOTH left AND right.
+          if (wallLeft > gapLen * 0.4 && wallRight > gapLen * 0.4) {
             for (let gy = gapStart; gy <= gapEnd; gy++) out[gy*W+x] = 0
           }
         }
@@ -1948,8 +1936,12 @@ async function detectRoomsLocal(imageEl, opts) {
     return out
   }
 
+  // closeDoorGaps is only meaningful on the Canny-inverted binary (bin1) where
+  // "free" pixels are gaps in wall lines.  bin2 is Otsu-brightness-based — its
+  // large open rooms are wide white blobs; running closeDoorGaps on them with a
+  // large threshold fragments those blobs at narrow interior passages and makes
+  // large rooms disappear entirely.  Never apply to bin2.
   bin1 = closeDoorGaps(bin1, W, H)
-  bin2 = closeDoorGaps(bin2, W, H)
 
   // ---- Erosion (thicken walls) ----------------------------------------------
   // Auto: erode once when walls look thin (wallPeak < 8px in work canvas).
@@ -2727,17 +2719,21 @@ function buildRoomsFromLines(segments, W, H, edges) {
       // Check that the centre of the room is NOT an edge pixel (it's open space)
       const midX = Math.round((v1.coord + v2.coord) / 2)
       const midY = Math.round((h1.coord + h2.coord) / 2)
+      // Wall density check: use a small fixed radius (20px) around room centre.
+      // Previously used 15% of room size — for a 400×300 px room that's a 45 px
+      // radius, pulling in column markers (⊠) and furniture symbols and causing
+      // large valid rooms to be rejected as "wall".  A fixed 20 px radius tests
+      // only the immediate centre, where a real room is always open.
+      const checkRi = 20
       let wallDensity = 0
-      const checkR = Math.min(roomW2, roomH) * 0.15
-      const checkRi = Math.max(3, Math.round(checkR))
       for (let dy = -checkRi; dy <= checkRi; dy++)
         for (let dx = -checkRi; dx <= checkRi; dx++) {
           const ny = midY+dy, nx = midX+dx
           if (ny>=0&&ny<H&&nx>=0&&nx<W&&edges[ny*W+nx]) wallDensity++
         }
       const checkArea = (2*checkRi+1)*(2*checkRi+1)
-      // Порог плотности адаптивен: большие комнаты допускают меньше стен в центре
-      const densityLimit = (roomW2 * roomH > W * H * 0.02) ? 0.15 : 0.25
+      // Large rooms tolerate a bit more (columns, symbols); small rooms stricter.
+      const densityLimit = (roomW2 * roomH > W * H * 0.02) ? 0.20 : 0.30
       if (wallDensity / checkArea > densityLimit) continue  // too many edges = wall, not room
 
       rooms.push(corners.map(([cx,cy]) => [Math.round(cx), Math.round(cy)]))
