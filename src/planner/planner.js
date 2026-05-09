@@ -1640,6 +1640,12 @@ function tick() { return new Promise(r => setTimeout(r, 0)) }
 
 // ── Local CV pipeline ──────────────────────────────────────
 async function detectRoomsLocal(imageEl, opts) {
+  // ── Debug slider params (from left panel) ──────────────────────────────────
+  const _minCompact = (+(document.getElementById('paramMinCompact')?.value ?? 8))  / 100
+  const _minFill    = (+(document.getElementById('paramMinFill')?.value    ?? 35)) / 100
+  const _maxAreaPct = (+(document.getElementById('paramMaxArea')?.value    ?? 92)) / 100
+  const _dashGapMul = (+(document.getElementById('paramDashGap')?.value    ?? 10)) / 10
+
   // Поддерживаем как HTMLImageElement (naturalWidth), так и HTMLCanvasElement (width)
   const W0 = imageEl.naturalWidth ?? imageEl.width
   const H0 = imageEl.naturalHeight ?? imageEl.height
@@ -1944,8 +1950,8 @@ async function detectRoomsLocal(imageEl, opts) {
   // so flood fill treats them as solid walls.
   function closeDashedWalls(bin, W, H) {
     const out = bin.slice()
-    // Max gap between dashes: ~2.5% of short side (scales with resolution)
-    const maxGap  = Math.max(18, Math.round(Math.min(W, H) * 0.025))
+    // Max gap between dashes: ~2.5% of short side × slider multiplier
+    const maxGap  = Math.max(18, Math.round(Math.min(W, H) * 0.025 * _dashGapMul))
     const minDash = 3   // min dark-pixel run to qualify as a "dash"
 
     // Horizontal scan
@@ -2065,7 +2071,7 @@ async function detectRoomsLocal(imageEl, opts) {
     ? Math.pow(wallInfo.wallMin * 4, 2) / total
     : 0.003
   const minArea = total * autoMinAreaFrac
-  const maxArea = total * 0.92  // raised from 0.85 — very large rooms can span most of image
+  const maxArea = total * _maxAreaPct  // from slider (default 0.92)
 
   // touchesBorder — умная проверка: отбрасываем регион только если он касается
   // самого края растра (вероятно, фоновая область за пределами здания).
@@ -2080,7 +2086,7 @@ async function detectRoomsLocal(imageEl, opts) {
       // Отбрасываем граничные регионы только если они маленькие ИЛИ некомпактные
       // Большие компактные регионы у края — это легитимные комнаты у внешней стены
       if (r.touchesBorder) {
-        const isBigAndCompact = r.area > total * 0.005 && fillRatio > 0.35
+        const isBigAndCompact = r.area > total * 0.005 && fillRatio > _minFill
         if (!isBigAndCompact) return false
       }
       return true
@@ -2218,7 +2224,7 @@ async function detectRoomsLocal(imageEl, opts) {
     rooms.length = 0
     for (let i = 0; i < merged.length; i++) {
       const room = floodRoomFromRegion(merged[i], i + 1)
-      if (room) rooms.push(room)
+      if (room && room.compactness >= _minCompact) rooms.push(room)
     }
   } else {
     // ── SUPPLEMENT mode: add large rooms Hough missed ─────────────────────────
@@ -2258,7 +2264,7 @@ async function detectRoomsLocal(imageEl, opts) {
       if (overlapHough) continue  // already well-covered
 
       const room = floodRoomFromRegion(r, rooms.length + 1)
-      if (room) {
+      if (room && room.compactness >= _minCompact) {
         rooms.push(room)
         coveredBboxes.push({x1:r.minX,y1:r.minY,x2:r.maxX,y2:r.maxY})
       }
