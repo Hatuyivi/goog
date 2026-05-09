@@ -803,6 +803,10 @@ async function detectRoomsLocal(imageEl, opts) {
   const { labels: labels1, regions: regions1 } = floodFill(bin1)
   const { labels: labels2, regions: regions2 } = floodFill(bin2)
 
+  // Заполнить дыры от мебели/деталей внутри помещений
+  fillEnclosedHoles(labels1, regions1, W, H)
+  fillEnclosedHoles(labels2, regions2, W, H)
+
   await tick()
 
   // ── Candidate filtering ─────────────────────────────────
@@ -917,6 +921,64 @@ function erode4(bin, W, H) {
     }
   }
   return out
+}
+
+
+// ── Заполнение замкнутых дыр внутри помещений ─────────────────
+// После flood fill пиксели мебели/штриховки/лестниц остаются с label=0
+// внутри комнаты — это и есть «дыры». Алгоритм:
+//   1. BFS от всех граничных пикселей с label=0 → «внешние» стены
+//   2. Любой label=0 недостижимый снаружи — замкнутая дыра
+//   3. Назначаем ей метку ближайшего соседа (=помещение вокруг)
+// Безопаснее морфологического закрытия: не может объединить соседние комнаты.
+function fillEnclosedHoles(labels, regions, W, H) {
+  // Шаг 1: BFS от границы через label=0 пиксели
+  const reachable = new Uint8Array(W * H)
+  const queue = new Int32Array(W * H)
+  let qHead = 0, qTail = 0
+
+  function seed(p) {
+    if (labels[p] === 0 && !reachable[p]) { reachable[p] = 1; queue[qTail++] = p }
+  }
+  for (let x = 0; x < W; x++) { seed(x); seed((H - 1) * W + x) }
+  for (let y = 1; y < H - 1; y++) { seed(y * W); seed(y * W + W - 1) }
+
+  while (qHead < qTail) {
+    const p = queue[qHead++]
+    const py = (p / W) | 0, px = p % W
+    if (px > 0     && labels[p-1] === 0 && !reachable[p-1]) { reachable[p-1]=1; queue[qTail++]=p-1 }
+    if (px < W - 1 && labels[p+1] === 0 && !reachable[p+1]) { reachable[p+1]=1; queue[qTail++]=p+1 }
+    if (py > 0     && labels[p-W] === 0 && !reachable[p-W]) { reachable[p-W]=1; queue[qTail++]=p-W }
+    if (py < H - 1 && labels[p+W] === 0 && !reachable[p+W]) { reachable[p+W]=1; queue[qTail++]=p+W }
+  }
+
+  // Шаг 2: заполнить замкнутые дыры — несколько волн расширения от соседей
+  // Итерируем пока есть изменения (дыры могут быть больше 1 пикселя)
+  let changed = true
+  while (changed) {
+    changed = false
+    for (let p = 0; p < W * H; p++) {
+      if (labels[p] !== 0 || reachable[p]) continue
+      const py = (p / W) | 0, px = p % W
+      let nb = 0
+      if (px > 0     && labels[p-1] > 0) nb = labels[p-1]
+      else if (px < W-1 && labels[p+1] > 0) nb = labels[p+1]
+      else if (py > 0     && labels[p-W] > 0) nb = labels[p-W]
+      else if (py < H-1  && labels[p+W] > 0) nb = labels[p+W]
+      if (nb > 0) { labels[p] = nb; changed = true }
+    }
+  }
+
+  // Шаг 3: пересчитать площади регионов
+  const areaCnt = new Map()
+  for (let p = 0; p < W * H; p++) {
+    const lb = labels[p]
+    if (lb > 0) areaCnt.set(lb, (areaCnt.get(lb) || 0) + 1)
+  }
+  for (const r of regions) {
+    const updated = areaCnt.get(r.label)
+    if (updated) r.area = updated
+  }
 }
 
 // Moore-neighbor boundary tracing on a labeled region.
@@ -1123,20 +1185,77 @@ const ZOOM_MIN = 0.25, ZOOM_MAX = 8.0, ZOOM_STEP = 0.2
 
 function applyZoom() {
   const group = document.getElementById('canvasGroup')
-  if (group) group.style.transform = `scale(${zoomLevel})`
+  const wrap  = document.querySelector('.canvas-wrap')
+  if (!group || !wrap) return
+
+  // CSS zoom (Chromium/Electron) — в отличие от transform:scale реально
+  // раздвигает layout, поэтому overflow:auto даёт полосы прокрутки
+  group.style.zoom      = zoomLevel
+  group.style.transform = ''  // убрать старый scale если был
+
+  if (zoomLevel > 1) {
+    wrap.style.overflow       = 'auto'
+    wrap.style.alignItems     = 'flex-start'
+    wrap.style.justifyContent = 'flex-start'
+  } else {
+    wrap.style.overflow       = 'hidden'
+    wrap.style.alignItems     = 'center'
+    wrap.style.justifyContent = 'center'
+  }
+
   const lbl = document.getElementById('zoomLabel')
   if (lbl) lbl.textContent = `${Math.round(zoomLevel * 100)}%`
 }
 
 function zoomIn()    { zoomLevel = Math.min(ZOOM_MAX, +(zoomLevel + ZOOM_STEP).toFixed(2)); applyZoom() }
 function zoomOut()   { zoomLevel = Math.max(ZOOM_MIN, +(zoomLevel - ZOOM_STEP).toFixed(2)); applyZoom() }
-function resetZoom() { zoomLevel = 1.0; applyZoom() }
+function resetZoom() { zoomLevel = 1.0; applyZoom(); const wrap = document.querySelector('.canvas-wrap'); if (wrap) { wrap.scrollLeft = 0; wrap.scrollTop = 0 } }
 
-document.addEventListener('wheel', e => {
-  if (!e.ctrlKey) return
-  e.preventDefault()
-  e.deltaY < 0 ? zoomIn() : zoomOut()
-}, { passive: false })
+// Зум колесом мыши над холстом (без Ctrl)
+const _canvasWrap = document.querySelector('.canvas-wrap')
+if (_canvasWrap) {
+  _canvasWrap.addEventListener('wheel', e => {
+    if (editMode === 'eraser') return  // ластик использует колесо сам
+    e.preventDefault()
+    e.deltaY < 0 ? zoomIn() : zoomOut()
+  }, { passive: false })
+}
+
+// Панорамирование перетаскиванием (во всех режимах кроме edit/draw/eraser)
+;(function initPan() {
+  const wrap = document.querySelector('.canvas-wrap')
+  if (!wrap) return
+  let _pan = null  // { startX, startY, scrollLeft, scrollTop }
+
+  wrap.addEventListener('mousedown', e => {
+    // Только левая кнопка, только в view/delete/rescan/crop режимах
+    if (e.button !== 0) return
+    if (editMode === 'edit' || editMode === 'collider' || editMode === 'eraser') return
+    // Если клик по канвасу — даём click-handler выбрать комнату,
+    // но одновременно начинаем отслеживать drag
+    _pan = { startX: e.clientX, startY: e.clientY,
+             scrollLeft: wrap.scrollLeft, scrollTop: wrap.scrollTop,
+             moved: false }
+  })
+
+  window.addEventListener('mousemove', e => {
+    if (!_pan) return
+    const dx = e.clientX - _pan.startX
+    const dy = e.clientY - _pan.startY
+    if (!_pan.moved && Math.hypot(dx, dy) < 4) return  // порог
+    _pan.moved = true
+    wrap.scrollLeft = _pan.scrollLeft - dx
+    wrap.scrollTop  = _pan.scrollTop  - dy
+    wrap.style.cursor = 'grabbing'
+  })
+
+  window.addEventListener('mouseup', () => {
+    if (_pan) {
+      wrap.style.cursor = ''
+      _pan = null
+    }
+  })
+})()
 
 document.addEventListener('keydown', e => {
   if (e.ctrlKey && (e.key === '=' || e.key === '+')) { e.preventDefault(); zoomIn() }
@@ -1522,8 +1641,9 @@ function saveChecked() {
 const REG = {
   // Порог угла (°) для слияния коллинеарных вершин
   collinearDeg:   8,
-  // Порог (°) для snap к 0/90
-  orthoDeg:       15,
+  // Порог (°) для snap рёбер к ближайшему кратному 90°
+  // от доминирующей ориентации помещения
+  orthoDeg:       22,
   // Мин. точек на дуге для детектирования
   arcMinPts:      5,
   // Макс. RMS отклонение (px в координатах изображения) для дуги
@@ -1633,26 +1753,81 @@ function _mergeCollinear(poly, threshDeg) {
   return pts
 }
 
-// ── Step 2: snap edges to 0° / 90° ────────────────────────────
+
+// ── Доминирующая ориентация помещения ────────────────────────
+// Возвращает угол (°) наиболее длинных рёбер, свёрнутый в [0°, 90°).
+// Это "база" для snap: комната, повёрнутая на любой угол, получает
+// прямые углы в своей локальной системе, а не только axis-aligned.
+function _findDominantAngle(poly) {
+  const n = poly.length
+  const BINS = 360  // 0.25° точность в [0°, 90°)
+  const hist = new Float64Array(BINS)
+
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n
+    const dx = poly[j][0] - poly[i][0]
+    const dy = poly[j][1] - poly[i][1]
+    const len = Math.hypot(dx, dy)
+    if (len < 2) continue
+    // Угол в [0°, 180°), затем складываем в [0°, 90°)
+    let ang = Math.atan2(dy, dx) * 180 / Math.PI
+    ang = ((ang % 180) + 180) % 180
+    if (ang >= 90) ang -= 90
+    const bin = Math.min(BINS - 1, Math.floor(ang / 90 * BINS))
+    hist[bin] += len
+  }
+
+  // Мягкое сглаживание (Gaussian-like, окно ±3 бина)
+  const smooth = new Float64Array(BINS)
+  const W = [0.25, 0.5, 1.0, 0.5, 0.25]
+  for (let i = 0; i < BINS; i++) {
+    let s = 0
+    for (let d = -2; d <= 2; d++) s += hist[((i + d) % BINS + BINS) % BINS] * W[d + 2]
+    smooth[i] = s
+  }
+
+  // Пик
+  let peak = 0
+  for (let i = 1; i < BINS; i++) if (smooth[i] > smooth[peak]) peak = i
+
+  // Взвешенный центроид вокруг пика для субпиксельной точности
+  let sumW = 0, sumA = 0
+  for (let d = -4; d <= 4; d++) {
+    const b = ((peak + d) % BINS + BINS) % BINS
+    sumW += smooth[b]
+    sumA += smooth[b] * (b + 0.5)
+  }
+  return sumW > 0 ? (sumA / sumW) / BINS * 90 : 0
+}
+
+// ── Step 2: snap edges to 90°-multiples of dominant room angle ─
+// Комната может быть повёрнута на произвольный угол: сначала
+// находим её доминирующую ориентацию, затем снэпим каждое ребро
+// к ближайшему кратному 90° от этой базы.
 function _orthogonalize(poly, threshDeg) {
   if (poly.length < 3) return poly.slice()
+
+  // Базовый угол помещения (в его «локальной» системе)
+  const base = _findDominantAngle(poly)
+
   const pts = poly.map(p => [...p])
   const n   = pts.length
-  // Two passes for stability
+  // Три прохода для стабильности
   for (let pass = 0; pass < 3; pass++) {
     for (let i = 0; i < n; i++) {
       const j = (i + 1) % n
       const dx = pts[j][0] - pts[i][0]
       const dy = pts[j][1] - pts[i][1]
       const ang = Math.atan2(dy, dx) * 180 / Math.PI
-      // Nearest cardinal: 0, 90, 180, -90
-      const snapped = Math.round(ang / 90) * 90
+      // Ближайший кратный 90° от base
+      const rel     = ang - base
+      const snapped = Math.round(rel / 90) * 90 + base
       if (Math.abs(ang - snapped) <= threshDeg) {
         const len = Math.hypot(dx, dy)
         const rad = snapped * Math.PI / 180
         const nx  = pts[i][0] + len * Math.cos(rad)
         const ny  = pts[i][1] + len * Math.sin(rad)
-        // Move j halfway to avoid over-correction
+        // Двигаем j наполовину, чтобы не перекорректировать
         pts[j][0] = Math.round((pts[j][0] + nx) / 2)
         pts[j][1] = Math.round((pts[j][1] + ny) / 2)
       }
