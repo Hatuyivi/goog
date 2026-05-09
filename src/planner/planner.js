@@ -155,6 +155,7 @@ function loadFile(filePath) {
       currentImageBW = makeBWCanvas(img)
       resizeCanvas(img)
       drawPlan()
+      document.getElementById('canvasGroup').style.display = ''
       canvas.style.display = 'block'
       canvasPlaceholder.style.display = 'none'
       viewLabel.textContent = 'Нажми «Распознать помещения»'
@@ -190,6 +191,7 @@ function clearPlan() {
   currentImageB64 = null; currentImageEl = null; currentImageBW = null
   previewThumb.style.display = 'none'; dropzone.style.display = 'block'
   canvas.style.display = 'none'; canvasPlaceholder.style.display = 'flex'
+  document.getElementById('canvasGroup').style.display = 'none'
   analyseBtn.disabled = true
   viewLabel.textContent = 'Загрузи план слева'
   viewAllBtn.style.display = 'none'; viewSelBtn.style.display = 'none'
