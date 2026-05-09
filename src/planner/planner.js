@@ -1638,18 +1638,29 @@ async function saveEdits() {
 
 function tick() { return new Promise(r => setTimeout(r, 0)) }
 
-// ── Local CV pipeline ──────────────────────────────────────
+// ── Local CV pipeline — Watershed + Distance Transform ─────────────────────
+//
+// Алгоритм:
+//   1. Grayscale → Otsu/Sauvola бинаризация (стены = 0, свободно = 1)
+//   2. Morphological closing с радиусом ≈ макс. ширина двери
+//      → закрывает дверные проёмы, поглощает мебель, штриховку
+//   3. Distance Transform (EDT, 2-pass приближение)
+//      → каждый свободный пиксель = расстояние до ближайшей стены
+//   4. Подавление немаксимумов на DT-карте + кластеризация пиков
+//      → центры помещений (seeds для Watershed)
+//   5. Priority-queue Watershed от каждого seed
+//      → границы проходят по минимуму DT = по стенам
+//   6. Постобработка: фильтрация по площади, contour tracing → полигоны
+//
 async function detectRoomsLocal(imageEl, opts) {
-  // ── Debug slider params (from left panel) ──────────────────────────────────
-  const _minCompact = (+(document.getElementById('paramMinCompact')?.value ?? 8))  / 100
-  const _minFill    = (+(document.getElementById('paramMinFill')?.value    ?? 35)) / 100
-  const _maxAreaPct = (+(document.getElementById('paramMaxArea')?.value    ?? 92)) / 100
-  const _dashGapMul = (+(document.getElementById('paramDashGap')?.value    ?? 10)) / 10
+  // ── Slider params ──────────────────────────────────────────────────────────
+  const _maxAreaPct  = (+(document.getElementById('paramMaxArea')?.value    ?? 92)) / 100
+  const _minCompact  = (+(document.getElementById('paramMinCompact')?.value ?? 8))  / 100
+  const _closingMul  = (+(document.getElementById('paramDashGap')?.value    ?? 10)) / 10  // переиспользуем слайдер
+  const _minFill     = (+(document.getElementById('paramMinFill')?.value    ?? 35)) / 100
 
-  // Поддерживаем как HTMLImageElement (naturalWidth), так и HTMLCanvasElement (width)
-  const W0 = imageEl.naturalWidth ?? imageEl.width
+  const W0 = imageEl.naturalWidth  ?? imageEl.width
   const H0 = imageEl.naturalHeight ?? imageEl.height
-
   const MAX_DIM = 2000
   const scale = Math.min(1, MAX_DIM / Math.max(W0, H0))
   const W = Math.round(W0 * scale), H = Math.round(H0 * scale)
@@ -1660,129 +1671,22 @@ async function detectRoomsLocal(imageEl, opts) {
   wctx.drawImage(imageEl, 0, 0, W, H)
   const px = wctx.getImageData(0, 0, W, H).data
 
-  // ── Grayscale ──────────────────────────────────────────────────────────────
+  // ── 1. Grayscale ───────────────────────────────────────────────────────────
   const gray = new Uint8Array(W * H)
   for (let i = 0, j = 0; i < px.length; i += 4, j++) {
     gray[j] = (px[i] * 0.299 + px[i+1] * 0.587 + px[i+2] * 0.114) | 0
   }
 
-  // ── Оцениваем качество изображения ────────────────────────────────────────
-  // Стандартное отклонение яркости: низкое (<40) = плохой контраст (скан, фото телефоном)
-  // В этом случае применяем CLAHE для выравнивания контраста перед порогованием.
+  // ── Определяем толщину стен ────────────────────────────────────────────────
+  const wallInfo = detectWallThickness(gray, W, H, opts.useKmeans || false)
+
+  // ── 2. Бинаризация — стены = 0, свободно = 1 ──────────────────────────────
+  // Адаптивный порог Саувола для фото, Otsu для сканов/PDF
   let mean = 0
   for (let i = 0; i < gray.length; i++) mean += gray[i]
   mean /= gray.length
 
-  // ── Автодетекция толщины стен ─────────────────────────────────────────────
-  // Запускаем до CLAHE — на исходных пикселях сигнал чище для сканов.
-  // Результат используется вместо захардкоженного wallEst = 1% от короткой стороны.
-  const wallInfo = detectWallThickness(gray, W, H, opts.useKmeans || false)
-  let variance = 0
-  for (let i = 0; i < gray.length; i++) variance += (gray[i] - mean) ** 2
-  const stddev = Math.sqrt(variance / gray.length)
-  const needsCLAHE = stddev < 40
-
-  if (needsCLAHE) {
-    // CLAHE только на изображениях с плохим контрастом
-    // Делим на 8x8 тайлов, каждый выравниваем независимо, потом билинейно смешиваем
-    const TILE_COLS = 8, TILE_ROWS = 8, CLIP = 3.0
-    const tw = Math.ceil(W / TILE_COLS), th = Math.ceil(H / TILE_ROWS)
-    const luts = []
-    for (let tr = 0; tr < TILE_ROWS; tr++) {
-      luts[tr] = []
-      for (let tc = 0; tc < TILE_COLS; tc++) {
-        const hist = new Uint32Array(256)
-        const x0 = tc * tw, y0 = tr * th
-        const x1 = Math.min(x0 + tw, W), y1 = Math.min(y0 + th, H)
-        let count = 0
-        for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { hist[gray[y*W+x]]++; count++ }
-        const clipLimit = Math.max(1, Math.round(CLIP * count / 256))
-        let excess = 0
-        for (let v = 0; v < 256; v++) { if (hist[v] > clipLimit) { excess += hist[v] - clipLimit; hist[v] = clipLimit } }
-        const add = (excess / 256) | 0
-        for (let v = 0; v < 256; v++) hist[v] += add
-        const lut = new Uint8Array(256)
-        let cdf = 0, cdfMin = -1
-        for (let v = 0; v < 256; v++) {
-          cdf += hist[v]
-          if (cdfMin < 0 && hist[v] > 0) cdfMin = cdf
-          lut[v] = (cdfMin >= 0 && count > cdfMin) ? Math.round((cdf - cdfMin) / (count - cdfMin) * 255) : v
-        }
-        luts[tr][tc] = lut
-      }
-    }
-    const out = new Uint8Array(gray.length)
-    for (let y = 0; y < H; y++) {
-      const fyRaw = (y - th/2) / th
-      const tr0 = Math.max(0, Math.min(TILE_ROWS-2, Math.floor(fyRaw)))
-      const fy  = Math.max(0, Math.min(1, fyRaw - tr0))
-      for (let x = 0; x < W; x++) {
-        const fxRaw = (x - tw/2) / tw
-        const tc0 = Math.max(0, Math.min(TILE_COLS-2, Math.floor(fxRaw)))
-        const fx  = Math.max(0, Math.min(1, fxRaw - tc0))
-        const v   = gray[y*W+x]
-        const v00 = luts[tr0][tc0][v], v01 = luts[tr0][tc0+1][v]
-        const v10 = luts[tr0+1][tc0][v], v11 = luts[tr0+1][tc0+1][v]
-        out[y*W+x] = (v00*(1-fx)*(1-fy) + v01*fx*(1-fy) + v10*(1-fx)*fy + v11*fx*fy) | 0
-      }
-    }
-    for (let i = 0; i < gray.length; i++) gray[i] = out[i]
-  }
-
-  // ── Адаптивный порог Саувола ───────────────────────────────────────────────
-  // Для каждого пикселя порог = локальное среднее + k * локальное σ
-  // Работает одинаково хорошо на светлых и тёмных планах — без угадывания типа.
-  // Если пользователь задал порог вручную — используем глобальный Otsu как раньше.
-  // Буферы под интегральные образы — выделяем один раз, переиспользуем в обоих вызовах
-  // Float64Array(2001×2001) = ~32 МБ × 2 = ~64 МБ, приемлемо для Electron
-  const _iSum  = new Float64Array((W+1) * (H+1))
-  const _iSum2 = new Float64Array((W+1) * (H+1))
-
-  function sauvolaThreshold(gray, W, H, windowR, k) {
-    const iSum  = _iSum
-    const iSum2 = _iSum2
-    // Обнуляем перед использованием (буфер переиспользуется)
-    iSum.fill(0); iSum2.fill(0)
-    for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++) {
-        const v = gray[y*W+x]
-        iSum [(y+1)*(W+1)+(x+1)] = v + iSum [y*(W+1)+(x+1)] + iSum [(y+1)*(W+1)+x] - iSum [y*(W+1)+x]
-        iSum2[(y+1)*(W+1)+(x+1)] = v*v + iSum2[y*(W+1)+(x+1)] + iSum2[(y+1)*(W+1)+x] - iSum2[y*(W+1)+x]
-      }
-    }
-    const bin = new Uint8Array(W * H)
-    for (let y = 0; y < H; y++) {
-      const y0 = Math.max(0, y - windowR), y1 = Math.min(H-1, y + windowR)
-      for (let x = 0; x < W; x++) {
-        const x0 = Math.max(0, x - windowR), x1 = Math.min(W-1, x + windowR)
-        const n  = (y1-y0+1) * (x1-x0+1)
-        const s  = iSum [(y1+1)*(W+1)+(x1+1)] - iSum [y0*(W+1)+(x1+1)] - iSum [(y1+1)*(W+1)+x0] + iSum [y0*(W+1)+x0]
-        const s2 = iSum2[(y1+1)*(W+1)+(x1+1)] - iSum2[y0*(W+1)+(x1+1)] - iSum2[(y1+1)*(W+1)+x0] + iSum2[y0*(W+1)+x0]
-        const localMean = s / n
-        const localVar  = Math.max(0, s2/n - localMean*localMean)
-        const localStd  = Math.sqrt(localVar)
-        // Саувола: T = mean * (1 + k * (std/128 - 1))
-        // Пиксель светлее порога → свободное пространство (комната)
-        const T = localMean * (1 + k * (localStd / 128 - 1))
-        bin[y*W+x] = gray[y*W+x] > T ? 1 : 0
-      }
-    }
-    return bin
-  }
-
-  // Размер окна Саувола ≈ толщина стены × 3.
-  // Используем реальный wallPeak из детекции вместо грубой эвристики 1% от стороны.
-  const wallEst = wallInfo
-    ? Math.max(2, Math.min(40, wallInfo.wallPeak))
-    : Math.max(2, Math.min(40, Math.round(Math.min(W, H) * 0.01)))
-  const windowR = Math.max(7, wallEst * 3)
-  const K_SAUVOLA = 0.2
-
-  // ── Определяем тип источника: фото или скан ──────────────────────────────
-  // Фото с телефона: неравномерный фон (тени, перспектива) — высокая локальная
-  // неоднородность яркости в фоновых зонах (пикселях светлее среднего).
-  // Скан/PDF: фон почти однородный — низкая локальная неоднородность.
-  // Метрика: среднее σ по блокам 32×32 среди светлых пикселей (фон без стен).
+  // Определяем тип источника (фото vs скан)
   let isPhoto = false
   if (opts.threshold == null) {
     const BLOCK = 32
@@ -1803,476 +1707,333 @@ async function detectRoomsLocal(imageEl, opts) {
         }
       }
     }
-    // Среднее σ фоновых блоков > 12 → неравномерный фон → фото
     isPhoto = blockCount > 0 && (blockVarSum / blockCount) > 12
   }
 
-  let bin1, bin2
-  let _cannyEdges  = null  // Canny edges — kept for Hough snap/align (scan mode)
-  let _houghRooms  = null  // Polygons built from Probabilistic Hough intersections
-
-  // ── DETECTION: Otsu brightness threshold (primary, all modes) ───────────────
-  // Rooms are light pixels, walls are dark pixels.  Otsu finds the optimal
-  // threshold automatically.  This is robust for any plan with dark walls on a
-  // light background — thick or thin, CAD or photo.
-  //
-  // Canny is kept ONLY for boundary refinement (step 7 below: snap polygon
-  // vertices to real wall edges).  It is NOT used for room detection anymore
-  // because Canny-inverted binaries treat thick-wall interiors as free space,
-  // merging every room into one giant blob.
-
-  if (opts.threshold == null && !isPhoto) {
-    // ── Scan / CAD mode: compute Canny now so it's ready for polygon refinement.
-    // Canny is NOT used to build bin1/bin2 — only stored in _cannyEdges for the
-    // axisAlignEdges + snapToRightAngles refinement steps later.
-    _cannyEdges = cannyEdges(gray, W, H)
-    const closeR = Math.max(1, Math.round(wallEst * 0.6))
-    const closedEdges = morphClose(_cannyEdges, W, H, closeR)
-
-    // Hough line segments — used in axisAlignEdges to snap polygon edges to
-    // detected wall lines.  Also feeds buildRoomsFromLines (PATH A supplement).
-    const houghSegs = probabilisticHough(closedEdges, W, H, {
-      threshold: Math.max(25, Math.min(W, H) * 0.05),
-      minLength: Math.max(15, Math.min(W, H) * 0.03),
-      maxGap:    Math.max(4,  Math.min(W, H) * 0.006),
-    })
-    _houghRooms = buildRoomsFromLines(houghSegs, W, H, closedEdges)
-  }
-
-  // ── bin1 (strict) and bin2 (loose) — pure brightness, no Canny ───────────
-  if (isPhoto && opts.threshold == null) {
-    // Photo mode: Sauvola adaptive threshold handles uneven lighting
-    bin1 = sauvolaThreshold(gray, W, H, windowR,     K_SAUVOLA)
-    bin2 = sauvolaThreshold(gray, W, H, windowR + 8, K_SAUVOLA - 0.05)
-  } else {
-    // Scan / CAD / manual mode: global Otsu or user-supplied threshold.
-    // Pure brightness — correctly marks thick black wall interiors as wall (=0).
-    const T      = opts.threshold != null ? opts.threshold : otsu(gray)
-    const T_loose = Math.max(T - 30, 80)
-    bin1 = new Uint8Array(gray.length)
-    bin2 = new Uint8Array(gray.length)
-    for (let i = 0; i < gray.length; i++) {
-      bin1[i] = gray[i] > T       ? 1 : 0
-      bin2[i] = gray[i] > T_loose ? 1 : 0
-    }
-  }
-
-  // ---- Artificial wall border -----------------------------------------------
-  // 3-pixel ring of zeros around the binary image prevents the touchesBorder
-  // filter from incorrectly discarding perimeter offices along outer building walls.
-  const WALL_BORDER = 3
-  for (let k = 0; k < WALL_BORDER; k++) {
-    for (let x = 0; x < W; x++) {
-      bin1[k*W+x] = 0; bin2[k*W+x] = 0
-      bin1[(H-1-k)*W+x] = 0; bin2[(H-1-k)*W+x] = 0
-    }
-    for (let y = 0; y < H; y++) {
-      bin1[y*W+k] = 0; bin2[y*W+k] = 0
-      bin1[y*W+(W-1-k)] = 0; bin2[y*W+(W-1-k)] = 0
-    }
-  }
-
-  // ---- Close doorway gaps in binary map ----------------------------------------
-  // Architectural plans have doorway openings: short gaps in walls (typ. 80-120cm).
-  // We close these gaps by scanning for "gap columns/rows" — sequences of free pixels
-  // flanked by wall pixels on both sides — and filling them if gap ≤ maxDoorPx.
-  // This is done BEFORE erosion so that rooms separated only by a door opening
-  // are treated as separate connected components.
-  function closeDoorGaps(bin, W, H) {
-    const out = bin.slice()
-    // maxDoor: typical doorway at floor-plan scale.
-    // 1.2% of short side ≈ 24 px at 2000 px → ~90 cm at 1:50 scale.
-    // 2.5% was too large — it closed interior passages in large rooms.
-    const maxDoor = Math.max(6, Math.round(Math.min(W, H) * 0.012))
-
-    // Horizontal scan: free pixel runs flanked by wall on BOTH left AND right,
-    // AND wall pixels present BOTH above AND below (confirms this is a doorway gap
-    // cutting through a wall, not an open interior space).
-    for (let y = 1; y < H - 1; y++) {
-      let x = 1
-      while (x < W - 1) {
-        if (out[y*W+x] === 0) { x++; continue }
-        let gapStart = x
-        while (x < W && out[y*W+x] === 1) x++
-        const gapEnd = x - 1
-        const gapLen = gapEnd - gapStart + 1
-        if (gapLen > maxDoor) continue
-        const hasWallLeft  = gapStart > 0 && out[y*W+(gapStart-1)] === 0
-        const hasWallRight = gapEnd < W-1  && out[y*W+(gapEnd+1)]  === 0
-        if (hasWallLeft && hasWallRight) {
-          let wallAbove = 0, wallBelow = 0
-          for (let gx = gapStart; gx <= gapEnd; gx++) {
-            if (y > 0   && out[(y-1)*W+gx] === 0) wallAbove++
-            if (y < H-1 && out[(y+1)*W+gx] === 0) wallBelow++
-          }
-          // Require walls BOTH above AND below — doorway cuts through a wall.
-          // OR logic caused false closures inside large open rooms.
-          if (wallAbove > gapLen * 0.4 && wallBelow > gapLen * 0.4) {
-            for (let gx = gapStart; gx <= gapEnd; gx++) out[y*W+gx] = 0
-          }
-        }
-      }
-    }
-
-    // Vertical scan: same logic — require walls on BOTH left AND right sides.
-    for (let x = 1; x < W - 1; x++) {
-      let y = 1
-      while (y < H - 1) {
-        if (out[y*W+x] === 0) { y++; continue }
-        let gapStart = y
-        while (y < H && out[y*W+x] === 1) y++
-        const gapEnd = y - 1
-        const gapLen = gapEnd - gapStart + 1
-        if (gapLen > maxDoor) continue
-        const hasWallAbove = gapStart > 0 && out[(gapStart-1)*W+x] === 0
-        const hasWallBelow = gapEnd < H-1  && out[(gapEnd+1)*W+x]  === 0
-        if (hasWallAbove && hasWallBelow) {
-          let wallLeft = 0, wallRight = 0
-          for (let gy = gapStart; gy <= gapEnd; gy++) {
-            if (x > 0   && out[gy*W+(x-1)] === 0) wallLeft++
-            if (x < W-1 && out[gy*W+(x+1)] === 0) wallRight++
-          }
-          // Require walls BOTH left AND right.
-          if (wallLeft > gapLen * 0.4 && wallRight > gapLen * 0.4) {
-            for (let gy = gapStart; gy <= gapEnd; gy++) out[gy*W+x] = 0
-          }
-        }
-      }
-    }
-    return out
-  }
-
-  // ---- Close dashed-wall gaps ------------------------------------------------
-  // Architectural plans use dashed lines for zone/administrative boundaries.
-  // These appear in the binary as repeating dark-light-dark patterns with gaps
-  // larger than typical doorways (closeDoorGaps uses ~1.2% of short side, which
-  // is too small for dash spacing). We detect the dash pattern and fill the gaps
-  // so flood fill treats them as solid walls.
-  function closeDashedWalls(bin, W, H) {
-    const out = bin.slice()
-    // Max gap between dashes: ~2.5% of short side × slider multiplier
-    const maxGap  = Math.max(18, Math.round(Math.min(W, H) * 0.025 * _dashGapMul))
-    const minDash = 3   // min dark-pixel run to qualify as a "dash"
-
-    // Horizontal scan
-    for (let y = 1; y < H - 1; y++) {
-      let x = 1
-      while (x < W - 1) {
-        if (out[y*W+x] === 0) { x++; continue }
-        const gapStart = x
-        while (x < W && out[y*W+x] === 1) x++
-        const gapLen = x - gapStart
-        if (gapLen < 1 || gapLen > maxGap) continue
-        const hasWallLeft  = gapStart > 0 && out[y*W+(gapStart-1)] === 0
-        const hasWallRight = x < W        && out[y*W+x]             === 0
-        if (!hasWallLeft || !hasWallRight) continue
-        let leftDark = 0
-        for (let lx = gapStart - 1; lx >= Math.max(0, gapStart - 20); lx--) {
-          if (out[y*W+lx] === 0) leftDark++; else break
-        }
-        let rightDark = 0
-        for (let rx = x; rx < Math.min(W, x + 20); rx++) {
-          if (out[y*W+rx] === 0) rightDark++; else break
-        }
-        if (leftDark >= minDash && rightDark >= minDash) {
-          for (let gx = gapStart; gx < x; gx++) out[y*W+gx] = 0
-        }
-      }
-    }
-
-    // Vertical scan
-    for (let x = 1; x < W - 1; x++) {
-      let y = 1
-      while (y < H - 1) {
-        if (out[y*W+x] === 0) { y++; continue }
-        const gapStart = y
-        while (y < H && out[y*W+x] === 1) y++
-        const gapLen = y - gapStart
-        if (gapLen < 1 || gapLen > maxGap) continue
-        const hasWallAbove = gapStart > 0 && out[(gapStart-1)*W+x] === 0
-        const hasWallBelow = y < H        && out[y*W+x]             === 0
-        if (!hasWallAbove || !hasWallBelow) continue
-        let aboveDark = 0
-        for (let ay = gapStart - 1; ay >= Math.max(0, gapStart - 20); ay--) {
-          if (out[ay*W+x] === 0) aboveDark++; else break
-        }
-        let belowDark = 0
-        for (let by = y; by < Math.min(H, y + 20); by++) {
-          if (out[by*W+x] === 0) belowDark++; else break
-        }
-        if (aboveDark >= minDash && belowDark >= minDash) {
-          for (let gy = gapStart; gy < y; gy++) out[gy*W+x] = 0
-        }
-      }
-    }
-    return out
-  }
-
-  bin1 = closeDashedWalls(bin1, W, H)
-  bin2 = closeDashedWalls(bin2, W, H)
-
-  // closeDoorGaps is only meaningful on the Canny-inverted binary (bin1) where
-  // "free" pixels are gaps in wall lines.  bin2 is Otsu-brightness-based — its
-  // large open rooms are wide white blobs; running closeDoorGaps on them with a
-  // large threshold fragments those blobs at narrow interior passages and makes
-  // large rooms disappear entirely.  Never apply to bin2.
-  bin1 = closeDoorGaps(bin1, W, H)
-
-  // ---- Erosion (thicken walls) ----------------------------------------------
-  // Auto: erode once when walls look thin (wallPeak < 8px in work canvas).
-  // Manual threshold overrides to no erosion (user controls via threshold slider).
-  const autoDilateK = (opts.threshold == null && wallInfo && wallInfo.wallPeak <= 7) ? 1 : 0
-  for (let i = 0; i < autoDilateK; i++) { bin1 = erode4(bin1, W, H); bin2 = erode4(bin2, W, H) }
-  bin2 = erode4(bin2, W, H)  // extra pass for loose
-
-  // ── Connected components ───────────────────────────────────────────────────
-  function floodFill(bin) {
-    const labels  = new Int32Array(W * H)
-    const regions = []
-    let nextLabel = 1
-    const stack   = new Int32Array(W * H)
+  // Саувола (для фото и сканов с плохим контрастом)
+  function sauvolaThreshold(gray, W, H, windowR, k) {
+    const iSum  = new Float64Array((W+1) * (H+1))
+    const iSum2 = new Float64Array((W+1) * (H+1))
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
-        const idx = y * W + x
-        if (bin[idx] !== 1 || labels[idx] !== 0) continue
-        let minX = x, maxX = x, minY = y, maxY = y, area = 0
-        let touchesBorder = false
-        let sp = 0
-        stack[sp++] = idx; labels[idx] = nextLabel
-        while (sp > 0) {
-          const p = stack[--sp]
-          const py = (p / W) | 0, pxx = p - py * W
-          area++
-          if (pxx < minX) minX = pxx; if (pxx > maxX) maxX = pxx
-          if (py  < minY) minY = py;  if (py  > maxY) maxY = py
-          if (pxx === 0 || py === 0 || pxx === W-1 || py === H-1) touchesBorder = true
-          if (pxx > 0)     { const n=p-1; if (bin[n]===1&&labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
-          if (pxx < W - 1) { const n=p+1; if (bin[n]===1&&labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
-          if (py  > 0)     { const n=p-W; if (bin[n]===1&&labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
-          if (py  < H - 1) { const n=p+W; if (bin[n]===1&&labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
-        }
-        regions.push({ label: nextLabel, minX, maxX, minY, maxY, area, touchesBorder })
-        nextLabel++
+        const v = gray[y*W+x]
+        iSum [(y+1)*(W+1)+(x+1)] = v     + iSum [y*(W+1)+(x+1)] + iSum [(y+1)*(W+1)+x] - iSum [y*(W+1)+x]
+        iSum2[(y+1)*(W+1)+(x+1)] = v*v   + iSum2[y*(W+1)+(x+1)] + iSum2[(y+1)*(W+1)+x] - iSum2[y*(W+1)+x]
       }
     }
-    return { labels, regions }
+    const bin = new Uint8Array(W * H)
+    for (let y = 0; y < H; y++) {
+      const y0 = Math.max(0, y - windowR), y1 = Math.min(H-1, y + windowR)
+      for (let x = 0; x < W; x++) {
+        const x0 = Math.max(0, x - windowR), x1 = Math.min(W-1, x + windowR)
+        const n  = (y1-y0+1) * (x1-x0+1)
+        const s  = iSum [(y1+1)*(W+1)+(x1+1)] - iSum [y0*(W+1)+(x1+1)] - iSum [(y1+1)*(W+1)+x0] + iSum [y0*(W+1)+x0]
+        const s2 = iSum2[(y1+1)*(W+1)+(x1+1)] - iSum2[y0*(W+1)+(x1+1)] - iSum2[(y1+1)*(W+1)+x0] + iSum2[y0*(W+1)+x0]
+        const localMean = s / n
+        const localVar  = Math.max(0, s2/n - localMean*localMean)
+        const localStd  = Math.sqrt(localVar)
+        const T = localMean * (1 + k * (localStd / 128 - 1))
+        bin[y*W+x] = gray[y*W+x] > T ? 1 : 0
+      }
+    }
+    return bin
   }
 
-  const { labels: labels1, regions: regions1 } = floodFill(bin1)
-  const { labels: labels2, regions: regions2 } = floodFill(bin2)
+  const wallEst = wallInfo
+    ? Math.max(2, Math.min(40, wallInfo.wallPeak))
+    : Math.max(2, Math.min(40, Math.round(Math.min(W, H) * 0.01)))
+  const windowR = Math.max(7, wallEst * 3)
+
+  let bin
+  if (opts.threshold != null) {
+    bin = new Uint8Array(gray.length)
+    for (let i = 0; i < gray.length; i++) bin[i] = gray[i] > opts.threshold ? 1 : 0
+  } else if (isPhoto) {
+    bin = sauvolaThreshold(gray, W, H, windowR, 0.2)
+  } else {
+    const T = otsu(gray)
+    bin = new Uint8Array(gray.length)
+    for (let i = 0; i < gray.length; i++) bin[i] = gray[i] > T ? 1 : 0
+  }
 
   await tick()
 
-  // ── Фильтрация кандидатов ──────────────────────────────────────────────────
-  const total   = W * H
-  // Auto min area: room must be at least (wallMin × 4)² pixels — ~4 wall thicknesses wide.
-  // Falls back to 0.3% of image area if wall detection failed.
-  const autoMinAreaFrac = wallInfo
-    ? Math.pow(wallInfo.wallMin * 4, 2) / total
-    : 0.003
-  const minArea = total * autoMinAreaFrac
-  const maxArea = total * _maxAreaPct  // from slider (default 0.92)
+  // ── 3. Morphological closing — закрываем двери и мебель ───────────────────
+  // Радиус = типичная ширина дверного проёма ≈ 3–4 × толщина стены.
+  // Слайдер «Зазор пунктира» масштабирует радиус (1.0 = авто).
+  // Результат: тёмные стены «расширяются», поглощая узкие проёмы и мебель.
+  // После этого каждое помещение — замкнутый светлый остров.
+  const doorWidth = Math.max(6, Math.round(wallEst * 3.5 * _closingMul))
 
-  // touchesBorder — умная проверка: отбрасываем регион только если он касается
-  // самого края растра (вероятно, фоновая область за пределами здания).
-  // НО: если регион большой (> 1% площади) и компактный (fill ratio > 0.5),
-  // это скорее перименальный офис у внешней стены — его НЕ выбрасываем.
-  function filterRegions(regions, fillRatioMin) {
-    return regions.filter(r => {
-      if (r.area < minArea || r.area > maxArea) return false
-      const bboxArea = (r.maxX - r.minX + 1) * (r.maxY - r.minY + 1)
-      const fillRatio = bboxArea > 0 ? r.area / bboxArea : 0
-      if (fillRatio < fillRatioMin) return false
-      // Отбрасываем граничные регионы только если они маленькие ИЛИ некомпактные
-      // Большие компактные регионы у края — это легитимные комнаты у внешней стены
-      if (r.touchesBorder) {
-        const isBigAndCompact = r.area > total * 0.005 && fillRatio > _minFill
-        if (!isBigAndCompact) return false
+  function morphDilate(bin, W, H, r) {
+    // Separable box dilation: horizontal pass then vertical pass — O(W*H*1) not O(W*H*r²)
+    const tmp = new Uint8Array(bin.length)
+    // Horizontal
+    for (let y = 0; y < H; y++) {
+      let count = 0
+      for (let x = 0; x < r; x++) if (bin[y*W+x]) count++
+      for (let x = 0; x < W; x++) {
+        if (x + r < W && bin[y*W+(x+r)]) count++
+        if (x - r - 1 >= 0 && bin[y*W+(x-r-1)]) count--
+        tmp[y*W+x] = count > 0 ? 1 : 0
       }
-      return true
-    })
+    }
+    const out = new Uint8Array(bin.length)
+    // Vertical
+    for (let x = 0; x < W; x++) {
+      let count = 0
+      for (let y = 0; y < r; y++) if (tmp[y*W+x]) count++
+      for (let y = 0; y < H; y++) {
+        if (y + r < H && tmp[(y+r)*W+x]) count++
+        if (y - r - 1 >= 0 && tmp[(y-r-1)*W+x]) count--
+        out[y*W+x] = count > 0 ? 1 : 0
+      }
+    }
+    return out
   }
 
-  const cand1 = filterRegions(regions1, 0.30)
-  const cand2 = filterRegions(regions2, 0.20)
-
-  // ── Дедупликация ───────────────────────────────────────────────────────────
-  function bboxOf(r) { return { x1: r.minX, y1: r.minY, x2: r.maxX, y2: r.maxY } }
-  function iou(a, b) {
-    const ix1 = Math.max(a.x1,b.x1), iy1 = Math.max(a.y1,b.y1)
-    const ix2 = Math.min(a.x2,b.x2), iy2 = Math.min(a.y2,b.y2)
-    if (ix2<=ix1||iy2<=iy1) return 0
-    const inter = (ix2-ix1)*(iy2-iy1)
-    const u = (a.x2-a.x1)*(a.y2-a.y1)+(b.x2-b.x1)*(b.y2-b.y1)-inter
-    return u<=0 ? 0 : inter/u
+  function morphErode(bin, W, H, r) {
+    // Separable box erosion
+    const tmp = new Uint8Array(bin.length)
+    const diam = 2 * r + 1
+    for (let y = 0; y < H; y++) {
+      let count = 0
+      for (let x = 0; x < diam && x < W; x++) if (bin[y*W+x]) count++
+      for (let x = 0; x < W; x++) {
+        if (x + r < W && bin[y*W+(x+r)]) count++
+        if (x - r - 1 >= 0 && bin[y*W+(x-r-1)]) count--
+        // Erode: pixel is 1 only if entire window is 1
+        // Approximate via: count === diam for interior pixels
+        const wStart = Math.max(0, x - r), wEnd = Math.min(W-1, x + r)
+        tmp[y*W+x] = count >= (wEnd - wStart + 1) ? 1 : 0
+      }
+    }
+    const out = new Uint8Array(bin.length)
+    for (let x = 0; x < W; x++) {
+      let count = 0
+      for (let y = 0; y < diam && y < H; y++) if (tmp[y*W+x]) count++
+      for (let y = 0; y < H; y++) {
+        if (y + r < H && tmp[(y+r)*W+x]) count++
+        if (y - r - 1 >= 0 && tmp[(y-r-1)*W+x]) count--
+        const hStart = Math.max(0, y - r), hEnd = Math.min(H-1, y + r)
+        out[y*W+x] = count >= (hEnd - hStart + 1) ? 1 : 0
+      }
+    }
+    return out
   }
-  const merged = [...cand1]
-  const strictBoxes = cand1.map(bboxOf)
-  for (const r of cand2) {
-    if (!strictBoxes.some(sb => iou(sb, bboxOf(r)) > 0.4)) merged.push(r)
+
+  // Closing = dilate then erode — закрывает дыры, не меняя внешние контуры
+  // Инвертируем: работаем по стенам (0→1) чтобы closing закрыл проёмы
+  const wallBin = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) wallBin[i] = bin[i] ? 0 : 1  // инверт
+  const wallClosed = morphErode(morphDilate(wallBin, W, H, doorWidth), W, H, doorWidth)
+  // Свободное пространство после закрытия
+  const freeBin = new Uint8Array(bin.length)
+  for (let i = 0; i < freeBin.length; i++) freeBin[i] = wallClosed[i] ? 0 : 1
+
+  // Убираем краевой пиксель (артефакты closing на границе)
+  for (let x = 0; x < W; x++) { freeBin[x] = 0; freeBin[(H-1)*W+x] = 0 }
+  for (let y = 0; y < H; y++) { freeBin[y*W] = 0; freeBin[y*W+(W-1)] = 0 }
+
+  await tick()
+
+  // ── 4. Distance Transform (приближённый EDT, 2 прохода) ───────────────────
+  // dt[i] = расстояние пикселя до ближайшей стены (в px).
+  // Свободные пиксели в центре комнаты имеют наибольшее dt → они seeds.
+  const INF = 1e9
+  const dt = new Float32Array(W * H)
+  // Прямой проход (сверху-слева)
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x
+      if (!freeBin[i]) { dt[i] = 0; continue }
+      let best = INF
+      if (x > 0 && dt[i-1] < INF)   best = Math.min(best, dt[i-1] + 1)
+      if (y > 0 && dt[i-W] < INF)   best = Math.min(best, dt[i-W] + 1)
+      if (x > 0 && y > 0 && dt[i-W-1] < INF) best = Math.min(best, dt[i-W-1] + 1.414)
+      if (x < W-1 && y > 0 && dt[i-W+1] < INF) best = Math.min(best, dt[i-W+1] + 1.414)
+      dt[i] = best < INF ? best : INF
+    }
+  }
+  // Обратный проход (снизу-справа)
+  for (let y = H - 1; y >= 0; y--) {
+    for (let x = W - 1; x >= 0; x--) {
+      const i = y * W + x
+      if (!freeBin[i]) continue
+      if (x < W-1 && dt[i+1] + 1 < dt[i])         dt[i] = dt[i+1] + 1
+      if (y < H-1 && dt[i+W] + 1 < dt[i])          dt[i] = dt[i+W] + 1
+      if (x < W-1 && y < H-1 && dt[i+W+1] + 1.414 < dt[i]) dt[i] = dt[i+W+1] + 1.414
+      if (x > 0   && y < H-1 && dt[i+W-1] + 1.414 < dt[i]) dt[i] = dt[i+W-1] + 1.414
+    }
   }
 
-  merged.sort((a, b) => {
-    const cyA = (a.minY+a.maxY)/2, cyB = (b.minY+b.maxY)/2
-    if (Math.abs(cyA-cyB) > 20) return cyA-cyB
-    return (a.minX+a.maxX)/2 - (b.minX+b.maxX)/2
+  // ── 5. Поиск seeds — локальных максимумов DT ──────────────────────────────
+  // Пик DT = центр помещения (он дальше всего от стен).
+  // Мин. расстояние между seed'ами = wallEst * 4 (чтобы не плодить seeds в одной комнате).
+  const minSeedDist = Math.max(wallEst * 4, 12)
+  const minSeedDT   = Math.max(wallEst * 1.5, 4)  // seed должен быть реально внутри комнаты
+
+  // Локальный максимум: dt[i] >= всех 8 соседей в окне minSeedDist/2
+  const peakR = Math.max(3, Math.round(minSeedDist / 2))
+
+  // Собираем все кандидаты в seeds
+  const seedCandidates = []
+  for (let y = peakR; y < H - peakR; y++) {
+    for (let x = peakR; x < W - peakR; x++) {
+      const i = y * W + x
+      if (!freeBin[i] || dt[i] < minSeedDT) continue
+      let isMax = true
+      check: for (let dy = -peakR; dy <= peakR; dy++) {
+        for (let dx = -peakR; dx <= peakR; dx++) {
+          if (dx === 0 && dy === 0) continue
+          if (dt[(y+dy)*W+(x+dx)] > dt[i]) { isMax = false; break check }
+        }
+      }
+      if (isMax) seedCandidates.push({ x, y, dt: dt[i] })
+    }
+  }
+
+  // Жадная дедупликация по расстоянию (NMS)
+  seedCandidates.sort((a, b) => b.dt - a.dt)
+  const seeds = []
+  const seedDist2 = minSeedDist * minSeedDist
+  for (const c of seedCandidates) {
+    const tooClose = seeds.some(s => (s.x-c.x)**2 + (s.y-c.y)**2 < seedDist2)
+    if (!tooClose) seeds.push(c)
+  }
+
+  await tick()
+
+  if (seeds.length === 0) {
+    return { rooms: [], wallInfo }
+  }
+
+  // ── 6. Watershed от seeds ─────────────────────────────────────────────────
+  // Priority Queue (min-heap по убыванию DT — «затапливаем» от пиков вниз)
+  // labels: 0 = необработано, -1 = стена/граница, 1..N = регион seed'а
+  const labels = new Int32Array(W * H)  // 0 = unvisited
+  // Простая реализация PQ через bucket (DT квантован в 0.5 px шагов)
+  const MAX_DT = Math.ceil(Math.max(...seeds.map(s => s.dt))) + 2
+  const BUCKETS = Math.ceil(MAX_DT * 2) + 2
+  const buckets = Array.from({ length: BUCKETS }, () => [])
+
+  for (let s = 0; s < seeds.length; s++) {
+    const { x, y } = seeds[s]
+    const i = y * W + x
+    labels[i] = s + 1
+    const bucket = Math.min(BUCKETS - 1, Math.floor(dt[i] * 2))
+    buckets[bucket].push(i)
+  }
+
+  // Обходим от высоких DT к низким (от центров к стенам)
+  const DIRS4 = [-1, 1, -W, W]
+
+  for (let b = BUCKETS - 1; b >= 0; b--) {
+    const bkt = buckets[b]
+    for (let qi = 0; qi < bkt.length; qi++) {
+      const p = bkt[qi]
+      const label = labels[p]
+      if (label === 0) continue
+
+      const py = (p / W) | 0, px2 = p - py * W
+
+      for (const dir of DIRS4) {
+        const nx = px2 + (dir === -1 ? -1 : dir === 1 ? 1 : 0)
+        const ny = py  + (dir === -W ? -1 : dir ===  W ? 1 : 0)
+        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue
+        const ni = ny * W + nx
+        if (!freeBin[ni]) continue   // стена
+        if (labels[ni] !== 0) continue  // уже обработан
+
+        labels[ni] = label
+        const nb = Math.min(BUCKETS - 1, Math.floor(dt[ni] * 2))
+        buckets[nb].push(ni)
+      }
+    }
+  }
+
+  await tick()
+
+  // ── 7. Построение регионов из watershed labels ────────────────────────────
+  const regionMap = new Map()  // label → {minX,maxX,minY,maxY,area}
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x
+      const lbl = labels[i]
+      if (lbl <= 0) continue
+      if (!regionMap.has(lbl)) {
+        regionMap.set(lbl, { label: lbl, minX: x, maxX: x, minY: y, maxY: y, area: 0 })
+      }
+      const r = regionMap.get(lbl)
+      if (x < r.minX) r.minX = x; if (x > r.maxX) r.maxX = x
+      if (y < r.minY) r.minY = y; if (y > r.maxY) r.maxY = y
+      r.area++
+    }
+  }
+
+  // ── 8. Фильтрация регионов ────────────────────────────────────────────────
+  const total = W * H
+  const minArea = wallInfo
+    ? Math.pow(wallInfo.wallMin * 4, 2)
+    : total * 0.002
+  const maxArea = total * _maxAreaPct
+
+  const inv = 1 / scale
+  const rooms = []
+  let roomIdx = 0
+
+  const regionList = [...regionMap.values()].sort((a, b) => {
+    const cyA = (a.minY + a.maxY) / 2, cyB = (b.minY + b.maxY) / 2
+    if (Math.abs(cyA - cyB) > 20) return cyA - cyB
+    return (a.minX + a.maxX) / 2 - (b.minX + b.maxX) / 2
   })
 
-  await tick()
+  for (const r of regionList) {
+    if (r.area < minArea || r.area > maxArea) continue
 
-  // ---- Hough H/V wall line detection (for snap/align of flood-fill polygons) ---
-  // Project the Canny edge map onto Y-axis (horizontals) and X-axis (verticals).
-  // Peaks in each projection = wall positions used to snap polygon vertices.
-  let _houghLines = null
-  if (_cannyEdges) _houghLines = houghHVLines(_cannyEdges, W, H)
+    // bbox fill ratio
+    const bboxArea = (r.maxX - r.minX + 1) * (r.maxY - r.minY + 1)
+    const fillRatio = bboxArea > 0 ? r.area / bboxArea : 0
 
-  // ── Построение полигонов + вычисление shape-метрик ─────────────────────────
-  // compactness и aspect сохраняются в каждой комнате — используются shape-фильтром
-  // в analyseLocal (только если набралось достаточно обучающих данных).
-  const inv   = 1 / scale
-  const rooms = []
+    // Строим полигон контура
+    const poly = traceContour(labels, r.label, W, H, r)
+    if (poly.length < 6) continue
 
-  // ── PATH A: Probabilistic Hough + intersection polygons (scan/PDF mode) ────
-  // If _houghRooms has results, convert them directly to room records.
-  // Polygons are already clean rectangles with vertices at wall intersections.
-  if (_houghRooms && _houghRooms.length > 0) {
-    for (let i = 0; i < _houghRooms.length; i++) {
-      const poly = _houghRooms[i]  // [[x,y], ...] in work-canvas coords
-      if (poly.length < 3) continue
-
-      // Compute area (shoelace) and bounding box for metrics
-      let area = 0
-      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
-      for (let k = 0; k < poly.length; k++) {
-        const [x1, y1] = poly[k], [x2, y2] = poly[(k+1) % poly.length]
-        area += x1*y2 - x2*y1
-        if (x1 < minX) minX = x1; if (x1 > maxX) maxX = x1
-        if (y1 < minY) minY = y1; if (y1 > maxY) maxY = y1
-      }
-      area = Math.abs(area) / 2
-
-      let perim = 0
-      for (let k = 0; k < poly.length; k++) {
-        const [x1,y1] = poly[k], [x2,y2] = poly[(k+1)%poly.length]
-        perim += Math.hypot(x2-x1, y2-y1)
-      }
-      const compactness = perim > 0 ? (4 * Math.PI * area) / (perim * perim) : 1
-      const bboxW = maxX - minX + 1, bboxH = maxY - minY + 1
-      const aspect = Math.max(bboxW, bboxH) / Math.max(1, Math.min(bboxW, bboxH))
-
-      rooms.push({
-        id:          `r${i+1}`,
-        label:       `Помещение ${i+1}`,
-        areaPx:      Math.round(area * inv * inv),
-        compactness: Math.round(compactness * 100) / 100,
-        aspect,
-        polygon:     poly.map(([x,y]) => [Math.round(x*inv), Math.round(y*inv)]),
-        _source:     'hough',
-      })
-    }
-  }
-
-  // ── PATH B: Flood-fill + contour tracing ────────────────────────────────────
-  // Runs in two modes:
-  //   FULL       — Hough found < 6 rooms: flood-fill handles everything.
-  //   SUPPLEMENT — Hough found >= 6 rooms: flood-fill adds only large rooms
-  //                that Hough missed (large open spaces, lobbies, wings).
-  const houghCoveredWell = rooms.length >= 6
-
-  // Shared helper: build a room record from a flood-fill candidate region
-  function floodRoomFromRegion(r, roomIdx) {
-    const isFromLoose = !cand1.includes(r)
-    const labelsMap   = isFromLoose ? labels2 : labels1
-    const poly = traceContour(labelsMap, r.label, W, H, r)
-    if (poly.length < 4) return null
     const dynEps = opts.epsilon > 0
       ? opts.epsilon
-      : Math.max(2, Math.round(Math.min(W, H) * 0.005))
-    const simp0 = rdp(poly, dynEps)
-    if (simp0.length < 3) return null
-    let simp
-    if (_cannyEdges && _houghLines) {
-      const snapDist = Math.max(4, Math.round(Math.min(W, H) * 0.008))
-      const aligned  = axisAlignEdges(simp0, _houghLines.hLines, _houghLines.vLines, snapDist)
-      const snapped  = snapToRightAngles(aligned)
-      simp = cleanJaggedEdges(snapped)
-    } else {
-      simp = cleanJaggedEdges(snapToRightAngles(simp0))
-    }
-    if (simp.length < 3) return null
+      : Math.max(2, Math.round(Math.min(W, H) * 0.004))
+    let simp = rdp(poly, dynEps)
+    simp = cleanJaggedEdges(snapToRightAngles(simp))
+    if (simp.length < 3) continue
+
+    // Compactness
     let perim = 0
     for (let k = 0; k < simp.length; k++) {
       const [x1,y1] = simp[k], [x2,y2] = simp[(k+1)%simp.length]
       perim += Math.hypot(x2-x1, y2-y1)
     }
     const compactness = perim > 0 ? (4 * Math.PI * r.area) / (perim * perim) : 1
-    const bboxW2 = r.maxX - r.minX + 1, bboxH2 = r.maxY - r.minY + 1
-    const aspect = Math.max(bboxW2, bboxH2) / Math.max(1, Math.min(bboxW2, bboxH2))
-    return {
+    if (compactness < _minCompact) continue
+
+    const bboxW = r.maxX - r.minX + 1, bboxH = r.maxY - r.minY + 1
+    const aspect = Math.max(bboxW, bboxH) / Math.max(1, Math.min(bboxW, bboxH))
+
+    roomIdx++
+    rooms.push({
       id:          `r${roomIdx}`,
       label:       `Помещение ${roomIdx}`,
       areaPx:      Math.round(r.area * inv * inv),
       compactness: Math.round(compactness * 100) / 100,
       aspect,
-      polygon:     simp.map(([x,y]) => [Math.round(x*inv), Math.round(y*inv)]),
-      _source:     'flood',
-    }
-  }
-
-  if (!houghCoveredWell) {
-    // ── FULL mode ──────────────────────────────────────────────────────────────
-    rooms.length = 0
-    for (let i = 0; i < merged.length; i++) {
-      const room = floodRoomFromRegion(merged[i], i + 1)
-      if (room && room.compactness >= _minCompact) rooms.push(room)
-    }
-  } else {
-    // ── SUPPLEMENT mode: add large rooms Hough missed ─────────────────────────
-    // Hough builds rooms only from adjacent H×V wall-line intersections, so it
-    // consistently misses large open spaces (entire wings, lobbies, open floors)
-    // whose boundary walls don't form clean grid pairs in the line clustering.
-    // Threshold: supplement only regions > 1.5% of image area.
-    const largeAreaThresh = total * 0.015
-
-    // Bboxes of existing Hough rooms in work-canvas coords for IoU check
-    const coveredBboxes = rooms.map(r => {
-      let x1=Infinity,y1=Infinity,x2=-Infinity,y2=-Infinity
-      for (const [px,py] of r.polygon) {
-        const wx=px*scale, wy=py*scale
-        if (wx<x1)x1=wx; if (wx>x2)x2=wx
-        if (wy<y1)y1=wy; if (wy>y2)y2=wy
-      }
-      return {x1,y1,x2,y2}
+      polygon:     simp.map(([x, y]) => [Math.round(x * inv), Math.round(y * inv)]),
+      _source:     'watershed',
     })
-
-    function bboxIoU(ax1,ay1,ax2,ay2, bx1,by1,bx2,by2) {
-      const ix1=Math.max(ax1,bx1), iy1=Math.max(ay1,by1)
-      const ix2=Math.min(ax2,bx2), iy2=Math.min(ay2,by2)
-      if (ix2<=ix1||iy2<=iy1) return 0
-      const inter=(ix2-ix1)*(iy2-iy1)
-      const ua=(ax2-ax1)*(ay2-ay1), ub=(bx2-bx1)*(by2-by1)
-      return inter/(ua+ub-inter)
-    }
-
-    for (let i = 0; i < merged.length; i++) {
-      const r = merged[i]
-      if (r.area < largeAreaThresh) continue  // small rooms already handled by Hough
-
-      const overlapHough = coveredBboxes.some(cb =>
-        bboxIoU(r.minX,r.minY,r.maxX,r.maxY, cb.x1,cb.y1,cb.x2,cb.y2) > 0.35
-      )
-      if (overlapHough) continue  // already well-covered
-
-      const room = floodRoomFromRegion(r, rooms.length + 1)
-      if (room && room.compactness >= _minCompact) {
-        rooms.push(room)
-        coveredBboxes.push({x1:r.minX,y1:r.minY,x2:r.maxX,y2:r.maxY})
-      }
-    }
   }
 
   return { rooms, wallInfo }
 }
+
+
 
 // ── Auto wall-thickness detection ──────────────────────────────────────────
 // Scans 3 horizontal + 3 vertical lines through the gray image,

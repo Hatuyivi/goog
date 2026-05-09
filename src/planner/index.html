@@ -699,21 +699,21 @@
             <span class="adj-arrow" id="arrow-detect">▶</span> 🔬 Фильтры детектора
           </div>
           <div class="adj-body" id="body-detect" style="display:none">
-            <p style="font-size:10px;color:var(--text-ter);margin:0 0 10px;line-height:1.5">Настрой перед «Распознать». Помогает убрать коридоры и мелкий мусор.</p>
+            <p style="font-size:10px;color:var(--text-ter);margin:0 0 10px;line-height:1.5">Алгоритм: Watershed + Distance Transform. Настрой перед «Распознать».</p>
 
             <div class="adj-row">
-              <label>Компактность (коридор-фильтр) <span class="adj-val" id="v-minCompact">0.08</span></label>
+              <label>Закрытие дверей ×<span class="adj-val" id="v-dashGap">1.0</span></label>
+              <input type="range" id="paramDashGap" min="3" max="30" value="10"
+                oninput="document.getElementById('v-dashGap').textContent=(this.value/10).toFixed(1)">
+            </div>
+            <p style="font-size:10px;color:var(--text-ter);margin:-4px 0 8px;line-height:1.4">Радиус морфологического закрытия дверных проёмов. Больше = шире закрываемые проёмы. При 1.0 = авто (3.5 × толщина стены).</p>
+
+            <div class="adj-row">
+              <label>Мин. компактность <span class="adj-val" id="v-minCompact">0.08</span></label>
               <input type="range" id="paramMinCompact" min="0" max="50" value="8"
                 oninput="document.getElementById('v-minCompact').textContent=(this.value/100).toFixed(2)">
             </div>
-            <p style="font-size:10px;color:var(--text-ter);margin:-4px 0 8px;line-height:1.4">↑ выше = жёстче отсекает сложные формы (коридоры). Прямоугольные комнаты ≈ 0.5–1.0, коридоры &lt; 0.15.</p>
-
-            <div class="adj-row">
-              <label>Заполнение bbox (граница) <span class="adj-val" id="v-minFill">0.35</span></label>
-              <input type="range" id="paramMinFill" min="5" max="80" value="35"
-                oninput="document.getElementById('v-minFill').textContent=(this.value/100).toFixed(2)">
-            </div>
-            <p style="font-size:10px;color:var(--text-ter);margin:-4px 0 8px;line-height:1.4">Мин. заполнение bbox для комнат у края. Ниже = меньше отбрасывает.</p>
+            <p style="font-size:10px;color:var(--text-ter);margin:-4px 0 8px;line-height:1.4">Фильтр коридоров и узких форм. Прямоугольные комнаты ≈ 0.5–1.0, узкие коридоры &lt; 0.15.</p>
 
             <div class="adj-row">
               <label>Макс. площадь комнаты <span class="adj-val" id="v-maxArea">92</span>%</label>
@@ -723,11 +723,11 @@
             <p style="font-size:10px;color:var(--text-ter);margin:-4px 0 8px;line-height:1.4">Верхний порог площади региона. Ниже = большие помещения не детектируются.</p>
 
             <div class="adj-row">
-              <label>Зазор пунктира ×<span class="adj-val" id="v-dashGap">1.0</span></label>
-              <input type="range" id="paramDashGap" min="3" max="30" value="10"
-                oninput="document.getElementById('v-dashGap').textContent=(this.value/10).toFixed(1)">
+              <label>Заполнение bbox (граница) <span class="adj-val" id="v-minFill">0.35</span></label>
+              <input type="range" id="paramMinFill" min="5" max="80" value="35"
+                oninput="document.getElementById('v-minFill').textContent=(this.value/100).toFixed(2)">
             </div>
-            <p style="font-size:10px;color:var(--text-ter);margin:-4px 0 4px;line-height:1.4">Множитель для закрытия пунктирных стен. Больше = крупнее зазоры закрываются.</p>
+            <p style="font-size:10px;color:var(--text-ter);margin:-4px 0 4px;line-height:1.4">Мин. заполнение bbox для комнат у края. Ниже = меньше отбрасывает.</p>
 
             <button class="adj-reset" onclick="resetDetectParams()">Сбросить</button>
           </div>
