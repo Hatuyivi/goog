@@ -63,6 +63,7 @@ const DRAW_ROOM_STROKE = 'rgba(0,100,220,0.55)'
 // ── DOM ────────────────────────────────────────────────────
 const canvas            = document.getElementById('planCanvas')
 const ctx               = canvas.getContext('2d')
+const planSVG           = document.getElementById('planSVG')
 const dropzone          = document.getElementById('dropzone')
 const previewThumb      = document.getElementById('previewThumb')
 const previewImg        = document.getElementById('previewImg')
@@ -188,6 +189,7 @@ function loadFile(filePath) {
       resizeCanvas(img)
       drawPlan()
       canvas.style.display = 'block'
+      planSVG.style.display = 'block'
       canvasPlaceholder.style.display = 'none'
       viewLabel.textContent = 'Нажми «Распознать помещения»'
       resetZoom()
@@ -386,7 +388,7 @@ function clearPlan() {
   _rawPixels = null; _rawWidth = 0; _rawHeight = 0
   if (_rebuildRaf) { cancelAnimationFrame(_rebuildRaf); _rebuildRaf = null }
   previewThumb.style.display = 'none'; dropzone.style.display = 'block'
-  canvas.style.display = 'none'; canvasPlaceholder.style.display = 'flex'
+  canvas.style.display = 'none'; planSVG.style.display = 'none'; canvasPlaceholder.style.display = 'flex'
   analyseBtn.disabled = true
   viewLabel.textContent = 'Загрузи план слева'
   viewAllBtn.style.display = 'none'; viewSelBtn.style.display = 'none'
@@ -407,106 +409,144 @@ function clearResults() {
   if (currentImageEl) drawPlan()
 }
 
+// ── SVG helpers ────────────────────────────────────────────
+const SVG_NS = 'http://www.w3.org/2000/svg'
+function svgEl(tag, attrs = {}) {
+  const el = document.createElementNS(SVG_NS, tag)
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v)
+  return el
+}
+
 // ── Canvas render ──────────────────────────────────────────
+// Canvas draws only the raster image (and eraser strokes).
+// All vector overlays (polygons, vertices, labels, draw preview)
+// live in #planSVG which shares the same CSS transform as the canvas
+// and uses the same coordinate space → always pixel-perfect at any zoom.
 function drawPlan() {
   if (!currentImageEl) return
-  ctx.clearRect(0, 0, canvas.width, canvas.height)
 
-  const sx = canvas.width  / currentImageEl.naturalWidth
-  const sy = canvas.height / currentImageEl.naturalHeight
+  const cw = canvas.width, ch = canvas.height
+  const sx = cw / currentImageEl.naturalWidth
+  const sy = ch / currentImageEl.naturalHeight
 
+  // ── Raster layer (canvas) ──────────────────────────────
+  ctx.clearRect(0, 0, cw, ch)
   if (rooms.length && currentImageBW) {
-    ctx.drawImage(currentImageBW, 0, 0, canvas.width, canvas.height)
+    ctx.drawImage(currentImageBW, 0, 0, cw, ch)
   } else {
-    ctx.drawImage(currentImageEl, 0, 0, canvas.width, canvas.height)
-    return
+    ctx.drawImage(currentImageEl, 0, 0, cw, ch)
   }
 
-  rooms.forEach(room => {
-    if (!showPolygons) return
-    if (!room.polygon || room.polygon.length < 3) return
-    const isSelected = room.id === selectedRoomId
-    const show = currentView === 'all' || isSelected
-    if (!show) return
+  // ── Vector layer (SVG) ─────────────────────────────────
+  // viewBox matches canvas px dimensions; SVG is positioned to overlap
+  // the canvas exactly via CSS (top:50%, left:50%, negative margins).
+  planSVG.setAttribute('viewBox', `0 0 ${cw} ${ch}`)
+  planSVG.setAttribute('width',   cw)
+  planSVG.setAttribute('height',  ch)
+  planSVG.style.marginLeft = (-cw / 2) + 'px'
+  planSVG.style.marginTop  = (-ch / 2) + 'px'
+  planSVG.innerHTML = ''
 
-    const pts = room.polygon.map(([x, y]) => [x * sx, y * sy])
+  // ── Room polygons + labels ─────────────────────────────
+  if (showPolygons) {
+    rooms.forEach(room => {
+      if (!room.polygon || room.polygon.length < 3) return
+      const isSelected = room.id === selectedRoomId
+      const show = currentView === 'all' || isSelected
+      if (!show) return
 
-    ctx.beginPath()
-    ctx.moveTo(pts[0][0], pts[0][1])
-    pts.slice(1).forEach(([x, y]) => ctx.lineTo(x, y))
-    ctx.closePath()
+      const isChecked   = selectedRoomIds.has(room.id)
+      const pts         = room.polygon.map(([x, y]) => [x * sx, y * sy])
+      const fillColor   = isChecked ? '#c8e6ff' : ROOM_COLOR
+      const fillAlpha   = isSelected ? 0.78 : ROOM_ALPHA
+      const strokeColor = isSelected ? 'rgba(30,120,60,0.95)'
+                        : isChecked  ? 'rgba(0,100,220,0.85)'
+                        : STROKE_COLOR
+      const strokeW     = isSelected ? 3 : isChecked ? 2.5 : STROKE_WIDTH
 
-    const isChecked = selectedRoomIds.has(room.id)
-    ctx.globalAlpha = isSelected ? 0.78 : ROOM_ALPHA
-    ctx.fillStyle   = isChecked ? '#c8e6ff' : ROOM_COLOR
-    ctx.fill()
+      planSVG.appendChild(svgEl('polygon', {
+        points:           pts.map(p => p.join(',')).join(' '),
+        fill:             fillColor,
+        'fill-opacity':   fillAlpha,
+        stroke:           strokeColor,
+        'stroke-width':   strokeW,
+        'stroke-linejoin':'round',
+      }))
 
-    ctx.globalAlpha = 1
-    ctx.strokeStyle = isSelected ? 'rgba(30,120,60,0.95)' : isChecked ? 'rgba(0,100,220,0.85)' : STROKE_COLOR
-    ctx.lineWidth   = isSelected ? 3 : isChecked ? 2.5 : STROKE_WIDTH
-    ctx.stroke()
+      // Label at centroid
+      const lcx = pts.reduce((s, p) => s + p[0], 0) / pts.length
+      const lcy = pts.reduce((s, p) => s + p[1], 0) / pts.length
+      const fs  = 13   // fixed px in SVG space — stays crisp at all zoom levels
 
-    // label
-    const cx = pts.reduce((s,p)=>s+p[0],0) / pts.length
-    const cy = pts.reduce((s,p)=>s+p[1],0) / pts.length
-    const fontSize = Math.max(11, Math.min(16, Math.round(canvas.width / 80)))
-    ctx.font = `600 ${fontSize}px -apple-system, sans-serif`
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
-    const tw = ctx.measureText(room.label).width + 10
-    ctx.fillStyle = 'rgba(255,255,255,0.92)'
-    ctx.fillRect(cx - tw/2, cy - fontSize*0.7, tw, fontSize*1.4)
-    ctx.fillStyle = '#1d1d1f'
-    ctx.fillText(room.label, cx, cy)
-  })
+      // Background pill — width estimated from character count
+      const labelW = room.label.length * fs * 0.6 + 12
+      const labelH = fs * 1.5
+      planSVG.appendChild(svgEl('rect', {
+        x: lcx - labelW / 2, y: lcy - labelH / 2,
+        width: labelW, height: labelH, rx: 3,
+        fill: 'rgba(255,255,255,0.92)',
+      }))
+      const txt = svgEl('text', {
+        x: lcx, y: lcy,
+        'text-anchor':      'middle',
+        'dominant-baseline':'central',
+        'font-family':      'Geist, -apple-system, sans-serif',
+        'font-size':        fs,
+        'font-weight':      600,
+        fill:               '#1d1d1f',
+      })
+      txt.textContent = room.label
+      planSVG.appendChild(txt)
+    })
 
-  // Draw vertices in edit mode
-  if (editMode === 'edit' && showPolygons) {
-    for (const room of rooms) {
-      if (!room.polygon) continue
-      if (currentView === 'selected' && room.id !== selectedRoomId) continue
-      const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
+    // ── Edit mode: vertices + edge midpoints ─────────────
+    if (editMode === 'edit') {
+      for (const room of rooms) {
+        if (!room.polygon) continue
+        if (currentView === 'selected' && room.id !== selectedRoomId) continue
+        const pts = room.polygon.map(([x, y]) => [x * sx, y * sy])
 
-      // Draw edge midpoints as faint add-points
-      for (let i = 0; i < pts.length; i++) {
-        const j = (i+1) % pts.length
-        const mx = (pts[i][0]+pts[j][0])/2, my = (pts[i][1]+pts[j][1])/2
-        const isHovered = hoverState?.roomId===room.id && hoverState?.edgeIdx===i
-        ctx.globalAlpha = isHovered ? 1 : 0.35
-        ctx.beginPath(); ctx.arc(mx, my, isHovered ? 5 : 3, 0, Math.PI*2)
-        ctx.fillStyle = '#007aff'; ctx.fill()
-      }
+        // Edge midpoints (add-vertex hints)
+        for (let i = 0; i < pts.length; i++) {
+          const j   = (i + 1) % pts.length
+          const emx = (pts[i][0] + pts[j][0]) / 2
+          const emy = (pts[i][1] + pts[j][1]) / 2
+          const isHov = hoverState?.roomId === room.id && hoverState?.edgeIdx === i
+          planSVG.appendChild(svgEl('circle', {
+            cx: emx, cy: emy, r: isHov ? 5 : 3,
+            fill: '#007aff', 'fill-opacity': isHov ? 1 : 0.35,
+          }))
+        }
 
-      // Draw vertices
-      for (let i = 0; i < pts.length; i++) {
-        const isHovered = hoverState?.roomId===room.id && hoverState?.ptIdx===i
-        const isDragging = dragState?.roomId===room.id && dragState?.ptIdx===i
-        const r = (isHovered || isDragging) ? 7 : 5
-        ctx.globalAlpha = 1
-        ctx.beginPath(); ctx.arc(pts[i][0], pts[i][1], r, 0, Math.PI*2)
-        ctx.fillStyle = isDragging ? '#ff9500' : isHovered ? '#ff3b30' : '#fff'
-        ctx.fill()
-        ctx.strokeStyle = isDragging ? '#ff6a00' : isHovered ? '#cc1000' : 'rgba(30,120,60,0.9)'
-        ctx.lineWidth = 2; ctx.stroke()
+        // Corner vertices
+        for (let i = 0; i < pts.length; i++) {
+          const isHov  = hoverState?.roomId === room.id && hoverState?.ptIdx === i
+          const isDrag = dragState?.roomId  === room.id && dragState?.ptIdx  === i
+          const r = (isHov || isDrag) ? 7 : 5
+          planSVG.appendChild(svgEl('circle', {
+            cx: pts[i][0], cy: pts[i][1], r,
+            fill:           isDrag ? '#ff9500' : isHov ? '#ff3b30' : '#fff',
+            stroke:         isDrag ? '#ff6a00' : isHov ? '#cc1000' : 'rgba(30,120,60,0.9)',
+            'stroke-width': 2,
+          }))
+        }
       }
     }
   }
 
-  ctx.globalAlpha = 1
-
-  // Draw in-progress room rectangle (draw mode)
+  // ── Draw-mode preview rect ─────────────────────────────
   if (roomDraw) {
-    const csx = canvas.width  / currentImageEl.naturalWidth
-    const csy = canvas.height / currentImageEl.naturalHeight
-    const x0 = roomDraw.x0 * csx, y0 = roomDraw.y0 * csy
-    const x1 = roomDraw.x1 * csx, y1 = roomDraw.y1 * csy
-    ctx.globalAlpha = 1
-    ctx.fillStyle = DRAW_ROOM_COLOR
-    ctx.fillRect(Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0))
-    ctx.setLineDash([5, 4])
-    ctx.strokeStyle = DRAW_ROOM_STROKE
-    ctx.lineWidth = 1.5
-    ctx.strokeRect(Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0))
-    ctx.setLineDash([])
+    const x0 = roomDraw.x0 * sx, y0 = roomDraw.y0 * sy
+    const x1 = roomDraw.x1 * sx, y1 = roomDraw.y1 * sy
+    planSVG.appendChild(svgEl('rect', {
+      x: Math.min(x0, x1), y: Math.min(y0, y1),
+      width:  Math.abs(x1 - x0),
+      height: Math.abs(y1 - y0),
+      fill:             DRAW_ROOM_COLOR,
+      stroke:           DRAW_ROOM_STROKE,
+      'stroke-width':   1.5,
+      'stroke-dasharray':'5 4',
+    }))
   }
 }
 
@@ -819,11 +859,257 @@ function setEditMode(m) {
   document.getElementById('emodeDelete').classList.toggle('active',   m === 'delete')
   document.getElementById('emodeDraw').classList.toggle('active',     m === 'collider')
   document.getElementById('emodeEraser')?.classList.toggle('active',  m === 'eraser')
+  document.getElementById('cropBtn')?.classList.toggle('active',      m === 'crop')
   canvas.className = m === 'eraser' ? 'mode-eraser' : m !== 'view' ? `mode-${m}` : ''
   hoverState = null
   dragState  = null
   roomDraw   = null
+
+  // ── Crop overlay ─────────────────────────────────────────
+  const overlay = document.getElementById('cropOverlay')
+  if (overlay) {
+    if (m === 'crop' && currentImageEl) {
+      overlay.style.display = 'block'
+      initCropBox()
+      startCropInteraction()
+    } else {
+      overlay.style.display = 'none'
+      stopCropInteraction()
+    }
+  }
+
   drawPlan()
+}
+
+// ── Crop implementation ────────────────────────────────────
+// cropRect is in *canvas-wrap-relative CSS pixels* (matches the overlay coords).
+let cropRect      = { x: 0, y: 0, w: 0, h: 0 }
+let cropRatio     = 'free'   // 'free' | '4:3' | '3:4' | '16:9' | '1:1'
+let _cropCleanup  = null     // fn that removes event listeners
+
+function _wrapRect() {
+  return document.querySelector('.canvas-wrap').getBoundingClientRect()
+}
+
+// Position the crop box using canvas-relative CSS px.
+function _setCropBox(x, y, w, h) {
+  const box = document.getElementById('cropBox')
+  if (!box) return
+  box.style.left   = x + 'px'
+  box.style.top    = y + 'px'
+  box.style.width  = w + 'px'
+  box.style.height = h + 'px'
+  cropRect = { x, y, w, h }
+}
+
+// Convert canvas-wrap CSS px → image px (accounts for zoom & pan)
+function _wrapPxToImagePx(wx, wy) {
+  if (!currentImageEl) return [0, 0]
+  const wrap = document.querySelector('.canvas-wrap')
+  const wRect = wrap.getBoundingClientRect()
+  // centre of canvas-wrap in wrap coords
+  const cxW = wRect.width  / 2 + panX
+  const cyW = wRect.height / 2 + panY
+  // canvas CSS size (before zoom scale)
+  const cvsCssW = canvas.width   // canvas physical px (== CSS px because no CSS size override)
+  const cvsCssH = canvas.height
+  // top-left of canvas in wrap coords
+  const canvasLeft = cxW - cvsCssW / 2 * zoomLevel
+  const canvasTop  = cyW - cvsCssH / 2 * zoomLevel
+  // position within canvas in CSS px (accounting for zoom)
+  const relX = (wx - canvasLeft) / zoomLevel
+  const relY = (wy - canvasTop)  / zoomLevel
+  // canvas CSS px → image px
+  const imgX = relX * currentImageEl.naturalWidth  / cvsCssW
+  const imgY = relY * currentImageEl.naturalHeight / cvsCssH
+  return [imgX, imgY]
+}
+
+// Clamp crop box to canvas-wrap bounds
+function _clampCrop(x, y, w, h) {
+  const wrap = document.querySelector('.canvas-wrap')
+  const maxW = wrap.clientWidth, maxH = wrap.clientHeight
+  w = Math.max(20, Math.min(w, maxW))
+  h = Math.max(20, Math.min(h, maxH))
+  x = Math.max(0, Math.min(x, maxW - w))
+  y = Math.max(0, Math.min(y, maxH - h))
+  return { x, y, w, h }
+}
+
+function _applyRatio(w, h) {
+  if (cropRatio === 'free') return { w, h }
+  const [rw, rh] = cropRatio.split(':').map(Number)
+  // keep width, adjust height
+  h = Math.round(w * rh / rw)
+  return { w, h }
+}
+
+function initCropBox() {
+  const wrap = document.querySelector('.canvas-wrap')
+  if (!wrap) return
+  // Default: 80% of canvas area centred in wrap
+  const W = wrap.clientWidth, H = wrap.clientHeight
+  let w = Math.round(W * 0.8), h = Math.round(H * 0.8)
+  const applied = _applyRatio(w, h)
+  w = applied.w; h = applied.h
+  const x = Math.round((W - w) / 2), y = Math.round((H - h) / 2)
+  _setCropBox(x, y, w, h)
+
+  // Wire ratio buttons
+  document.querySelectorAll('.crop-ratio-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.ratio === cropRatio)
+    btn.onclick = () => {
+      cropRatio = btn.dataset.ratio
+      document.querySelectorAll('.crop-ratio-btn').forEach(b => b.classList.toggle('active', b.dataset.ratio === cropRatio))
+      // Re-apply ratio to current box size
+      const applied = _applyRatio(cropRect.w, cropRect.h)
+      const clamped = _clampCrop(cropRect.x, cropRect.y, applied.w, applied.h)
+      _setCropBox(clamped.x, clamped.y, clamped.w, clamped.h)
+    }
+  })
+}
+
+function startCropInteraction() {
+  const overlay = document.getElementById('cropOverlay')
+  const box     = document.getElementById('cropBox')
+  if (!overlay || !box) return
+
+  let drag = null  // { type:'move'|handle, startX, startY, startRect, handle }
+
+  function onDown(e) {
+    if (e.button !== 0) return
+    e.preventDefault(); e.stopPropagation()
+    const h = e.target.dataset?.h  // handle type or undefined
+    drag = {
+      type: h ? 'handle' : 'move',
+      handle: h || null,
+      startX: e.clientX,
+      startY: e.clientY,
+      startRect: { ...cropRect },
+    }
+  }
+
+  function onMove(e) {
+    if (!drag) return
+    const dx = e.clientX - drag.startX
+    const dy = e.clientY - drag.startY
+    const sr = drag.startRect
+    let { x, y, w, h } = sr
+
+    if (drag.type === 'move') {
+      x = sr.x + dx; y = sr.y + dy
+    } else {
+      const d = drag.handle
+      if (d.includes('e')) w = sr.w + dx
+      if (d.includes('s')) h = sr.h + dy
+      if (d.includes('w')) { x = sr.x + dx; w = sr.w - dx }
+      if (d.includes('n')) { y = sr.y + dy; h = sr.h - dy }
+      // Enforce minimum size
+      if (w < 20) { if (d.includes('w')) x = sr.x + sr.w - 20; w = 20 }
+      if (h < 20) { if (d.includes('n')) y = sr.y + sr.h - 20; h = 20 }
+      // Apply ratio constraint while dragging
+      if (cropRatio !== 'free') {
+        const [rw, rh] = cropRatio.split(':').map(Number)
+        if (d.includes('n') || d.includes('s')) {
+          // Height-driven: adjust width
+          w = Math.round(h * rw / rh)
+        } else {
+          h = Math.round(w * rh / rw)
+        }
+      }
+    }
+
+    const clamped = _clampCrop(x, y, w, h)
+    _setCropBox(clamped.x, clamped.y, clamped.w, clamped.h)
+  }
+
+  function onUp() { drag = null }
+
+  box.addEventListener('mousedown', onDown)
+  document.querySelectorAll('.crop-handle').forEach(el => el.addEventListener('mousedown', onDown))
+  window.addEventListener('mousemove', onMove)
+  window.addEventListener('mouseup', onUp)
+
+  _cropCleanup = () => {
+    box.removeEventListener('mousedown', onDown)
+    document.querySelectorAll('.crop-handle').forEach(el => el.removeEventListener('mousedown', onDown))
+    window.removeEventListener('mousemove', onMove)
+    window.removeEventListener('mouseup', onUp)
+  }
+}
+
+function stopCropInteraction() {
+  if (_cropCleanup) { _cropCleanup(); _cropCleanup = null }
+}
+
+function applyCrop() {
+  if (!currentImageEl) return
+
+  const wrap = document.querySelector('.canvas-wrap')
+  const wRect = wrap.getBoundingClientRect()
+
+  // cropRect is in CSS px relative to the wrap element.
+  // Convert top-left and bottom-right corners to image coords.
+  const [x0img, y0img] = _wrapPxToImagePx(cropRect.x, cropRect.y)
+  const [x1img, y1img] = _wrapPxToImagePx(cropRect.x + cropRect.w, cropRect.y + cropRect.h)
+
+  const iw = currentImageEl.naturalWidth
+  const ih = currentImageEl.naturalHeight
+
+  const sx = Math.max(0, Math.round(x0img))
+  const sy = Math.max(0, Math.round(y0img))
+  const sw = Math.min(iw - sx, Math.round(x1img - x0img))
+  const sh = Math.min(ih - sy, Math.round(y1img - y0img))
+
+  if (sw < 4 || sh < 4) {
+    alert('Область обрезки слишком мала.')
+    return
+  }
+
+  // Render cropped region from the current BW canvas (or original)
+  const src = currentImageBW || currentImageEl
+  const off = document.createElement('canvas')
+  off.width = sw; off.height = sh
+  const c = off.getContext('2d')
+  c.drawImage(src, sx, sy, sw, sh, 0, 0, sw, sh)
+
+  // Commit: replace working image state
+  const newImg = new Image()
+  newImg.onload = () => {
+    pushUndo()
+    currentImageEl = newImg
+    currentImageBW = (() => {
+      const bw = document.createElement('canvas')
+      bw.width = sw; bw.height = sh
+      bw.getContext('2d').drawImage(off, 0, 0)
+      return bw
+    })()
+    // Re-cache raw pixels
+    const tmpCtx = document.createElement('canvas').getContext('2d')
+    const tmp = document.createElement('canvas')
+    tmp.width = sw; tmp.height = sh
+    tmp.getContext('2d').drawImage(newImg, 0, 0)
+    const id = tmp.getContext('2d').getImageData(0, 0, sw, sh)
+    _rawPixels = new Uint8ClampedArray(id.data)
+    _rawWidth  = sw; _rawHeight = sh
+
+    // Shift polygons into cropped coordinate space
+    rooms = rooms.map(r => ({
+      ...r,
+      polygon: r.polygon
+        ? r.polygon.map(([px, py]) => [
+            Math.max(0, Math.min(sw, Math.round(px - sx))),
+            Math.max(0, Math.min(sh, Math.round(py - sy))),
+          ])
+        : r.polygon,
+    }))
+
+    resizeCanvas(newImg)
+    drawPlan()
+    markEdited()
+    setEditMode('view')
+  }
+  newImg.src = off.toDataURL('image/png')
 }
 
 // ── Canvas hit testing ─────────────────────────────────────
@@ -981,8 +1267,11 @@ function getCanvasXY(e) {
 
 // ── Zoom helpers ───────────────────────────────────────────
 function applyZoomTransform() {
-  canvas.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`
+  const t = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`
+  canvas.style.transform    = t
   canvas.style.transformOrigin = '50% 50%'
+  planSVG.style.transform   = t
+  planSVG.style.transformOrigin = '50% 50%'
   updateZoomLabel()
 }
 
@@ -991,23 +1280,23 @@ function updateZoomLabel() {
   if (lbl) lbl.textContent = Math.round(zoomLevel * 100) + '%'
 }
 
-function zoomBy(delta, originX, originY) {
-  // originX/Y are screen coords relative to canvas-wrap centre
+// Core: zoom by multiplicative factor centred on absolute screen coords.
+function zoomByFactor(factor, originX, originY) {
   const wrap = document.querySelector('.canvas-wrap')
   const wRect = wrap.getBoundingClientRect()
-  // point in canvas space before zoom
-  const ox = originX !== undefined ? originX - wRect.left - wRect.width / 2 : 0
+  const ox = originX !== undefined ? originX - wRect.left - wRect.width  / 2 : 0
   const oy = originY !== undefined ? originY - wRect.top  - wRect.height / 2 : 0
-
   const oldZoom = zoomLevel
-  zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel * (1 + delta)))
-
-  // Adjust pan so the point under cursor stays fixed
+  zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel * factor))
   const ratio = zoomLevel / oldZoom
   panX = ox + (panX - ox) * ratio
   panY = oy + (panY - oy) * ratio
-
   applyZoomTransform()
+}
+
+// Additive-delta wrapper — used by keyboard shortcuts and buttons.
+function zoomBy(delta, originX, originY) {
+  zoomByFactor(1 + delta, originX, originY)
 }
 
 function resetZoom() {
@@ -1112,14 +1401,14 @@ canvas.addEventListener('mousemove', e => {
       bwCtx.beginPath(); bwCtx.arc(ix, iy, r, 0, Math.PI * 2); bwCtx.fill()
       drawPlan()
     }
-    // Draw eraser cursor ring
+    // Draw eraser cursor ring in SVG (vector, no blur at any zoom)
     const r = eraserSize
-    ctx.save()
-    ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 1.5
-    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke()
-    ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1
-    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke()
-    ctx.restore()
+    // Remove any previous cursor ring
+    planSVG.querySelector('.eraser-cursor')?.remove()
+    const g = svgEl('g', { class: 'eraser-cursor' })
+    g.appendChild(svgEl('circle', { cx, cy, r, fill: 'none', stroke: 'rgba(0,0,0,0.6)', 'stroke-width': 1.5 }))
+    g.appendChild(svgEl('circle', { cx, cy, r, fill: 'none', stroke: 'rgba(255,255,255,0.7)', 'stroke-width': 1 }))
+    planSVG.appendChild(g)
     return
   }
 
@@ -1217,6 +1506,7 @@ canvas.addEventListener('mouseleave', () => {
   }
   if (dragState) { markEdited(); dragState = null }
   hoverState = null
+  planSVG.querySelector('.eraser-cursor')?.remove()
   if (editMode !== 'view') canvas.style.cursor = editMode === 'delete' ? 'not-allowed' : 'crosshair'
   drawPlan()
 })
@@ -1697,9 +1987,9 @@ document.querySelector('.canvas-wrap').addEventListener('wheel', e => {
     if (slider) slider.value = eraserSize
     drawPlan()
   } else {
-    // Normal mode: wheel zooms, centred on cursor
-    const delta = e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP
-    zoomBy(delta, e.clientX, e.clientY)
+    // Normal mode: wheel zooms, centred on cursor — smooth proportional step
+    const factor = Math.pow(1.0015, -e.deltaY)   // ~1.5% per pixel of scroll, direction-correct
+    zoomByFactor(factor, e.clientX, e.clientY)
   }
 }, { passive: false })
 
@@ -1732,12 +2022,31 @@ document.querySelector('.canvas-wrap').addEventListener('gesturechange', e => {
   const delta = (e.scale - 1) * 0.08
   zoomBy(delta)
 }, { passive: false })
+// ── Space key state (for Space+drag pan) ──────────────────
+let _spaceDown = false
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && !e.repeat && document.activeElement.tagName !== 'INPUT') {
+    _spaceDown = true
+    document.querySelector('.canvas-wrap').style.cursor = 'grab'
+    e.preventDefault()
+  }
+}, true)
+document.addEventListener('keyup', e => {
+  if (e.code === 'Space') {
+    _spaceDown = false
+    if (!isPanning) document.querySelector('.canvas-wrap').style.cursor = ''
+  }
+}, true)
+
 document.querySelector('.canvas-wrap').addEventListener('mousedown', e => {
-  if (e.button === 1 || (e.button === 0 && e.altKey)) {
+  const isMiddle = e.button === 1
+  const isAlt    = e.button === 0 && e.altKey
+  const isSpace  = e.button === 0 && _spaceDown
+  if (isMiddle || isAlt || isSpace) {
     e.preventDefault()
     isPanning = true
     panStart = { x: e.clientX, y: e.clientY, panX, panY }
-    document.querySelector('.canvas-wrap').style.cursor = 'grab'
+    document.querySelector('.canvas-wrap').style.cursor = 'grabbing'
   }
 })
 window.addEventListener('mousemove', e => {
@@ -1749,7 +2058,7 @@ window.addEventListener('mousemove', e => {
 window.addEventListener('mouseup', e => {
   if (isPanning) {
     isPanning = false; panStart = null
-    document.querySelector('.canvas-wrap').style.cursor = ''
+    document.querySelector('.canvas-wrap').style.cursor = _spaceDown ? 'grab' : ''
   }
 })
 
