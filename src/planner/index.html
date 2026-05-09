@@ -884,7 +884,7 @@ function resetDetectParams() {
   document.getElementById('paramDashGap').value = 10
   document.getElementById('v-dashGap').textContent = '1.0'
 }
-
+function resetBWMix() {
   const defaults = { red:40, orange:33, yellow:17, green:-20, aqua:-8, blue:-10, lavender:0, magenta:0 }
   Object.entries(defaults).forEach(([k, v]) => {
     const el = document.querySelector(`#body-bwmix input[oninput*="'${k}'"]`)
