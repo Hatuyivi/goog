@@ -95,6 +95,8 @@ const trainingBadge     = document.getElementById('trainingBadge')
 
 const paramThreshold = document.getElementById('paramThreshold')
 const paramEpsilon   = document.getElementById('paramEpsilon')
+const paramDilate    = document.getElementById('paramDilate')
+const paramMinArea   = document.getElementById('paramMinArea')
 const vThr = document.getElementById('vThr')
 const vEps = document.getElementById('vEps')
 
@@ -742,7 +744,7 @@ async function analyseAI() {
 // Анализирует накопленные правки пользователя и возвращает
 // диапазоны нормализованной площади (доля от площади изображения),
 // которые стоит сохранять или отбрасывать.
-function computeLocalLearning(trainingData, currentHash) {
+function computeLocalLearning(trainingData) {
   // Берём только локальные образцы
   const localSamples = trainingData.filter(s => !s.mode || s.mode === 'local')
   if (!localSamples.length) return null
@@ -757,104 +759,46 @@ function computeLocalLearning(trainingData, currentHash) {
     const imgArea = Number(m[1]) * Number(m[2])
     if (!imgArea) continue
 
-    // Правки с текущего плана весят вдвое — детектор точнее подстроится
-    // под конкретный масштаб/стиль чертежа, а не только под «среднее по всем»
-    const weight = (currentHash && sample.imageHash === currentHash) ? 2 : 1
-
     const deletedSet = new Set(sample.deletedIds || [])
     const addedSet   = new Set(sample.addedIds   || [])
 
     for (const r of (sample.original || [])) {
       if (typeof r.areaPx !== 'number') continue
       const frac = r.areaPx / imgArea
-      for (let w = 0; w < weight; w++) {
-        if (deletedSet.has(r.id)) deletedFracs.push(frac)
-        else                       keptFracs.push(frac)
-      }
+      if (deletedSet.has(r.id)) deletedFracs.push(frac)
+      else                       keptFracs.push(frac)
     }
 
     for (const r of (sample.edited || [])) {
       if (!addedSet.has(r.id) || typeof r.areaPx !== 'number') continue
       const frac = r.areaPx / imgArea
-      for (let w = 0; w < weight; w++) {
-        addedFracs.push(frac)
-        keptFracs.push(frac)
-      }
+      addedFracs.push(frac)
+      keptFracs.push(frac)   // тоже входит в «правильный» диапазон
     }
   }
 
   if (keptFracs.length === 0) return null
   keptFracs.sort((a, b) => a - b)
 
+  // p5 / p98 — устойчивые границы без выбросов
   const idxLow  = Math.max(0, Math.floor(keptFracs.length * 0.05))
   const idxHigh = Math.min(keptFracs.length - 1, Math.floor(keptFracs.length * 0.98))
   const minAreaFrac = keptFracs[idxLow]
   const maxAreaFrac = keptFracs[idxHigh]
 
+  // Считаем, сколько «удалённых» попадало вне диапазона — качество обучения
   const truePositives = deletedFracs.filter(f => f < minAreaFrac || f > maxAreaFrac).length
 
   return {
     minAreaFrac,
     maxAreaFrac,
-    sampleCount:   localSamples.length,
-    keptCount:     keptFracs.length,
-    deletedCount:  deletedFracs.length,
-    addedCount:    addedFracs.length,
+    sampleCount: localSamples.length,
+    keptCount:   keptFracs.length,
+    deletedCount: deletedFracs.length,
+    addedCount:  addedFracs.length,
     filterAccuracy: deletedFracs.length
       ? Math.round(truePositives / deletedFracs.length * 100)
       : null,
-  }
-}
-
-
-// ── Shape-фильтр: учится на compactness/aspect удалённых помещений ────────────
-// Применяется ТОЛЬКО если накопили ≥5 образцов И точность фильтра >70%.
-// Без достаточной статистики — не трогает ничего.
-function computeShapeFilter(trainingData, currentHash) {
-  const MIN_SAMPLES  = 5
-  const MIN_ACCURACY = 0.70
-
-  const localSamples = trainingData.filter(s => !s.mode || s.mode === 'local')
-  if (localSamples.length < MIN_SAMPLES) return null
-
-  const deletedShapes = []
-  const keptShapes    = []
-
-  for (const sample of localSamples) {
-    const weight     = (currentHash && sample.imageHash === currentHash) ? 2 : 1
-    const deletedSet = new Set(sample.deletedIds || [])
-    const allRooms   = [...(sample.original || []), ...(sample.edited || [])]
-    for (const r of allRooms) {
-      if (typeof r.compactness !== 'number' || typeof r.aspect !== 'number') continue
-      const entry = { c: r.compactness, a: r.aspect }
-      for (let w = 0; w < weight; w++) {
-        if (deletedSet.has(r.id)) deletedShapes.push(entry)
-        else                       keptShapes.push(entry)
-      }
-    }
-  }
-
-  if (!keptShapes.length || !deletedShapes.length) return null
-
-  // Строим пороги по p10 оставленных (консервативно — не режем то, что пользователь хранит)
-  keptShapes.sort((a, b) => a.c - b.c)
-  const compactThresh = keptShapes[Math.floor(keptShapes.length * 0.10)].c * 0.80
-
-  keptShapes.sort((a, b) => a.a - b.a)
-  const aspectThresh  = keptShapes[Math.floor(keptShapes.length * 0.90)].a * 1.30
-
-  // Проверяем точность: сколько удалённых действительно попадают под фильтр
-  const trueFiltered = deletedShapes.filter(s => s.c < compactThresh || s.a > aspectThresh).length
-  const accuracy = trueFiltered / deletedShapes.length
-
-  // Активируем только если фильтр действительно работает
-  if (accuracy < MIN_ACCURACY) return null
-
-  return {
-    compactThresh,
-    aspectThresh,
-    accuracy: Math.round(accuracy * 100),
-    sampleCount: localSamples.length,
   }
 }
 
@@ -865,58 +809,41 @@ async function analyseLocal() {
   // ── Загружаем накопленные правки ───────────────────────
   const trainingData = await ipcRenderer.invoke('get-training-data')
 
-  // ── Стандартная детекция ───────────────────────────────
-  // Правки пользователя — сигнал для обучения (фильтры площади и формы),
-  // а не кэш результата. Детекция запускается всегда заново.
-  // Убеждаемся, что BW-канвас актуален (может быть отложен через rAF)
-  if (_rebuildRaf) { cancelAnimationFrame(_rebuildRaf); _rebuildRaf = null; _doRebuildBWCanvas() }
-
-  // Local CV always needs a grayscale canvas — build one with full BW pipeline
-  // regardless of the display toggle (user may be in colour mode)
-  let recognitionCanvas = currentImageBW
-  if (!showBWBackground && _rawPixels) {
-    const data = new Uint8ClampedArray(_rawPixels)
-    applyBWProcessing(data)
-    if (eraserStrokes.length) {
-      const tmp = document.createElement('canvas')
-      tmp.width = _rawWidth; tmp.height = _rawHeight
-      const tc = tmp.getContext('2d')
-      tc.putImageData(new ImageData(data, _rawWidth, _rawHeight), 0, 0)
-      tc.fillStyle = '#ffffff'
-      for (const stroke of eraserStrokes)
-        for (const pt of stroke) { tc.beginPath(); tc.arc(pt.x, pt.y, pt.r, 0, Math.PI*2); tc.fill() }
-      recognitionCanvas = tmp
-    } else {
-      const tmp = document.createElement('canvas')
-      tmp.width = _rawWidth; tmp.height = _rawHeight
-      tmp.getContext('2d').putImageData(new ImageData(data, _rawWidth, _rawHeight), 0, 0)
-      recognitionCanvas = tmp
-    }
+  // ── Функция 1: точное восстановление ──────────────────
+  // Если это изображение уже исправлялось — возвращаем сохранённый результат.
+  const hash = imageHash()
+  const exactMatch = trainingData.find(
+    s => s.imageHash === hash && (s.mode === 'local' || !s.mode) && s.edited?.length
+  )
+  if (exactMatch) {
+    rooms = exactMatch.edited.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) }))
+    finishAnalysis()
+    viewLabel.textContent = `✦ Восстановлено из обучения: ${rooms.length} помещений`
+    return
   }
 
-  const currentHash = imageHash()   // передаём в learning-функции для взвешивания
+  // ── Стандартная детекция ───────────────────────────────
   setProgressStep('Подготовка изображения')
   await tick()
 
   const tManual = Number(paramThreshold.value)         // 0 = auto (Otsu)
+  const dilateK = Number(paramDilate.value)            // 0..5
+  const minPct  = Number(paramMinArea.value) / 1000    // /10 -> percent then /100 -> fraction
   const epsilon = Number(paramEpsilon.value)           // px in display scale
-
-  _analyseRunCount++   // 1st run → valley method; 2nd+ → k-means
 
   setProgressStep('Поиск стен и помещений…')
   await tick()
 
-  const result = await detectRoomsLocal(recognitionCanvas || currentImageEl, {
+  rooms = await detectRoomsLocal(currentImageEl, {
     threshold: tManual || null,
+    dilateK,
+    minAreaFrac: minPct,
     epsilon,
-    useKmeans: _analyseRunCount > 1,
   })
-  rooms = result.rooms
-  updateWallInfoDisplay(result.wallInfo)
 
   // ── Функция 2: автофильтрация по накопленным площадям ─
   // Учится на том, комнаты каких размеров пользователь обычно удаляет.
-  const learned = computeLocalLearning(trainingData, currentHash)
+  const learned = computeLocalLearning(trainingData)
   let filteredCount = 0
   if (learned && rooms.length) {
     const imgArea = currentImageEl.naturalWidth * currentImageEl.naturalHeight
@@ -931,736 +858,22 @@ async function analyseLocal() {
 
   if (!rooms.length) throw new Error('Помещения не найдены. Попробуй уменьшить «Мин. площадь» или включить «Утолщение стен».')
 
-  // ── Shape-фильтр (МОП и нестандартные формы) ──────────────────────────────
-  // Активируется только при достаточном количестве обучающих данных (≥5 образцов)
-  // и высокой точности (>70%). Без данных — не трогает ничего.
-  const shapeFilter = computeShapeFilter(trainingData, currentHash)
-  let shapeFilteredCount = 0
-  if (shapeFilter && rooms.length) {
-    const before = rooms.length
-    rooms = rooms.filter(r => {
-      if (typeof r.compactness !== 'number' || typeof r.aspect !== 'number') return true
-      if (r.compactness < shapeFilter.compactThresh) return false
-      if (r.aspect      > shapeFilter.aspectThresh)  return false
-      return true
-    })
-    shapeFilteredCount = before - rooms.length
-  }
-
-  // ── Слияние перекрывающихся комнат ────────────────────────────────────────
-  const beforeMerge = rooms.length
-  rooms = mergeOverlappingRooms(rooms)
-  if (rooms.length < beforeMerge) {
-    rooms.forEach((r, i) => { r.id = `r${i+1}`; r.label = `Помещение ${i+1}` })
-  }
-
   finishAnalysis()
 
-  // ── Строка статуса ─────────────────────────────────────────────────────────
-  const notes = []
+  // Показываем информацию об активном обучении в строке статуса
   if (learned) {
-    notes.push(`✦ обучение: ${learned.sampleCount} образц.`)
-    if (filteredCount > 0)      notes.push(`−${filteredCount} по площади`)
-    if (learned.addedCount > 0) notes.push(`+${learned.addedCount} доб.`)
-    if (learned.filterAccuracy !== null) notes.push(`точность ${learned.filterAccuracy}%`)
+    const accNote    = learned.filterAccuracy !== null ? `, точность ${learned.filterAccuracy}%` : ''
+    const filterNote = filteredCount > 0 ? ` · −${filteredCount} отф.` : ''
+    const addedNote  = learned.addedCount  > 0 ? ` · +${learned.addedCount} доб.` : ''
+    viewLabel.textContent += ` · ✦ обучение: ${learned.sampleCount} образц.${filterNote}${addedNote}${accNote}`
   }
-  if (shapeFilter) {
-    notes.push(`−${shapeFilteredCount} по форме (${shapeFilter.accuracy}%)`)
-  }
-  if (notes.length) viewLabel.textContent += ` · ${notes.join(' · ')}`
 }
 
-function finishAnalysis() {
-  // Snapshot for training diff
-  originalRooms = rooms.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) }))
-  hasUnsavedEdits = false
-  undoStack = []
-  if (undoBtn) undoBtn.disabled = true
-  buildRoomList()
-  drawPlan()
-  saveBar.classList.add('visible')
-  viewAllBtn.style.display = ''; viewSelBtn.style.display = ''
-  viewLabel.textContent = `Найдено: ${rooms.length} помещений — кликни для выбора`
-  editToolbar.classList.add('visible')
-  saveEditsBtn.style.display = 'none'
-  setEditMode('view')
-  updateTrainingBadge()
-}
-
-// ── Edit mode ──────────────────────────────────────────────
-function setEditMode(m) {
-  // Exit crop mode if leaving it
-  if (editMode === 'crop' && m !== 'crop') exitCropMode()
-
-  editMode = m
-  document.getElementById('emodeView').classList.toggle('active',     m === 'view')
-  document.getElementById('emodeEdit').classList.toggle('active',     m === 'edit')
-  document.getElementById('emodeDelete').classList.toggle('active',   m === 'delete')
-  document.getElementById('emodeDraw').classList.toggle('active',     m === 'collider')
-  document.getElementById('emodeEraser')?.classList.toggle('active',  m === 'eraser')
-  document.getElementById('cropBtn')?.classList.toggle('active',      m === 'crop')
-  document.getElementById('emodeRescan')?.classList.toggle('active',  m === 'rescan')
-  canvas.className = m === 'eraser' ? 'mode-eraser' : m !== 'view' ? `mode-${m}` : ''
-  hoverState = null
-  dragState  = null
-  roomDraw   = null
-
-  if (m === 'crop') initCropMode()
-  drawPlan()
-}
-
-// ── Canvas hit testing ─────────────────────────────────────
-const VERTEX_HIT_R  = 8   // px on screen
-const EDGE_HIT_R    = 6
-
-function canvasToImage(cx, cy) {
-  if (!currentImageEl) return [cx, cy]
-  return [
-    cx * currentImageEl.naturalWidth  / canvas.width,
-    cy * currentImageEl.naturalHeight / canvas.height,
-  ]
-}
-function imageToCanvas(ix, iy) {
-  if (!currentImageEl) return [ix, iy]
-  return [
-    ix * canvas.width  / currentImageEl.naturalWidth,
-    iy * canvas.height / currentImageEl.naturalHeight,
-  ]
-}
-
-function ptDistSq(ax, ay, bx, by) { return (ax-bx)**2 + (ay-by)**2 }
-
-function segDistSq(px, py, ax, ay, bx, by) {
-  const dx = bx-ax, dy = by-ay
-  const lenSq = dx*dx + dy*dy
-  if (lenSq === 0) return ptDistSq(px, py, ax, ay)
-  const t = Math.max(0, Math.min(1, ((px-ax)*dx + (py-ay)*dy) / lenSq))
-  return ptDistSq(px, py, ax + t*dx, ay + t*dy)
-}
-
-// Returns {roomId, ptIdx} for nearest vertex, or {roomId, edgeIdx} for nearest edge, or null
-function hitTest(cx, cy) {
-  if (!rooms.length || !currentImageEl) return null
-  const sx = canvas.width  / currentImageEl.naturalWidth
-  const sy = canvas.height / currentImageEl.naturalHeight
-  let bestVDist = VERTEX_HIT_R * VERTEX_HIT_R
-  let bestEDist = EDGE_HIT_R * EDGE_HIT_R
-  let bestV = null, bestE = null
-
-  for (const room of rooms) {
-    if (!room.polygon) continue
-    const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
-    // Check vertices
-    for (let i = 0; i < pts.length; i++) {
-      const d = ptDistSq(cx, cy, pts[i][0], pts[i][1])
-      if (d < bestVDist) { bestVDist = d; bestV = { roomId: room.id, ptIdx: i } }
-    }
-    // Check edges
-    for (let i = 0; i < pts.length; i++) {
-      const j = (i+1) % pts.length
-      const d = segDistSq(cx, cy, pts[i][0], pts[i][1], pts[j][0], pts[j][1])
-      if (d < bestEDist) { bestEDist = d; bestE = { roomId: room.id, edgeIdx: i } }
-    }
-  }
-  return bestV || bestE || null
-}
-
-// ── Polygon editing ────────────────────────────────────────
-function deepCopyRooms(src) {
-  return src.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) }))
-}
-
-function snapshotBW() {
-  if (!currentImageBW) return null
-  const snap = document.createElement('canvas')
-  snap.width = currentImageBW.width
-  snap.height = currentImageBW.height
-  snap.getContext('2d').drawImage(currentImageBW, 0, 0)
-  return snap
-}
-
-function pushUndo() {
-  // Deep-copy eraserStrokes: each stroke is an array of {x,y,r} objects
-  const eraserSnap = eraserStrokes.map(stroke => stroke.map(pt => ({ ...pt })))
-  undoStack.push({ rooms: deepCopyRooms(rooms), bw: snapshotBW(), eraserStrokes: eraserSnap })
-  if (undoStack.length > MAX_UNDO) undoStack.shift()
-  if (undoBtn) undoBtn.disabled = false
-}
-
-function togglePolygons() {
-  showPolygons = !showPolygons
-  const btn = document.getElementById('togglePolygonsBtn')
-  if (btn) {
-    if (showPolygons) {
-      btn.textContent = '🔲 Скрыть полигоны'
-      btn.style.background = '#e8e8ed'
-      btn.style.color = '#555'
-    } else {
-      btn.textContent = '🔳 Показать полигоны'
-      btn.style.background = '#ff9500'
-      btn.style.color = '#fff'
-    }
-  }
-  drawPlan()
-}
-
-
-function toggleBWBackground() {
-  showBWBackground = !showBWBackground
-  const btn = document.getElementById('toggleBWBtn')
-  if (btn) btn.classList.toggle('active', showBWBackground)
-  if (btn) btn.textContent = showBWBackground ? '🎨 Цветной' : '⬛ Ч/Б'
-  drawPlan()
-}
-function undo() {
-  const entry = undoStack.pop()
-  rooms = entry.rooms
-  // Restore eraser strokes snapshot so rebuildBWCanvas won't re-apply removed strokes
-  if (entry.eraserStrokes !== undefined) {
-    eraserStrokes = entry.eraserStrokes
-  }
-  if (entry.bw && currentImageBW) {
-    currentImageBW.getContext('2d').drawImage(entry.bw, 0, 0)
-  }
-  if (undoBtn) undoBtn.disabled = undoStack.length === 0
-  buildRoomList()
-  drawPlan()
-  hasUnsavedEdits = undoStack.length > 0
-  saveEditsBtn.style.display = hasUnsavedEdits ? '' : 'none'
-}
-
-function markEdited() {
-  hasUnsavedEdits = true
-  saveEditsBtn.style.display = ''
-}
-
-function deleteRoom(id) {
-  pushUndo()
-  rooms = rooms.filter(r => r.id !== id)
-  if (selectedRoomId === id) selectedRoomId = null
-  buildRoomList()
-  drawPlan()
-  markEdited()
-}
-
-function addVertexOnEdge(roomId, edgeIdx, cx, cy) {
-  pushUndo()
-  const room = rooms.find(r => r.id === roomId)
-  if (!room) return
-  const [ix, iy] = canvasToImage(cx, cy)
-  const pt = [Math.round(ix), Math.round(iy)]
-  room.polygon.splice(edgeIdx + 1, 0, pt)
-  markEdited()
-}
-
-function removeVertex(roomId, ptIdx) {
-  const room = rooms.find(r => r.id === roomId)
-  if (!room || room.polygon.length <= 3) return  // keep minimum 3 pts
-  pushUndo()
-  room.polygon.splice(ptIdx, 1)
-  markEdited()
-}
-
-// ── Canvas mouse events ────────────────────────────────────
-function getCanvasXY(e) {
-  const rect = canvas.getBoundingClientRect()
-  return [
-    (e.clientX - rect.left) * (canvas.width  / rect.width),
-    (e.clientY - rect.top)  * (canvas.height / rect.height),
-  ]
-}
-
-// ── Zoom helpers ───────────────────────────────────────────
-function applyZoomTransform() {
-  canvas.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`
-  canvas.style.transformOrigin = '50% 50%'
-  updateZoomLabel()
-}
-
-function updateZoomLabel() {
-  const lbl = document.getElementById('zoomLabel')
-  if (lbl) lbl.textContent = Math.round(zoomLevel * 100) + '%'
-}
-
-function zoomBy(delta, originX, originY) {
-  // originX/Y are screen coords relative to canvas-wrap centre
-  const wrap = document.querySelector('.canvas-wrap')
-  const wRect = wrap.getBoundingClientRect()
-  // point in canvas space before zoom
-  const ox = originX !== undefined ? originX - wRect.left - wRect.width / 2 : 0
-  const oy = originY !== undefined ? originY - wRect.top  - wRect.height / 2 : 0
-
-  const oldZoom = zoomLevel
-  zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoomLevel * (1 + delta)))
-
-  // Adjust pan so the point under cursor stays fixed
-  const ratio = zoomLevel / oldZoom
-  panX = ox + (panX - ox) * ratio
-  panY = oy + (panY - oy) * ratio
-
-  applyZoomTransform()
-}
-
-function resetZoom() {
-  zoomLevel = 1.0; panX = 0; panY = 0
-  applyZoomTransform()
-}
-
-function zoomIn()  { zoomBy(ZOOM_STEP) }
-function zoomOut() { zoomBy(-ZOOM_STEP) }
-
-canvas.addEventListener('mousedown', e => {
-  if (!currentImageEl) return
-  const [cx, cy] = getCanvasXY(e)
-
-  // ── Eraser ─────────────────────────────────────────────
-  if (editMode === 'eraser') {
-    pushUndo()
-    eraserActive = true
-    eraserCurrentStroke = []
-    eraserStrokes.push(eraserCurrentStroke)
-    const [ix, iy] = canvasToImage(cx, cy)
-    const r = eraserSize * currentImageEl.naturalWidth / canvas.width
-    eraserCurrentStroke.push({ x: ix, y: iy, r })
-    drawPlan()
-    e.preventDefault()
-    return
-  }
-
-  // ── Room drawing ───────────────────────────────────────
-  if (editMode === 'collider') {
-    const [ix, iy] = canvasToImage(cx, cy)
-    roomDraw = { x0: ix, y0: iy, x1: ix, y1: iy }
-    e.preventDefault()
-    return
-  }
-
-  // ── Rescan zone draw ────────────────────────────────────
-  if (editMode === 'rescan') {
-    const [ix, iy] = canvasToImage(cx, cy)
-    roomDraw = { x0: ix, y0: iy, x1: ix, y1: iy }
-    e.preventDefault()
-    return
-  }
-
-  if (!rooms.length) return
-
-  if (editMode === 'delete') {
-    // Delete whole room on click
-    const sx = canvas.width  / currentImageEl.naturalWidth
-    const sy = canvas.height / currentImageEl.naturalHeight
-    for (const room of [...rooms].reverse()) {
-      if (!room.polygon) continue
-      const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
-      if (pointInPolygon(cx, cy, pts)) { deleteRoom(room.id); return }
-    }
-    return
-  }
-
-  if (editMode === 'edit') {
-    const hit = hitTest(cx, cy)
-    if (!hit) return
-    if (hit.ptIdx !== undefined) {
-      // Start dragging vertex
-      pushUndo()
-      dragState = { roomId: hit.roomId, ptIdx: hit.ptIdx }
-      selectRoom(hit.roomId)
-      e.preventDefault()
-    } else if (hit.edgeIdx !== undefined) {
-      // Insert vertex on edge then start dragging it
-      addVertexOnEdge(hit.roomId, hit.edgeIdx, cx, cy)
-      const room = rooms.find(r => r.id === hit.roomId)
-      dragState = { roomId: hit.roomId, ptIdx: hit.edgeIdx + 1 }
-      selectRoom(hit.roomId)
-      e.preventDefault()
-    }
-    return
-  }
-
-  // view mode: клик по комнате — выбор; клик по пустому месту — начало пана
-  if (editMode === 'view' && e.button === 0 && !e.altKey && !_spaceDown) {
-    const sx = canvas.width  / currentImageEl.naturalWidth
-    const sy = canvas.height / currentImageEl.naturalHeight
-    for (const room of [...rooms].reverse()) {
-      if (!room.polygon) continue
-      const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
-      if (pointInPolygon(cx, cy, pts)) { selectRoom(room.id); return }
-    }
-    // Пустое место — запускаем пан
-    isPanning = true
-    panStart = { x: e.clientX, y: e.clientY, panX, panY }
-    document.querySelector('.canvas-wrap').style.cursor = 'grabbing'
-    selectedRoomId = null
-    document.querySelectorAll('.room-item').forEach(el => el.classList.remove('selected'))
-    drawPlan()
-    return
-  }
-})
-
-canvas.addEventListener('mousemove', e => {
-  if (!currentImageEl) return
-  const [cx, cy] = getCanvasXY(e)
-
-  // ── Eraser drag ────────────────────────────────────────
-  if (editMode === 'eraser') {
-    canvas.style.cursor = 'none'
-    drawPlan()  // redraw to show eraser cursor preview
-    if (eraserActive && currentImageBW) {
-      const [ix, iy] = canvasToImage(cx, cy)
-      const r = eraserSize * currentImageEl.naturalWidth / canvas.width
-      eraserCurrentStroke.push({ x: ix, y: iy, r })
-      drawPlan()
-    }
-    // Draw eraser cursor ring
-    const r = eraserSize
-    ctx.save()
-    ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 1.5
-    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke()
-    ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1
-    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke()
-    ctx.restore()
-    return
-  }
-
-  // ── Room draw drag ─────────────────────────────────────
-  if (editMode === 'collider') {
-    canvas.style.cursor = 'crosshair'
-    if (roomDraw) {
-      const [ix, iy] = canvasToImage(cx, cy)
-      roomDraw.x1 = ix; roomDraw.y1 = iy
-      drawPlan()
-    }
-    return
-  }
-
-  if (!rooms.length) return
-
-  if (dragState) {
-    // Move dragged vertex
-    const room = rooms.find(r => r.id === dragState.roomId)
-    if (room) {
-      const [ix, iy] = canvasToImage(cx, cy)
-      room.polygon[dragState.ptIdx] = [Math.round(ix), Math.round(iy)]
-      drawPlan()
-    }
-    return
-  }
-
-  if (editMode === 'edit') {
-    const prevHover = JSON.stringify(hoverState)
-    hoverState = hitTest(cx, cy)
-    if (JSON.stringify(hoverState) !== prevHover) drawPlan()
-    // Cursor
-    if (hoverState?.ptIdx !== undefined) canvas.style.cursor = 'grab'
-    else if (hoverState?.edgeIdx !== undefined) canvas.style.cursor = 'cell'
-    else canvas.style.cursor = 'crosshair'
-    return
-  }
-
-  if (editMode === 'delete') {
-    const sx = canvas.width  / currentImageEl.naturalWidth
-    const sy = canvas.height / currentImageEl.naturalHeight
-    for (const room of rooms) {
-      if (!room.polygon) continue
-      const pts = room.polygon.map(([x,y]) => [x*sx, y*sy])
-      if (pointInPolygon(cx, cy, pts)) { canvas.style.cursor = 'not-allowed'; return }
-    }
-    canvas.style.cursor = 'default'; return
-  }
-
-  // view mode: курсор-рука на пустом месте подсказывает что можно тащить
-  if (editMode === 'view' && !isPanning) {
-    const sx = canvas.width  / currentImageEl.naturalWidth
-    const sy = canvas.height / currentImageEl.naturalHeight
-    const overRoom = rooms.some(room => {
-      if (!room.polygon) return false
-      return pointInPolygon(cx, cy, room.polygon.map(([x,y]) => [x*sx, y*sy]))
-    })
-    canvas.style.cursor = overRoom ? 'pointer' : (_spaceDown ? 'grab' : 'grab')
-  }
-})
-
-canvas.addEventListener('mouseup', e => {
-  // ── Finish eraser stroke ───────────────────────────────
-  if (editMode === 'eraser') {
-    eraserActive = false
-    eraserCurrentStroke = []
-    return
-  }
-
-  // ── Finish room draw ───────────────────────────────────
-  if (editMode === 'collider' && roomDraw) {
-    const { x0, y0, x1, y1 } = roomDraw
-    roomDraw = null
-    const minW = Math.abs(x1 - x0), minH = Math.abs(y1 - y0)
-    if (minW > 5 && minH > 5) {
-      const lx = Math.min(x0, x1), ly = Math.min(y0, y1)
-      const rx = Math.max(x0, x1), ry = Math.max(y0, y1)
-      drawnRoomCount++
-      pushUndo()
-      const newRoom = {
-        id:      `drawn${Date.now()}`,
-        label:   `Помещение ${rooms.length + 1}`,
-        areaPx:  Math.round(minW * minH),
-        polygon: [[lx,ly],[rx,ly],[rx,ry],[lx,ry]],
-        drawn:   true,
-      }
-      rooms.push(newRoom)
-
-      // For manually drawn rooms: union with any overlapping existing rooms
-      let mergedRoomId = newRoom.id
-      let mergedPoly = newRoom.polygon.map(p => [...p])
-      const toAbsorb = []
-
-      for (let i = 0; i < rooms.length - 1; i++) {
-        const other = rooms[i]
-        if (!other.polygon || other.polygon.length < 3) continue
-        if (!bboxOverlap(mergedPoly, other.polygon)) continue
-        const inter = intersectPolygons(mergedPoly, other.polygon)
-        if (!inter.length || polygonArea(inter) < 4) continue
-        // True union via convex hull of both polygons
-        mergedPoly = unionPolygonsConvexHull(mergedPoly, other.polygon)
-        toAbsorb.push(other.id)
-      }
-
-      if (toAbsorb.length) {
-        rooms = rooms.filter(r => !toAbsorb.includes(r.id))
-        const nr = rooms.find(r => r.id === newRoom.id)
-        if (nr) {
-          nr.polygon = mergedPoly.map(p => [Math.round(p[0]), Math.round(p[1])])
-          nr.areaPx  = Math.round(polygonArea(mergedPoly))
-        }
-      }
-
-      markEdited()
-      buildRoomList()
-      selectRoom(mergedRoomId)
-    }
-    drawPlan()
-    return
-  }
-
-  // ── Finish rescan zone ─────────────────────────────────
-  if (editMode === 'rescan' && roomDraw) {
-    const { x0, y0, x1, y1 } = roomDraw
-    roomDraw = null
-    drawPlan()
-    const minW = Math.abs(x1 - x0), minH = Math.abs(y1 - y0)
-    if (minW > 10 && minH > 10) {
-      rescanZone(Math.min(x0,x1), Math.min(y0,y1), Math.max(x0,x1), Math.max(y0,y1))
-    }
-    return
-  }
-
-  if (dragState) {
-    markEdited()
-    dragState = null
-    drawPlan()
-  }
-})
-
-canvas.addEventListener('mouseleave', () => {
-  if (editMode === 'collider' && roomDraw) {
-    roomDraw = null; drawPlan()
-  }
-  if (dragState) { markEdited(); dragState = null }
-  hoverState = null
-  if (editMode !== 'view') canvas.style.cursor = editMode === 'delete' ? 'not-allowed' : 'crosshair'
-  drawPlan()
-})
-
-canvas.addEventListener('dblclick', e => {
-  if (editMode !== 'edit') return
-  const [cx, cy] = getCanvasXY(e)
-  const hit = hitTest(cx, cy)
-  if (hit?.ptIdx !== undefined) {
-    removeVertex(hit.roomId, hit.ptIdx)
-    hoverState = null
-    drawPlan()
-  }
-})
-
-// ── Rescan zone ────────────────────────────────────────────
-// Запускает детекцию на вырезанном прямоугольнике изображения.
-// Найденные новые помещения добавляются к существующим.
-// Результат автоматически сохраняется как обучающий образец.
-async function rescanZone(x0, y0, x1, y1) {
-  if (!currentImageEl) return
-  const imgW = currentImageEl.naturalWidth
-  const imgH = currentImageEl.naturalHeight
-
-  // Зажимаем зону по границам изображения
-  x0 = Math.max(0, Math.round(x0)); y0 = Math.max(0, Math.round(y0))
-  x1 = Math.min(imgW, Math.round(x1)); y1 = Math.min(imgH, Math.round(y1))
-  const zw = x1 - x0, zh = y1 - y0
-  if (zw < 10 || zh < 10) return
-
-  showProgress('Доиск…', 'Вырезаем зону')
-  await tick()
-
-  // Вырезаем фрагмент изображения в отдельный canvas
-  const zoneCanvas = document.createElement('canvas')
-  zoneCanvas.width = zw; zoneCanvas.height = zh
-  const zc = zoneCanvas.getContext('2d')
-  const srcImg = showBWBackground ? (currentImageBW || currentImageEl) : (currentImageColor || currentImageEl)
-  zc.drawImage(srcImg, x0, y0, zw, zh, 0, 0, zw, zh)
-
-  // Применяем BW-обработку если используем цветное изображение
-  if (!showBWBackground && _rawPixels) {
-    const tmp = document.createElement('canvas')
-    tmp.width = zw; tmp.height = zh
-    const tc = tmp.getContext('2d')
-    tc.drawImage(currentImageEl, x0, y0, zw, zh, 0, 0, zw, zh)
-    const id = tc.getImageData(0, 0, zw, zh)
-    applyBWProcessing(id.data)
-    tc.putImageData(id, 0, 0)
-    zoneCanvas.getContext('2d').drawImage(tmp, 0, 0)
-  }
-
-  setProgressStep('Поиск помещений в зоне…')
-  await tick()
-
-  let found = []
-  try {
-    const tManual = Number(paramThreshold.value)
-    const epsilon = Number(paramEpsilon.value)
-
-    const result = await detectRoomsLocal(zoneCanvas, {
-      threshold:  tManual || null,
-      epsilon,
-      useKmeans:  _analyseRunCount > 1,
-    })
-    const zoneRooms = result.rooms
-
-    // Переводим координаты зоны → координаты всего изображения
-    const translated = zoneRooms.map(r => ({
-      ...r,
-      polygon: r.polygon.map(([px, py]) => [px + x0, py + y0]),
-      areaPx:  r.areaPx,
-    }))
-
-    // Фильтруем дубли: пропускаем помещение если его центр попадает в уже существующий полигон
-    const newRooms = translated.filter(nr => {
-      const cx = nr.polygon.reduce((s,p)=>s+p[0],0) / nr.polygon.length
-      const cy = nr.polygon.reduce((s,p)=>s+p[1],0) / nr.polygon.length
-      const sx = canvas.width  / imgW
-      const sy = canvas.height / imgH
-      return !rooms.some(existing => {
-        if (!existing.polygon?.length) return false
-        return pointInPolygon(cx * sx, cy * sy,
-          existing.polygon.map(([ex,ey]) => [ex*sx, ey*sy]))
-      })
-    })
-
-    found = newRooms
-  } catch (err) {
-    hideProgress()
-    console.warn('rescanZone: детекция не дала результатов:', err.message)
-    setEditMode('rescan')
-    return
-  }
-
-  hideProgress()
-
-  if (!found.length) {
-    viewLabel.textContent = 'Доиск: помещений не найдено в выделенной зоне'
-    setEditMode('rescan')
-    return
-  }
-
-  // Добавляем найденные комнаты
-  pushUndo()
-  const baseIdx = rooms.length
-  found.forEach((r, i) => {
-    r.id    = `rescan_${Date.now()}_${i}`
-    r.label = `Помещение ${baseIdx + i + 1}`
-    rooms.push(r)
-  })
-
-  markEdited()
-  buildRoomList()
-  drawPlan()
-  viewLabel.textContent = `Доиск: найдено ${found.length} новых помещений — сохрани образец`
-  setEditMode('view')
-
-  // Автосохраняем обучающий образец — нашли что-то новое, это ценный сигнал
-  await saveEdits()
-}
-
-// ── Training ───────────────────────────────────────────────
-async function updateTrainingBadge() {
-  const data = await ipcRenderer.invoke('get-training-data')
-  trainingCount = data.length
-  trainingBadge.textContent = `✦ ${trainingCount} образц${trainingCount === 1 ? '' : trainingCount < 5 ? 'а' : 'ов'}`
-  trainingBadge.classList.toggle('visible', trainingCount > 0)
-}
-
-function imageHash() {
-  // Simple hash from first 200 chars of b64 + image dimensions
-  if (!currentImageB64) return 'none'
-  return `${currentImageEl?.naturalWidth}x${currentImageEl?.naturalHeight}_${currentImageB64.slice(0, 80)}`
-}
-
-async function saveEdits() {
-  const hash = imageHash()
-  const deletedIds = originalRooms
-    .filter(o => !rooms.find(r => r.id === o.id))
-    .map(o => o.id)
-
-  // Track rooms added by the user (not in original set)
-  const addedIds = rooms
-    .filter(r => !originalRooms.find(o => o.id === r.id))
-    .map(r => r.id)
-
-  const sample = {
-    imageHash:  hash,
-    savedAt:    new Date().toISOString(),
-    mode,                 // 'local' | 'ai' — чтобы отделить локальные образцы при обучении CV
-    original:   originalRooms,
-    edited:     rooms.map(r => ({ ...r, polygon: r.polygon.map(p => [...p]) })),
-    deletedIds,
-    addedIds,
-  }
-
-  const count = await ipcRenderer.invoke('save-training-sample', sample)
-  hasUnsavedEdits = false
-  undoStack = []
-  if (undoBtn) undoBtn.disabled = true
-  saveEditsBtn.style.display = 'none'
-  trainingCount = count
-  await updateTrainingBadge()
-
-  // Brief visual confirmation
-  const orig = trainingBadge.style.background
-  trainingBadge.style.background = '#d4f8df'
-  setTimeout(() => { trainingBadge.style.background = orig }, 800)
-}
-
-function tick() { return new Promise(r => setTimeout(r, 0)) }
-
-// ── Local CV pipeline — Watershed + Distance Transform ─────────────────────
-//
-// Алгоритм:
-//   1. Grayscale → Otsu/Sauvola бинаризация (стены = 0, свободно = 1)
-//   2. Morphological closing с радиусом ≈ макс. ширина двери
-//      → закрывает дверные проёмы, поглощает мебель, штриховку
-//   3. Distance Transform (EDT, 2-pass приближение)
-//      → каждый свободный пиксель = расстояние до ближайшей стены
-//   4. Подавление немаксимумов на DT-карте + кластеризация пиков
-//      → центры помещений (seeds для Watershed)
-//   5. Priority-queue Watershed от каждого seed
-//      → границы проходят по минимуму DT = по стенам
-//   6. Постобработка: фильтрация по площади, contour tracing → полигоны
-//
+// ── Local CV pipeline ──────────────────────────────────────
 async function detectRoomsLocal(imageEl, opts) {
-  // ── Slider params ──────────────────────────────────────────────────────────
-  const _maxAreaPct  = (+(document.getElementById('paramMaxArea')?.value    ?? 92)) / 100
-  const _minCompact  = (+(document.getElementById('paramMinCompact')?.value ?? 8))  / 100
-  const _closingMul  = (+(document.getElementById('paramDashGap')?.value    ?? 10)) / 10  // переиспользуем слайдер
-  const _minFill     = (+(document.getElementById('paramMinFill')?.value    ?? 35)) / 100
+  const W0 = imageEl.naturalWidth, H0 = imageEl.naturalHeight
 
-  const W0 = imageEl.naturalWidth  ?? imageEl.width
-  const H0 = imageEl.naturalHeight ?? imageEl.height
+  // Downscale for speed — but keep enough detail for small rooms
   const MAX_DIM = 2000
   const scale = Math.min(1, MAX_DIM / Math.max(W0, H0))
   const W = Math.round(W0 * scale), H = Math.round(H0 * scale)
@@ -1671,505 +884,156 @@ async function detectRoomsLocal(imageEl, opts) {
   wctx.drawImage(imageEl, 0, 0, W, H)
   const px = wctx.getImageData(0, 0, W, H).data
 
-  // ── 1. Grayscale ───────────────────────────────────────────────────────────
+  // Grayscale
   const gray = new Uint8Array(W * H)
   for (let i = 0, j = 0; i < px.length; i += 4, j++) {
     gray[j] = (px[i] * 0.299 + px[i+1] * 0.587 + px[i+2] * 0.114) | 0
   }
 
-  // ── Определяем толщину стен ────────────────────────────────────────────────
-  const wallInfo = detectWallThickness(gray, W, H, opts.useKmeans || false)
+  // ── Multi-level threshold ──────────────────────────────
+  // Run two passes: global Otsu + a slightly lower threshold to catch
+  // rooms whose walls are lighter (partial walls, dashed lines).
+  const T_global = opts.threshold != null ? opts.threshold : otsu(gray)
+  // Second threshold slightly lower catches semi-dark boundaries
+  const T_loose  = Math.max(T_global - 30, 80)
 
-  // ── 2. Бинаризация — стены = 0, свободно = 1 ──────────────────────────────
-  // Адаптивный порог Саувола для фото, Otsu для сканов/PDF
-  let mean = 0
-  for (let i = 0; i < gray.length; i++) mean += gray[i]
-  mean /= gray.length
+  // Binary pass 1: strict (main structure)
+  const binStrict = new Uint8Array(W * H)
+  for (let i = 0; i < gray.length; i++) binStrict[i] = gray[i] > T_global ? 1 : 0
 
-  // Определяем тип источника (фото vs скан)
-  let isPhoto = false
-  if (opts.threshold == null) {
-    const BLOCK = 32
-    let blockVarSum = 0, blockCount = 0
-    for (let by = 0; by + BLOCK <= H; by += BLOCK) {
-      for (let bx = 0; bx + BLOCK <= W; bx += BLOCK) {
-        let bSum = 0, bSum2 = 0, bN = 0
-        for (let y = by; y < by + BLOCK; y++) {
-          for (let x = bx; x < bx + BLOCK; x++) {
-            const v = gray[y * W + x]
-            if (v > mean) { bSum += v; bSum2 += v * v; bN++ }
-          }
+  // Binary pass 2: loose (small rooms inside thick walls)
+  const binLoose = new Uint8Array(W * H)
+  for (let i = 0; i < gray.length; i++) binLoose[i] = gray[i] > T_loose ? 1 : 0
+
+  // Erode to thicken walls on both
+  let bin1 = binStrict, bin2 = binLoose
+  for (let i = 0; i < opts.dilateK; i++) { bin1 = erode4(bin1, W, H); bin2 = erode4(bin2, W, H) }
+  // Extra erode pass on loose to ensure walls are solid
+  bin2 = erode4(bin2, W, H)
+
+  // ── Connected components ────────────────────────────────
+  function floodFill(bin) {
+    const labels = new Int32Array(W * H)
+    const regions = []
+    let nextLabel = 1
+    const stack = new Int32Array(W * H)
+
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const idx = y * W + x
+        if (bin[idx] !== 1 || labels[idx] !== 0) continue
+
+        let minX = x, maxX = x, minY = y, maxY = y, area = 0
+        let touchesBorder = false
+        let sp = 0
+        stack[sp++] = idx
+        labels[idx] = nextLabel
+
+        while (sp > 0) {
+          const p = stack[--sp]
+          const py = (p / W) | 0
+          const pxx = p - py * W
+          area++
+          if (pxx < minX) minX = pxx; if (pxx > maxX) maxX = pxx
+          if (py  < minY) minY = py;  if (py  > maxY) maxY = py
+          if (pxx === 0 || py === 0 || pxx === W - 1 || py === H - 1) touchesBorder = true
+          if (pxx > 0)     { const n = p-1; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
+          if (pxx < W - 1) { const n = p+1; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
+          if (py  > 0)     { const n = p-W; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
+          if (py  < H - 1) { const n = p+W; if (bin[n]===1 && labels[n]===0) { labels[n]=nextLabel; stack[sp++]=n } }
         }
-        if (bN > 4) {
-          const bMean = bSum / bN
-          blockVarSum += Math.sqrt(Math.max(0, bSum2 / bN - bMean * bMean))
-          blockCount++
-        }
+        regions.push({ label: nextLabel, minX, maxX, minY, maxY, area, touchesBorder })
+        nextLabel++
       }
     }
-    isPhoto = blockCount > 0 && (blockVarSum / blockCount) > 12
+    return { labels, regions }
   }
 
-  // Саувола (для фото и сканов с плохим контрастом)
-  function sauvolaThreshold(gray, W, H, windowR, k) {
-    const iSum  = new Float64Array((W+1) * (H+1))
-    const iSum2 = new Float64Array((W+1) * (H+1))
-    for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++) {
-        const v = gray[y*W+x]
-        iSum [(y+1)*(W+1)+(x+1)] = v     + iSum [y*(W+1)+(x+1)] + iSum [(y+1)*(W+1)+x] - iSum [y*(W+1)+x]
-        iSum2[(y+1)*(W+1)+(x+1)] = v*v   + iSum2[y*(W+1)+(x+1)] + iSum2[(y+1)*(W+1)+x] - iSum2[y*(W+1)+x]
-      }
-    }
-    const bin = new Uint8Array(W * H)
-    for (let y = 0; y < H; y++) {
-      const y0 = Math.max(0, y - windowR), y1 = Math.min(H-1, y + windowR)
-      for (let x = 0; x < W; x++) {
-        const x0 = Math.max(0, x - windowR), x1 = Math.min(W-1, x + windowR)
-        const n  = (y1-y0+1) * (x1-x0+1)
-        const s  = iSum [(y1+1)*(W+1)+(x1+1)] - iSum [y0*(W+1)+(x1+1)] - iSum [(y1+1)*(W+1)+x0] + iSum [y0*(W+1)+x0]
-        const s2 = iSum2[(y1+1)*(W+1)+(x1+1)] - iSum2[y0*(W+1)+(x1+1)] - iSum2[(y1+1)*(W+1)+x0] + iSum2[y0*(W+1)+x0]
-        const localMean = s / n
-        const localVar  = Math.max(0, s2/n - localMean*localMean)
-        const localStd  = Math.sqrt(localVar)
-        const T = localMean * (1 + k * (localStd / 128 - 1))
-        bin[y*W+x] = gray[y*W+x] > T ? 1 : 0
-      }
-    }
-    return bin
-  }
-
-  const wallEst = wallInfo
-    ? Math.max(2, Math.min(40, wallInfo.wallPeak))
-    : Math.max(2, Math.min(40, Math.round(Math.min(W, H) * 0.01)))
-  const windowR = Math.max(7, wallEst * 3)
-
-  let bin
-  if (opts.threshold != null) {
-    bin = new Uint8Array(gray.length)
-    for (let i = 0; i < gray.length; i++) bin[i] = gray[i] > opts.threshold ? 1 : 0
-  } else if (isPhoto) {
-    bin = sauvolaThreshold(gray, W, H, windowR, 0.2)
-  } else {
-    const T = otsu(gray)
-    bin = new Uint8Array(gray.length)
-    for (let i = 0; i < gray.length; i++) bin[i] = gray[i] > T ? 1 : 0
-  }
+  const { labels: labels1, regions: regions1 } = floodFill(bin1)
+  const { labels: labels2, regions: regions2 } = floodFill(bin2)
 
   await tick()
 
-  // ── 3. Morphological closing — закрываем двери и мебель ───────────────────
-  // Радиус = типичная ширина дверного проёма ≈ 3–4 × толщина стены.
-  // Слайдер «Зазор пунктира» масштабирует радиус (1.0 = авто).
-  // Результат: тёмные стены «расширяются», поглощая узкие проёмы и мебель.
-  // После этого каждое помещение — замкнутый светлый остров.
-  const doorWidth = Math.max(6, Math.round(wallEst * 3.5 * _closingMul))
-
-  function morphDilate(bin, W, H, r) {
-    // Separable box dilation: horizontal pass then vertical pass — O(W*H*1) not O(W*H*r²)
-    const tmp = new Uint8Array(bin.length)
-    // Horizontal
-    for (let y = 0; y < H; y++) {
-      let count = 0
-      for (let x = 0; x < r; x++) if (bin[y*W+x]) count++
-      for (let x = 0; x < W; x++) {
-        if (x + r < W && bin[y*W+(x+r)]) count++
-        if (x - r - 1 >= 0 && bin[y*W+(x-r-1)]) count--
-        tmp[y*W+x] = count > 0 ? 1 : 0
-      }
-    }
-    const out = new Uint8Array(bin.length)
-    // Vertical
-    for (let x = 0; x < W; x++) {
-      let count = 0
-      for (let y = 0; y < r; y++) if (tmp[y*W+x]) count++
-      for (let y = 0; y < H; y++) {
-        if (y + r < H && tmp[(y+r)*W+x]) count++
-        if (y - r - 1 >= 0 && tmp[(y-r-1)*W+x]) count--
-        out[y*W+x] = count > 0 ? 1 : 0
-      }
-    }
-    return out
-  }
-
-  function morphErode(bin, W, H, r) {
-    // Separable box erosion
-    const tmp = new Uint8Array(bin.length)
-    const diam = 2 * r + 1
-    for (let y = 0; y < H; y++) {
-      let count = 0
-      for (let x = 0; x < diam && x < W; x++) if (bin[y*W+x]) count++
-      for (let x = 0; x < W; x++) {
-        if (x + r < W && bin[y*W+(x+r)]) count++
-        if (x - r - 1 >= 0 && bin[y*W+(x-r-1)]) count--
-        // Erode: pixel is 1 only if entire window is 1
-        // Approximate via: count === diam for interior pixels
-        const wStart = Math.max(0, x - r), wEnd = Math.min(W-1, x + r)
-        tmp[y*W+x] = count >= (wEnd - wStart + 1) ? 1 : 0
-      }
-    }
-    const out = new Uint8Array(bin.length)
-    for (let x = 0; x < W; x++) {
-      let count = 0
-      for (let y = 0; y < diam && y < H; y++) if (tmp[y*W+x]) count++
-      for (let y = 0; y < H; y++) {
-        if (y + r < H && tmp[(y+r)*W+x]) count++
-        if (y - r - 1 >= 0 && tmp[(y-r-1)*W+x]) count--
-        const hStart = Math.max(0, y - r), hEnd = Math.min(H-1, y + r)
-        out[y*W+x] = count >= (hEnd - hStart + 1) ? 1 : 0
-      }
-    }
-    return out
-  }
-
-  // Closing = dilate then erode — закрывает дыры, не меняя внешние контуры
-  // Инвертируем: работаем по стенам (0→1) чтобы closing закрыл проёмы
-  const wallBin = new Uint8Array(bin.length)
-  for (let i = 0; i < bin.length; i++) wallBin[i] = bin[i] ? 0 : 1  // инверт
-  const wallClosed = morphErode(morphDilate(wallBin, W, H, doorWidth), W, H, doorWidth)
-  // Свободное пространство после закрытия
-  const freeBin = new Uint8Array(bin.length)
-  for (let i = 0; i < freeBin.length; i++) freeBin[i] = wallClosed[i] ? 0 : 1
-
-  // Убираем краевой пиксель (артефакты closing на границе)
-  for (let x = 0; x < W; x++) { freeBin[x] = 0; freeBin[(H-1)*W+x] = 0 }
-  for (let y = 0; y < H; y++) { freeBin[y*W] = 0; freeBin[y*W+(W-1)] = 0 }
-
-  await tick()
-
-  // ── 4. Distance Transform (приближённый EDT, 2 прохода) ───────────────────
-  // dt[i] = расстояние пикселя до ближайшей стены (в px).
-  // Свободные пиксели в центре комнаты имеют наибольшее dt → они seeds.
-  const INF = 1e9
-  const dt = new Float32Array(W * H)
-  // Прямой проход (сверху-слева)
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const i = y * W + x
-      if (!freeBin[i]) { dt[i] = 0; continue }
-      let best = INF
-      if (x > 0 && dt[i-1] < INF)   best = Math.min(best, dt[i-1] + 1)
-      if (y > 0 && dt[i-W] < INF)   best = Math.min(best, dt[i-W] + 1)
-      if (x > 0 && y > 0 && dt[i-W-1] < INF) best = Math.min(best, dt[i-W-1] + 1.414)
-      if (x < W-1 && y > 0 && dt[i-W+1] < INF) best = Math.min(best, dt[i-W+1] + 1.414)
-      dt[i] = best < INF ? best : INF
-    }
-  }
-  // Обратный проход (снизу-справа)
-  for (let y = H - 1; y >= 0; y--) {
-    for (let x = W - 1; x >= 0; x--) {
-      const i = y * W + x
-      if (!freeBin[i]) continue
-      if (x < W-1 && dt[i+1] + 1 < dt[i])         dt[i] = dt[i+1] + 1
-      if (y < H-1 && dt[i+W] + 1 < dt[i])          dt[i] = dt[i+W] + 1
-      if (x < W-1 && y < H-1 && dt[i+W+1] + 1.414 < dt[i]) dt[i] = dt[i+W+1] + 1.414
-      if (x > 0   && y < H-1 && dt[i+W-1] + 1.414 < dt[i]) dt[i] = dt[i+W-1] + 1.414
-    }
-  }
-
-  // ── 5. Поиск seeds — локальных максимумов DT ──────────────────────────────
-  // Пик DT = центр помещения (он дальше всего от стен).
-  // Мин. расстояние между seed'ами = wallEst * 4 (чтобы не плодить seeds в одной комнате).
-  const minSeedDist = Math.max(wallEst * 4, 12)
-  const minSeedDT   = Math.max(wallEst * 1.5, 4)  // seed должен быть реально внутри комнаты
-
-  // Локальный максимум: dt[i] >= всех 8 соседей в окне minSeedDist/2
-  const peakR = Math.max(3, Math.round(minSeedDist / 2))
-
-  // Собираем все кандидаты в seeds
-  const seedCandidates = []
-  for (let y = peakR; y < H - peakR; y++) {
-    for (let x = peakR; x < W - peakR; x++) {
-      const i = y * W + x
-      if (!freeBin[i] || dt[i] < minSeedDT) continue
-      let isMax = true
-      check: for (let dy = -peakR; dy <= peakR; dy++) {
-        for (let dx = -peakR; dx <= peakR; dx++) {
-          if (dx === 0 && dy === 0) continue
-          if (dt[(y+dy)*W+(x+dx)] > dt[i]) { isMax = false; break check }
-        }
-      }
-      if (isMax) seedCandidates.push({ x, y, dt: dt[i] })
-    }
-  }
-
-  // Жадная дедупликация по расстоянию (NMS)
-  seedCandidates.sort((a, b) => b.dt - a.dt)
-  const seeds = []
-  const seedDist2 = minSeedDist * minSeedDist
-  for (const c of seedCandidates) {
-    const tooClose = seeds.some(s => (s.x-c.x)**2 + (s.y-c.y)**2 < seedDist2)
-    if (!tooClose) seeds.push(c)
-  }
-
-  await tick()
-
-  if (seeds.length === 0) {
-    return { rooms: [], wallInfo }
-  }
-
-  // ── 6. Watershed от seeds ─────────────────────────────────────────────────
-  // Priority Queue (min-heap по убыванию DT — «затапливаем» от пиков вниз)
-  // labels: 0 = необработано, -1 = стена/граница, 1..N = регион seed'а
-  const labels = new Int32Array(W * H)  // 0 = unvisited
-  // Простая реализация PQ через bucket (DT квантован в 0.5 px шагов)
-  const MAX_DT = Math.ceil(Math.max(...seeds.map(s => s.dt))) + 2
-  const BUCKETS = Math.ceil(MAX_DT * 2) + 2
-  const buckets = Array.from({ length: BUCKETS }, () => [])
-
-  for (let s = 0; s < seeds.length; s++) {
-    const { x, y } = seeds[s]
-    const i = y * W + x
-    labels[i] = s + 1
-    const bucket = Math.min(BUCKETS - 1, Math.floor(dt[i] * 2))
-    buckets[bucket].push(i)
-  }
-
-  // Обходим от высоких DT к низким (от центров к стенам)
-  const DIRS4 = [-1, 1, -W, W]
-
-  for (let b = BUCKETS - 1; b >= 0; b--) {
-    const bkt = buckets[b]
-    for (let qi = 0; qi < bkt.length; qi++) {
-      const p = bkt[qi]
-      const label = labels[p]
-      if (label === 0) continue
-
-      const py = (p / W) | 0, px2 = p - py * W
-
-      for (const dir of DIRS4) {
-        const nx = px2 + (dir === -1 ? -1 : dir === 1 ? 1 : 0)
-        const ny = py  + (dir === -W ? -1 : dir ===  W ? 1 : 0)
-        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue
-        const ni = ny * W + nx
-        if (!freeBin[ni]) continue   // стена
-        if (labels[ni] !== 0) continue  // уже обработан
-
-        labels[ni] = label
-        const nb = Math.min(BUCKETS - 1, Math.floor(dt[ni] * 2))
-        buckets[nb].push(ni)
-      }
-    }
-  }
-
-  await tick()
-
-  // ── 7. Построение регионов из watershed labels ────────────────────────────
-  const regionMap = new Map()  // label → {minX,maxX,minY,maxY,area}
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const i = y * W + x
-      const lbl = labels[i]
-      if (lbl <= 0) continue
-      if (!regionMap.has(lbl)) {
-        regionMap.set(lbl, { label: lbl, minX: x, maxX: x, minY: y, maxY: y, area: 0 })
-      }
-      const r = regionMap.get(lbl)
-      if (x < r.minX) r.minX = x; if (x > r.maxX) r.maxX = x
-      if (y < r.minY) r.minY = y; if (y > r.maxY) r.maxY = y
-      r.area++
-    }
-  }
-
-  // ── 8. Фильтрация регионов ────────────────────────────────────────────────
+  // ── Candidate filtering ─────────────────────────────────
   const total = W * H
-  const minArea = wallInfo
-    ? Math.pow(wallInfo.wallMin * 4, 2)
-    : total * 0.002
-  const maxArea = total * _maxAreaPct
+  const minArea    = total * opts.minAreaFrac
+  // No fixed maxArea ceiling — instead filter by bboxFill ratio
+  // This lets us catch small rooms while still rejecting background.
+  // Only reject regions that are overwhelmingly large (>70% of image)
+  const maxArea    = total * 0.70
 
-  const inv = 1 / scale
-  const rooms = []
-  let roomIdx = 0
-
-  const regionList = [...regionMap.values()].sort((a, b) => {
-    const cyA = (a.minY + a.maxY) / 2, cyB = (b.minY + b.maxY) / 2
-    if (Math.abs(cyA - cyB) > 20) return cyA - cyB
-    return (a.minX + a.maxX) / 2 - (b.minX + b.maxX) / 2
-  })
-
-  for (const r of regionList) {
-    if (r.area < minArea || r.area > maxArea) continue
-
-    // bbox fill ratio
-    const bboxArea = (r.maxX - r.minX + 1) * (r.maxY - r.minY + 1)
-    const fillRatio = bboxArea > 0 ? r.area / bboxArea : 0
-
-    // Строим полигон контура
-    const poly = traceContour(labels, r.label, W, H, r)
-    if (poly.length < 6) continue
-
-    const dynEps = opts.epsilon > 0
-      ? opts.epsilon
-      : Math.max(2, Math.round(Math.min(W, H) * 0.004))
-    let simp = rdp(poly, dynEps)
-    simp = cleanJaggedEdges(snapToRightAngles(simp))
-    if (simp.length < 3) continue
-
-    // Compactness
-    let perim = 0
-    for (let k = 0; k < simp.length; k++) {
-      const [x1,y1] = simp[k], [x2,y2] = simp[(k+1)%simp.length]
-      perim += Math.hypot(x2-x1, y2-y1)
-    }
-    const compactness = perim > 0 ? (4 * Math.PI * r.area) / (perim * perim) : 1
-    if (compactness < _minCompact) continue
-
-    const bboxW = r.maxX - r.minX + 1, bboxH = r.maxY - r.minY + 1
-    const aspect = Math.max(bboxW, bboxH) / Math.max(1, Math.min(bboxW, bboxH))
-
-    roomIdx++
-    rooms.push({
-      id:          `r${roomIdx}`,
-      label:       `Помещение ${roomIdx}`,
-      areaPx:      Math.round(r.area * inv * inv),
-      compactness: Math.round(compactness * 100) / 100,
-      aspect,
-      polygon:     simp.map(([x, y]) => [Math.round(x * inv), Math.round(y * inv)]),
-      _source:     'watershed',
+  function filterRegions(regions, fillRatioMin) {
+    return regions.filter(r => {
+      if (r.touchesBorder) return false
+      if (r.area < minArea || r.area > maxArea) return false
+      const bboxArea = (r.maxX - r.minX + 1) * (r.maxY - r.minY + 1)
+      // Small rooms can have lower fill ratio (irregular shapes, notched walls)
+      if (bboxArea > 0 && r.area / bboxArea < fillRatioMin) return false
+      return true
     })
   }
 
-  return { rooms, wallInfo }
+  // Strict pass: normal fill threshold
+  const cand1 = filterRegions(regions1, 0.30)
+  // Loose pass: allow slightly lower fill ratio for small rooms
+  const cand2 = filterRegions(regions2, 0.20)
+
+  // ── Merge and deduplicate ───────────────────────────────
+  // Prefer strict candidates; add loose ones that don't overlap with any strict.
+  // Two regions "overlap" if their centroids are within ~30px or bboxes >50% IoU.
+  function bbox(r) { return { x1: r.minX, y1: r.minY, x2: r.maxX, y2: r.maxY } }
+  function iou(a, b) {
+    const ix1 = Math.max(a.x1, b.x1), iy1 = Math.max(a.y1, b.y1)
+    const ix2 = Math.min(a.x2, b.x2), iy2 = Math.min(a.y2, b.y2)
+    if (ix2 <= ix1 || iy2 <= iy1) return 0
+    const inter = (ix2 - ix1) * (iy2 - iy1)
+    const unionA = (a.x2-a.x1)*(a.y2-a.y1) + (b.x2-b.x1)*(b.y2-b.y1) - inter
+    return unionA <= 0 ? 0 : inter / unionA
+  }
+
+  const merged = [...cand1]
+  const strictBoxes = cand1.map(bbox)
+  for (const r of cand2) {
+    const rb = bbox(r)
+    const overlaps = strictBoxes.some(sb => iou(sb, rb) > 0.4)
+    if (!overlaps) merged.push(r)
+  }
+
+  // ── Sort top-to-bottom, left-to-right ──────────────────
+  merged.sort((a, b) => {
+    const cyA = (a.minY + a.maxY) / 2, cyB = (b.minY + b.maxY) / 2
+    if (Math.abs(cyA - cyB) > 20) return cyA - cyB
+    return ((a.minX + a.maxX) / 2) - ((b.minX + b.maxX) / 2)
+  })
+
+  await tick()
+
+  // ── Build polygons ──────────────────────────────────────
+  const inv = 1 / scale
+  const rooms = []
+
+  for (let i = 0; i < merged.length; i++) {
+    const r = merged[i]
+    // Use the label map that produced this candidate
+    const isFromLoose = !cand1.includes(r)
+    const labelsMap   = isFromLoose ? labels2 : labels1
+
+    const poly = traceContour(labelsMap, r.label, W, H, r)
+    if (poly.length < 4) continue
+    const simp = rdp(poly, opts.epsilon || 2)
+    if (simp.length < 3) continue
+
+    rooms.push({
+      id:      `r${i + 1}`,
+      label:   `Помещение ${i + 1}`,
+      areaPx:  Math.round(r.area * inv * inv),
+      polygon: simp.map(([x, y]) => [Math.round(x * inv), Math.round(y * inv)]),
+    })
+  }
+  return rooms
 }
 
-
-
-// ── Auto wall-thickness detection ──────────────────────────────────────────
-// Scans 3 horizontal + 3 vertical lines through the gray image,
-// collects dark-pixel run lengths, and finds the structural-wall cluster
-// via valley detection (1st run) or k-means (subsequent runs).
-// Returns { wallMin, wallMax, wallPeak, method } in work-canvas px, or null.
-function detectWallThickness(gray, W, H, useKmeans) {
-  // Quick threshold: pixels below 75% of mean = dark (wall candidate)
-  let gSum = 0
-  for (let i = 0; i < gray.length; i++) gSum += gray[i]
-  const darkThresh = (gSum / gray.length) * 0.75
-
-  const maxRun = Math.min(W, H) * 0.18   // longer runs = background, skip
-
-  const runs = []
-  // Helper: collect dark runs along a scanline
-  function scanLine(get, len) {
-    let inDark = false, runStart = 0
-    for (let i = 0; i < len; i++) {
-      const dark = get(i) < darkThresh
-      if (dark && !inDark) { inDark = true; runStart = i }
-      else if (!dark && inDark) {
-        inDark = false
-        const r = i - runStart
-        if (r >= 2 && r < maxRun) runs.push(r)
-      }
-    }
-    if (inDark) { const r = len - runStart; if (r >= 2 && r < maxRun) runs.push(r) }
-  }
-
-  // 3 horizontal scan lines at 33%, 50%, 67%
-  for (const fy of [0.33, 0.50, 0.67]) {
-    const y = Math.floor(H * fy)
-    scanLine(x => gray[y*W+x], W)
-  }
-  // 3 vertical scan lines at 33%, 50%, 67%
-  for (const fx of [0.33, 0.50, 0.67]) {
-    const x = Math.floor(W * fx)
-    scanLine(y => gray[y*W+x], H)
-  }
-
-  if (runs.length < 6) return null
-
-  const maxBin = Math.ceil(maxRun)
-
-  if (!useKmeans) {
-    // ── Valley method (first run) ────────────────────────────────────────────
-    const hist = new Uint32Array(maxBin + 1)
-    for (const r of runs) hist[Math.min(Math.round(r), maxBin)]++
-
-    // 3-point smooth
-    const s = new Float32Array(maxBin + 1)
-    s[0] = hist[0]
-    for (let i = 1; i < maxBin; i++) s[i] = (hist[i-1] + hist[i]*2 + hist[i+1]) / 4
-    s[maxBin] = hist[maxBin]
-
-    // First peak — thin lines/artifacts (search first quarter)
-    let p1 = 1
-    const p1Limit = Math.min(14, maxBin >> 2)
-    for (let i = 2; i <= p1Limit; i++) if (s[i] > s[p1]) p1 = i
-
-    // Valley after first peak
-    let valley = p1
-    for (let i = p1 + 1; i < Math.min(p1 * 6 + 3, maxBin); i++) if (s[i] < s[valley]) valley = i
-
-    // Second peak — structural walls
-    let p2 = valley
-    for (let i = valley + 1; i < Math.min(valley + p1 * 10 + 4, maxBin); i++) if (s[i] > s[p2]) p2 = i
-
-    // If no clear two-peak structure — fall back to median
-    if (p2 <= valley || s[p2] < 1) {
-      const sorted = runs.slice().sort((a, b) => a - b)
-      const wallPeak = sorted[Math.floor(sorted.length * 0.50)]
-      return {
-        wallMin:  Math.max(2, Math.round(wallPeak * 0.60)),
-        wallMax:  Math.min(maxBin, Math.round(wallPeak * 2.20)),
-        wallPeak: Math.round(wallPeak),
-        method:   'median',
-      }
-    }
-
-    return {
-      wallMin:  Math.max(2, valley > p1 ? valley : p1 + 1),
-      wallMax:  Math.min(maxBin, Math.round(p2 * 2.20)),
-      wallPeak: p2,
-      method:   'valley',
-    }
-
-  } else {
-    // ── K-means k=3: thin lines | structural walls | exterior walls ──────────
-    let c0 = 2, c1 = maxRun * 0.08, c2 = maxRun * 0.25
-    for (let iter = 0; iter < 25; iter++) {
-      let s0=0,n0=0, s1=0,n1=0, s2=0,n2=0
-      for (const v of runs) {
-        const d0=Math.abs(v-c0), d1=Math.abs(v-c1), d2=Math.abs(v-c2)
-        if (d0<=d1&&d0<=d2) { s0+=v; n0++ }
-        else if (d1<=d2)    { s1+=v; n1++ }
-        else                { s2+=v; n2++ }
-      }
-      const nc0=n0?s0/n0:c0, nc1=n1?s1/n1:c1, nc2=n2?s2/n2:c2
-      if (Math.abs(nc0-c0)<0.3&&Math.abs(nc1-c1)<0.3&&Math.abs(nc2-c2)<0.3) break
-      c0=nc0; c1=nc1; c2=nc2
-    }
-    const [thin, wall, thick] = [c0,c1,c2].sort((a,b)=>a-b)
-    return {
-      wallMin:  Math.max(2, Math.round((thin + wall) / 2)),
-      wallMax:  Math.min(maxBin, Math.round((wall + thick) / 2 + wall * 0.5)),
-      wallPeak: Math.round(wall),
-      method:   'kmeans',
-    }
-  }
-}
-
-// ── Wall info display ──────────────────────────────────────────────────────
-function updateWallInfoDisplay(wallInfo) {
-  const box = document.getElementById('wallInfoBox')
-  if (!box) return
-  if (!wallInfo) { box.style.display = 'none'; return }
-
-  // Scale factor: work-canvas px → image px
-  const inv = currentImageEl
-    ? Math.min(1, 2000 / Math.max(currentImageEl.naturalWidth, currentImageEl.naturalHeight))
-    : 1
-
-  const minPx  = Math.round(wallInfo.wallMin  / inv)
-  const maxPx  = Math.round(wallInfo.wallMax  / inv)
-  const minSide = wallInfo.wallMin * 4   // min room side in work-canvas px
-  const minAreaImg = Math.round(Math.pow(minSide / inv, 2) / 1000)
-
-  document.getElementById('wallInfoRange').textContent   = `${minPx}–${maxPx} px`
-  document.getElementById('wallInfoMinArea').textContent = `${minAreaImg}k px²`
-  const labels = { valley: 'долина (1-й запуск)', kmeans: 'k-means', median: 'медиана' }
-  document.getElementById('wallInfoMethod').textContent  = labels[wallInfo.method] || wallInfo.method
-
-  box.style.display = ''
-}
+// Otsu threshold
 function otsu(gray) {
   const hist = new Uint32Array(256)
   for (let i = 0; i < gray.length; i++) hist[gray[i]]++
@@ -2204,477 +1068,6 @@ function erode4(bin, W, H) {
   return out
 }
 
-// ---- Canny Edge Detection --------------------------------------------------
-// Pure-JS Canny for the Electron renderer.
-// Steps: 3x3 Gaussian -> Sobel -> NMS -> double-threshold + BFS hysteresis.
-// Returns Uint8Array: 1 = edge/wall, 0 = background/room.
-function cannyEdges(gray, W, H) {
-  // 1. Gaussian blur 3x3
-  const blur = new Uint8Array(W * H)
-  for (let y = 1; y < H - 1; y++) {
-    for (let x = 1; x < W - 1; x++) {
-      blur[y*W+x] = (
-        gray[(y-1)*W+(x-1)]   + gray[(y-1)*W+x]*2 + gray[(y-1)*W+(x+1)] +
-        gray[ y   *W+(x-1)]*2 + gray[ y   *W+x]*4 + gray[ y   *W+(x+1)]*2 +
-        gray[(y+1)*W+(x-1)]   + gray[(y+1)*W+x]*2 + gray[(y+1)*W+(x+1)]
-      ) >> 4
-    }
-  }
-
-  // 2. Sobel gradient magnitude + quantised angle (4 directions)
-  const mag = new Float32Array(W * H)
-  const ang = new Uint8Array(W * H)  // 0=horiz 1=+45 2=vert 3=-45
-  for (let y = 1; y < H - 1; y++) {
-    for (let x = 1; x < W - 1; x++) {
-      const gx = -blur[(y-1)*W+(x-1)] + blur[(y-1)*W+(x+1)]
-               - 2*blur[y*W+(x-1)]   + 2*blur[y*W+(x+1)]
-               - blur[(y+1)*W+(x-1)] + blur[(y+1)*W+(x+1)]
-      const gy = -blur[(y-1)*W+(x-1)] - 2*blur[(y-1)*W+x] - blur[(y-1)*W+(x+1)]
-               + blur[(y+1)*W+(x-1)] + 2*blur[(y+1)*W+x] + blur[(y+1)*W+(x+1)]
-      mag[y*W+x] = Math.sqrt(gx*gx + gy*gy)
-      const a = Math.atan2(Math.abs(gy), Math.abs(gx))
-      ang[y*W+x] = a < 0.3927 ? 0 : a < 1.1781 ? (gy * gx >= 0 ? 1 : 3) : 2
-    }
-  }
-
-  // 3. Non-maximum suppression
-  const nms = new Float32Array(W * H)
-  for (let y = 1; y < H - 1; y++) {
-    for (let x = 1; x < W - 1; x++) {
-      const m = mag[y*W+x]
-      if (!m) continue
-      let n1, n2
-      switch (ang[y*W+x]) {
-        case 0: n1 = mag[y*W+(x-1)];       n2 = mag[y*W+(x+1)];       break
-        case 1: n1 = mag[(y-1)*W+(x+1)];   n2 = mag[(y+1)*W+(x-1)];   break
-        case 2: n1 = mag[(y-1)*W+x];       n2 = mag[(y+1)*W+x];       break
-        case 3: n1 = mag[(y-1)*W+(x-1)];   n2 = mag[(y+1)*W+(x+1)];   break
-      }
-      if (m >= n1 && m >= n2) nms[y*W+x] = m
-    }
-  }
-
-  // 4. Auto-thresholds from 85th-percentile of non-zero gradient magnitudes
-  const magHist = new Uint32Array(512)
-  for (let i = 0; i < nms.length; i++) magHist[Math.min(511, nms[i] | 0)]++
-  let nonZero = 0
-  for (let i = 1; i < 512; i++) nonZero += magHist[i]
-  let cumul = 0, highT = 50
-  for (let i = 1; i < 512; i++) {
-    cumul += magHist[i]
-    if (cumul >= nonZero * 0.85) { highT = i; break }
-  }
-  const lowT = Math.max(5, highT * 0.35)
-
-  // 5. Double-threshold + BFS hysteresis
-  const state = new Uint8Array(W * H)  // 0=none 1=weak 2=strong
-  for (let i = 0; i < nms.length; i++) {
-    if (nms[i] >= highT) state[i] = 2
-    else if (nms[i] >= lowT) state[i] = 1
-  }
-  const queue = []
-  for (let i = 0; i < state.length; i++) if (state[i] === 2) queue.push(i)
-  let qi = 0
-  while (qi < queue.length) {
-    const p = queue[qi++]
-    const py = (p / W) | 0, px = p - py * W
-    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-      if (!dx && !dy) continue
-      const ny = py + dy, nx = px + dx
-      if (ny < 0 || ny >= H || nx < 0 || nx >= W) continue
-      const ni = ny * W + nx
-      if (state[ni] === 1) { state[ni] = 2; queue.push(ni) }
-    }
-  }
-  const out = new Uint8Array(W * H)
-  for (let i = 0; i < state.length; i++) out[i] = state[i] === 2 ? 1 : 0
-  return out
-}
-
-// ── Morphological Closing ─────────────────────────────────────────────────────
-// Dilation followed by erosion with a square structuring element of radius r.
-// Closes small gaps in edge maps, connecting broken wall segments.
-// Input/output: Uint8Array of edge pixels (1 = edge, 0 = background).
-function morphClose(edges, W, H, r) {
-  // Dilation pass — set pixel if any neighbour within r×r is an edge
-  const dilated = new Uint8Array(W * H)
-  for (let y = r; y < H - r; y++) {
-    for (let x = r; x < W - r; x++) {
-      let has = 0
-      outer1: for (let dy = -r; dy <= r && !has; dy++)
-        for (let dx = -r; dx <= r; dx++)
-          if (edges[(y+dy)*W+(x+dx)]) { has = 1; break outer1 }
-      dilated[y*W+x] = has
-    }
-  }
-  // Erosion pass — keep pixel only if all neighbours within r×r are set
-  const closed = new Uint8Array(W * H)
-  for (let y = r; y < H - r; y++) {
-    for (let x = r; x < W - r; x++) {
-      if (!dilated[y*W+x]) continue
-      let all = 1
-      outer2: for (let dy = -r; dy <= r; dy++)
-        for (let dx = -r; dx <= r; dx++)
-          if (!dilated[(y+dy)*W+(x+dx)]) { all = 0; break outer2 }
-      closed[y*W+x] = all
-    }
-  }
-  return closed
-}
-
-// ── Probabilistic Hough Transform ─────────────────────────────────────────────
-// Detects line segments in an edge map using a simplified PPHT approach:
-//   1. Accumulate votes in (rho, theta) space for 180 angle buckets.
-//   2. For each peak above threshold, walk along the line collecting
-//      connected edge pixels into segments (gap tolerance = maxGap).
-// Returns [{x1,y1,x2,y2,theta,rho}, ...] sorted by length descending.
-function probabilisticHough(edges, W, H, opts) {
-  const NUM_ANGLES  = 180
-  const threshold   = opts.threshold  ?? Math.max(30, Math.min(W, H) * 0.06)
-  const minLength   = opts.minLength  ?? Math.max(20, Math.min(W, H) * 0.04)
-  const maxGap      = opts.maxGap     ?? Math.max(5,  Math.min(W, H) * 0.008)
-
-  const diag     = Math.ceil(Math.sqrt(W*W + H*H))
-  const numRho   = diag * 2 + 1
-  const cosT     = new Float32Array(NUM_ANGLES)
-  const sinT     = new Float32Array(NUM_ANGLES)
-  for (let a = 0; a < NUM_ANGLES; a++) {
-    const ang = a * Math.PI / NUM_ANGLES
-    cosT[a] = Math.cos(ang)
-    sinT[a] = Math.sin(ang)
-  }
-
-  // Accumulator
-  const acc = new Int32Array(numRho * NUM_ANGLES)
-  const edgePts = []
-  for (let y = 0; y < H; y++)
-    for (let x = 0; x < W; x++)
-      if (edges[y*W+x]) {
-        edgePts.push([x, y])
-        for (let a = 0; a < NUM_ANGLES; a++) {
-          const rho = Math.round(x * cosT[a] + y * sinT[a]) + diag
-          acc[rho * NUM_ANGLES + a]++
-        }
-      }
-
-  // Find peaks with NMS (5×5 window)
-  const peaks = []
-  for (let ri = 5; ri < numRho - 5; ri++) {
-    for (let ai = 5; ai < NUM_ANGLES - 5; ai++) {
-      const v = acc[ri * NUM_ANGLES + ai]
-      if (v < threshold) continue
-      let isMax = true
-      check: for (let dr = -2; dr <= 2; dr++)
-        for (let da = -2; da <= 2; da++) {
-          if (dr === 0 && da === 0) continue
-          if (acc[(ri+dr)*NUM_ANGLES+(ai+da)] >= v) { isMax = false; break check }
-        }
-      if (isMax) peaks.push({ rho: ri - diag, theta: ai, votes: v })
-    }
-  }
-  peaks.sort((a,b) => b.votes - a.votes)
-
-  // For each peak, extract segments by walking along the line
-  const used = new Uint8Array(W * H)
-  const segments = []
-
-  for (const pk of peaks) {
-    const { rho, theta } = pk
-    const cos = cosT[theta], sin = sinT[theta]
-
-    // Parametrise scan direction perpendicular to line normal
-    // Walk in the direction of the line (perpendicular to normal)
-    const scanDx = -sin, scanDy = cos  // direction along the line
-    // Find starting point: the edge pixel closest to the line
-    let bestDist = Infinity, startX = -1, startY = -1
-    for (const [ex, ey] of edgePts) {
-      if (used[ey*W+ex]) continue
-      const d = Math.abs(ex * cos + ey * sin - rho)
-      if (d < 1.5 && d < bestDist) { bestDist = d; startX = ex; startY = ey }
-    }
-    if (startX < 0) continue
-
-    // Walk in both directions from startX,startY collecting pixels
-    function collectSegment(sx, sy) {
-      const segs = []
-      let curSeg = null, gapCount = 0
-      // Project all edge points onto line, sort by parameter t
-      const pts = []
-      for (const [ex, ey] of edgePts) {
-        if (used[ey*W+ex]) continue
-        const perpDist = Math.abs(ex * cos + ey * sin - rho)
-        if (perpDist > 1.5) continue
-        const t = ex * scanDx + ey * scanDy
-        pts.push({ x: ex, y: ey, t })
-      }
-      pts.sort((a,b) => a.t - b.t)
-
-      if (pts.length < 2) return []
-      const result = []
-      let segStart = null, segPrev = null
-      for (const pt of pts) {
-        if (!segStart) { segStart = pt; segPrev = pt; continue }
-        const gap = pt.t - segPrev.t
-        if (gap > maxGap) {
-          const len = Math.hypot(segPrev.x - segStart.x, segPrev.y - segStart.y)
-          if (len >= minLength) result.push([segStart, segPrev])
-          segStart = pt
-        }
-        segPrev = pt
-      }
-      if (segStart && segPrev && segStart !== segPrev) {
-        const len = Math.hypot(segPrev.x - segStart.x, segPrev.y - segStart.y)
-        if (len >= minLength) result.push([segStart, segPrev])
-      }
-      return result
-    }
-
-    const found = collectSegment(startX, startY)
-    for (const [a, b] of found) {
-      segments.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, theta, rho })
-      // Mark used pixels near this segment to avoid double-counting
-      const len = Math.hypot(b.x - a.x, b.y - a.y)
-      const steps = Math.ceil(len)
-      for (let s = 0; s <= steps; s++) {
-        const t = s / steps
-        const mx = Math.round(a.x + (b.x - a.x) * t)
-        const my = Math.round(a.y + (b.y - a.y) * t)
-        if (mx >= 0 && mx < W && my >= 0 && my < H) used[my*W+mx] = 1
-      }
-    }
-  }
-
-  segments.sort((a,b) =>
-    Math.hypot(b.x2-b.x1,b.y2-b.y1) - Math.hypot(a.x2-a.x1,a.y2-a.y1))
-  return segments
-}
-
-// ── Line-segment intersection ──────────────────────────────────────────────────
-// Returns {x, y} intersection point or null if lines are parallel / don't meet.
-// Lines are treated as infinite (for wall extension) — use tMin/tMax to clamp.
-function lineIntersect(x1,y1,x2,y2, x3,y3,x4,y4) {
-  const d1x = x2-x1, d1y = y2-y1
-  const d2x = x4-x3, d2y = y4-y3
-  const denom = d1x*d2y - d1y*d2x
-  if (Math.abs(denom) < 1e-6) return null
-  const t = ((x3-x1)*d2y - (y3-y1)*d2x) / denom
-  return { x: x1 + t*d1x, y: y1 + t*d1y, t }
-}
-
-// ── Build room polygons from Hough line intersections ─────────────────────────
-// Groups wall segments by orientation (H/V), extends them to their grid position,
-// then computes all grid-cell polygons formed by pairs of H-walls and V-walls.
-// Returns array of polygon vertex arrays [[x,y], ...].
-function buildRoomsFromLines(segments, W, H, edges) {
-  // Separate horizontal vs vertical segments (within 20° of axis)
-  const hSegs = [], vSegs = []
-  for (const seg of segments) {
-    const dx = Math.abs(seg.x2 - seg.x1), dy = Math.abs(seg.y2 - seg.y1)
-    if (dy <= dx * 0.36) hSegs.push(seg)   // ≤ ~20° from horizontal
-    else if (dx <= dy * 0.36) vSegs.push(seg)  // ≤ ~20° from vertical
-    // Diagonal segments ignored for rectangular room detection
-  }
-
-  if (hSegs.length < 2 || vSegs.length < 2) return []
-
-  // Cluster H-segments by Y coordinate (merge if within mergeR pixels)
-  function clusterLines(segs, coordFn, spanFn, mergeR) {
-    const sorted = [...segs].sort((a,b) => coordFn(a) - coordFn(b))
-    const clusters = []
-    for (const seg of sorted) {
-      const c = coordFn(seg)
-      const last = clusters[clusters.length - 1]
-      if (last && Math.abs(c - last.coord) <= mergeR) {
-        last.coord = (last.coord * last.count + c) / (last.count + 1)
-        last.count++
-        const [s1, e1] = spanFn(last)
-        const [s2, e2] = spanFn(seg)
-        last.span = [Math.min(s1, s2), Math.max(e1, e2)]
-      } else {
-        clusters.push({ coord: c, count: 1, span: spanFn(seg) })
-      }
-    }
-    return clusters
-  }
-
-  const mergeR = Math.max(6, Math.min(W, H) * 0.012)
-  const hClusters = clusterLines(hSegs,
-    s => (s.y1 + s.y2) / 2,
-    s => [Math.min(s.x1,s.x2), Math.max(s.x1,s.x2)],
-    mergeR)
-  const vClusters = clusterLines(vSegs,
-    s => (s.x1 + s.x2) / 2,
-    s => [Math.min(s.y1,s.y2), Math.max(s.y1,s.y2)],
-    mergeR)
-
-  hClusters.sort((a,b) => a.coord - b.coord)
-  vClusters.sort((a,b) => a.coord - b.coord)
-
-  // Build candidate room rectangles: for each pair of adjacent H-lines and
-  // adjacent V-lines, check that all 4 corners are near real edge pixels.
-  const minRoomPx = Math.min(W, H) * 0.02   // минимум ~2% короткой стороны
-  const maxRoomPx = Math.min(W, H) * 0.98   // почти вся картинка — нет потолка
-  const rooms = []
-
-  function edgeNear(ex, ey, r) {
-    const ix = Math.round(ex), iy = Math.round(ey)
-    const r2 = r * r
-    for (let dy = -r; dy <= r; dy++) {
-      const ny = iy + dy
-      if (ny < 0 || ny >= H) continue
-      for (let dx = -r; dx <= r; dx++) {
-        if (dx*dx+dy*dy > r2) continue
-        const nx = ix + dx
-        if (nx >= 0 && nx < W && edges[ny*W+nx]) return true
-      }
-    }
-    return false
-  }
-
-  // Радиус поиска рёбра у угла — для больших комнат чуть больше
-  const cornerR = Math.max(12, mergeR * 2)
-
-  for (let hi = 0; hi < hClusters.length - 1; hi++) {
-    const h1 = hClusters[hi], h2 = hClusters[hi+1]
-    const roomH = h2.coord - h1.coord
-    if (roomH < minRoomPx || roomH > maxRoomPx) continue
-
-    for (let vi = 0; vi < vClusters.length - 1; vi++) {
-      const v1 = vClusters[vi], v2 = vClusters[vi+1]
-      const roomW2 = v2.coord - v1.coord
-      if (roomW2 < minRoomPx || roomW2 > maxRoomPx) continue
-
-      // Check corners: достаточно 3 из 4 углов (один может быть проёмом/дверью)
-      const corners = [
-        [v1.coord, h1.coord], [v2.coord, h1.coord],
-        [v2.coord, h2.coord], [v1.coord, h2.coord],
-      ]
-      const cornersFound = corners.filter(([cx, cy]) => edgeNear(cx, cy, cornerR)).length
-      if (cornersFound < 3) continue
-
-      // Check that the centre of the room is NOT an edge pixel (it's open space)
-      const midX = Math.round((v1.coord + v2.coord) / 2)
-      const midY = Math.round((h1.coord + h2.coord) / 2)
-      // Wall density check: use a small fixed radius (20px) around room centre.
-      // Previously used 15% of room size — for a 400×300 px room that's a 45 px
-      // radius, pulling in column markers (⊠) and furniture symbols and causing
-      // large valid rooms to be rejected as "wall".  A fixed 20 px radius tests
-      // only the immediate centre, where a real room is always open.
-      const checkRi = 20
-      let wallDensity = 0
-      for (let dy = -checkRi; dy <= checkRi; dy++)
-        for (let dx = -checkRi; dx <= checkRi; dx++) {
-          const ny = midY+dy, nx = midX+dx
-          if (ny>=0&&ny<H&&nx>=0&&nx<W&&edges[ny*W+nx]) wallDensity++
-        }
-      const checkArea = (2*checkRi+1)*(2*checkRi+1)
-      // Large rooms tolerate a bit more (columns, symbols); small rooms stricter.
-      const densityLimit = (roomW2 * roomH > W * H * 0.02) ? 0.20 : 0.30
-      if (wallDensity / checkArea > densityLimit) continue  // too many edges = wall, not room
-
-      rooms.push(corners.map(([cx,cy]) => [Math.round(cx), Math.round(cy)]))
-    }
-  }
-
-  // Deduplicate highly overlapping rectangles (IoU > 0.5)
-  function rectIoU(a, b) {
-    const ax1=a[0][0],ay1=a[0][1],ax2=a[2][0],ay2=a[2][1]
-    const bx1=b[0][0],by1=b[0][1],bx2=b[2][0],by2=b[2][1]
-    const ix1=Math.max(ax1,bx1), iy1=Math.max(ay1,by1)
-    const ix2=Math.min(ax2,bx2), iy2=Math.min(ay2,by2)
-    if (ix2<=ix1||iy2<=iy1) return 0
-    const inter=(ix2-ix1)*(iy2-iy1)
-    const ua=(ax2-ax1)*(ay2-ay1), ub=(bx2-bx1)*(by2-by1)
-    return inter/(ua+ub-inter)
-  }
-  const kept = []
-  for (let i = 0; i < rooms.length; i++) {
-    if (kept.some(j => rectIoU(rooms[j], rooms[i]) > 0.5)) continue
-    kept.push(i)
-  }
-  return kept.map(i => rooms[i])
-}
-
-// ---- Hough H/V Line Detector (legacy — used for snap/align only) -----------
-// Projects the Canny edge map onto the Y-axis (horizontals) and X-axis
-// (verticals). Local maxima in each 1-D projection that exceed minVotes are
-// returned as wall coordinates.  minVotes defaults to 4% of image dimension.
-function houghHVLines(edges, W, H) {
-  const hAcc = new Uint32Array(H)
-  const vAcc = new Uint32Array(W)
-  for (let y = 0; y < H; y++)
-    for (let x = 0; x < W; x++)
-      if (edges[y*W+x]) { hAcc[y]++; vAcc[x]++ }
-
-  const minH = Math.max(8, W * 0.04)
-  const minV = Math.max(8, H * 0.04)
-
-  function nmsPeaks(acc, n, minVal) {
-    const peaks = []
-    for (let i = 2; i < n - 2; i++) {
-      if (acc[i] < minVal) continue
-      if (acc[i] >= acc[i-1] && acc[i] >= acc[i+1] &&
-          acc[i] >= acc[i-2] && acc[i] >= acc[i+2]) peaks.push(i)
-    }
-    return peaks
-  }
-
-  return {
-    hLines: nmsPeaks(hAcc, H, minH),  // y-coords of horizontal walls
-    vLines: nmsPeaks(vAcc, W, minV),  // x-coords of vertical walls
-  }
-}
-
-// ---- Axis-align polygon edges using Hough wall lines -----------------------
-// For each polygon edge:
-//   - nearly horizontal (dy <= 0.4*dx): snap both endpoints to the nearest
-//     horizontal Hough line within snapDist pixels;
-//   - nearly vertical  (dx <= 0.4*dy): snap to nearest vertical Hough line.
-// Two alignment passes stabilise adjacent edges that share vertices.
-function axisAlignEdges(poly, hLines, vLines, snapDist) {
-  if (!poly.length || (!hLines.length && !vLines.length)) return poly
-  const n = poly.length
-  const result = poly.map(p => [p[0], p[1]])
-
-  for (let iter = 0; iter < 2; iter++) {
-    for (let i = 0; i < n; i++) {
-      const j = (i + 1) % n
-      const [x1, y1] = result[i], [x2, y2] = result[j]
-      const dx = Math.abs(x2 - x1), dy = Math.abs(y2 - y1)
-
-      if (dy <= dx * 0.4) {
-        // Nearly horizontal edge: align to common Y
-        const midY = (y1 + y2) * 0.5
-        let bestY = midY, bestD = snapDist
-        for (const hy of hLines) {
-          const d = Math.abs(midY - hy)
-          if (d < bestD) { bestD = d; bestY = hy }
-        }
-        result[i][1] = Math.round(bestY)
-        result[j][1] = Math.round(bestY)
-      } else if (dx <= dy * 0.4) {
-        // Nearly vertical edge: align to common X
-        const midX = (x1 + x2) * 0.5
-        let bestX = midX, bestD = snapDist
-        for (const vx of vLines) {
-          const d = Math.abs(midX - vx)
-          if (d < bestD) { bestD = d; bestX = vx }
-        }
-        result[i][0] = Math.round(bestX)
-        result[j][0] = Math.round(bestX)
-      }
-    }
-  }
-
-  // Remove collapsed adjacent points
-  const out = []
-  for (let i = 0; i < n; i++) {
-    const [cx, cy] = result[i], [px, py] = result[(i - 1 + n) % n]
-    if (Math.hypot(cx - px, cy - py) >= 1) out.push([cx, cy])
-  }
-  return out.length >= 3 ? out : poly
-}
-
 // Moore-neighbor boundary tracing on a labeled region.
 // Returns ordered list of [x,y] pixel coords forming a closed contour.
 function traceContour(labels, label, W, H, region) {
@@ -2699,10 +1092,7 @@ function traceContour(labels, label, W, H, region) {
   // Came from West (since topmost-leftmost has nothing W or N)
   let backDir = 4
 
-  const maxSteps = Math.max(
-    (region.maxX - region.minX + region.maxY - region.minY + 4) * 8,
-    (region.maxX - region.minX + 1) * (region.maxY - region.minY + 1) * 2
-  )
+  const maxSteps = (region.maxX - region.minX + region.maxY - region.minY + 4) * 8
   for (let step = 0; step < maxSteps; step++) {
     let found = false
     // Search 8 directions clockwise starting from (backDir + 1)
@@ -2725,88 +1115,21 @@ function traceContour(labels, label, W, H, region) {
 }
 
 // Ramer-Douglas-Peucker polygon simplification (iterative-safe)
-// Сглаживание контура с сохранением углов.
-// Алгоритм:
-//   1. Находим "угловые" точки — где направление контура резко меняется
-//      (угол между соседними отрезками > angleThr градусов).
-//   2. Между каждой парой соседних углов — прямой участок стены.
-//      Применяем RDP только внутри этого участка, фиксируя его концы.
-//      Это убирает зубчики вдоль прямой, не трогая сами углы.
 function rdp(points, eps) {
-  const n = points.length
-  if (n < 3 || eps <= 0) return points.slice()
-
-  // Угол в градусах между векторами (prev→cur) и (cur→next)
-  function angleDeg(prev, cur, next) {
-    const ax = cur[0] - prev[0], ay = cur[1] - prev[1]
-    const bx = next[0] - cur[0],  by = next[1] - cur[1]
-    const dot   = ax*bx + ay*by
-    const cross  = ax*by - ay*bx
-    return Math.abs(Math.atan2(Math.abs(cross), dot) * 180 / Math.PI)
-  }
-
-  // Порог угла: чем больше eps, тем мягче (меньше точек считаются углами).
-  // При eps=1 почти все изломы — углы; при eps=20 только резкие повороты.
-  const angleThr = Math.max(15, 60 - eps * 2)  // 15°..58°
-
-  // Шаг 1: помечаем угловые точки (замкнутый контур)
-  const isCorner = new Uint8Array(n)
-  for (let i = 0; i < n; i++) {
-    const prev = points[(i - 1 + n) % n]
-    const cur  = points[i]
-    const next = points[(i + 1) % n]
-    if (angleDeg(prev, cur, next) > angleThr) isCorner[i] = 1
-  }
-
-  // Если углов нет — вся комната круглая/бесформенная, применяем обычный RDP
-  const corners = []
-  for (let i = 0; i < n; i++) if (isCorner[i]) corners.push(i)
-  if (corners.length < 2) return rdpSegment(points, 0, n - 1, eps)
-
-  // Шаг 2: между каждой парой соседних углов — сегмент прямой стены.
-  // Применяем RDP внутри сегмента, концы фиксированы.
-  const keep = new Uint8Array(n)
-  for (const ci of corners) keep[ci] = 1
-
-  for (let k = 0; k < corners.length; k++) {
-    const a = corners[k]
-    const b = corners[(k + 1) % corners.length]
-    // Сегмент может перематываться через 0
-    const seg = []
-    let idx = a
-    while (idx !== b) { seg.push(idx); idx = (idx + 1) % n }
-    seg.push(b)
-    if (seg.length < 3) continue
-    // Применяем RDP к этому сегменту
-    const pts = seg.map(i => points[i])
-    const kept = rdpSegment(pts, 0, pts.length - 1, eps)
-    const keptSet = new Set(kept.map(p => p[0] * 100000 + p[1]))
-    for (let s = 1; s < seg.length - 1; s++) {
-      const [px, py] = points[seg[s]]
-      if (keptSet.has(px * 100000 + py)) keep[seg[s]] = 1
-    }
-  }
-
-  const out = []
-  for (let i = 0; i < n; i++) if (keep[i]) out.push(points[i])
-  return out.length >= 3 ? out : points.slice()
-}
-
-// Стандартный RDP для отрезка (не замкнутого), возвращает массив точек
-function rdpSegment(points, a, b, eps) {
-  if (b - a < 2) return points.slice(a, b + 1)
+  if (points.length < 3 || eps <= 0) return points.slice()
   const keep = new Uint8Array(points.length)
-  keep[a] = 1; keep[b] = 1
-  const stack = [[a, b]]
+  keep[0] = 1; keep[points.length - 1] = 1
+
+  const stack = [[0, points.length - 1]]
   while (stack.length) {
-    const [i, j] = stack.pop()
-    if (j - i < 2) continue
+    const [a, b] = stack.pop()
+    if (b - a < 2) continue
     let maxD = 0, idx = -1
-    const [x1, y1] = points[i], [x2, y2] = points[j]
+    const [x1, y1] = points[a], [x2, y2] = points[b]
     const dxAB = x2 - x1, dyAB = y2 - y1
     const denom = dxAB * dxAB + dyAB * dyAB
-    for (let k = i + 1; k < j; k++) {
-      const [px, py] = points[k]
+    for (let i = a + 1; i < b; i++) {
+      const [px, py] = points[i]
       let d
       if (denom === 0) {
         d = Math.hypot(px - x1, py - y1)
@@ -2815,348 +1138,17 @@ function rdpSegment(points, a, b, eps) {
         const tx = x1 + t * dxAB, ty = y1 + t * dyAB
         d = Math.hypot(px - tx, py - ty)
       }
-      if (d > maxD) { maxD = d; idx = k }
+      if (d > maxD) { maxD = d; idx = i }
     }
     if (maxD > eps && idx > 0) {
       keep[idx] = 1
-      stack.push([i, idx])
-      stack.push([idx, j])
+      stack.push([a, idx])
+      stack.push([idx, b])
     }
   }
   const out = []
-  for (let i = a; i <= b; i++) if (keep[i]) out.push(points[i])
+  for (let i = 0; i < points.length; i++) if (keep[i]) out.push(points[i])
   return out
-}
-
-// ── Post-processing: snap corners + clean jagged edges ────────────────────────
-
-// Шаг 1. snapToRightAngles
-// Если угол при вершине близок к 90° (90° ± snapThr), делаем его точно 90°.
-//
-// Edge cases:
-//  • Круглые/многоугольные помещения — у них нет углов ≈90°, функция их не трогает
-//  • Очень короткие рёбра (< minEdge px) — снап пропускается, чтобы не схлопнуть точки
-//  • Сдвиг вершины оказался слишком большим (> 35% короткого ребра) — снап отменяется
-//  • Все вершины сошлись в одну точку — возвращаем исходный массив
-//  • < 3 точек — возвращаем as-is
-function snapToRightAngles(points, snapThr) {
-  snapThr = snapThr || 15   // ±15° от 90°
-  const n = points.length
-  if (n < 3) return points.slice()
-
-  const result = points.map(p => [p[0], p[1]])
-
-  for (let iter = 0; iter < 4; iter++) {
-    let anySnapped = false
-    for (let i = 0; i < n; i++) {
-      const prev = result[(i - 1 + n) % n]
-      const cur  = result[i]
-      const next = result[(i + 1) % n]
-
-      const ax = cur[0] - prev[0], ay = cur[1] - prev[1]
-      const bx = next[0] - cur[0], by = next[1] - cur[1]
-      const lenA = Math.hypot(ax, ay)
-      const lenB = Math.hypot(bx, by)
-
-      // Защита от вырожденных рёбер (точки совпадают или почти)
-      if (lenA < 2 || lenB < 2) continue
-
-      const uax = ax / lenA, uay = ay / lenA
-      const ubx = bx / lenB, uby = by / lenB
-
-      const dot   = uax * ubx + uay * uby
-      const cross = uax * uby - uay * ubx
-      // turnDeg — угол отклонения от прямой (0° = прямо, 90° = поворот)
-      const turnDeg = Math.abs(Math.atan2(Math.abs(cross), dot) * 180 / Math.PI)
-
-      // Нас интересует только поворот ≈90°
-      if (Math.abs(turnDeg - 90) > snapThr) continue
-
-      // Снаппим: двигаем cur так, чтобы B стал перпендикулярен A.
-      // Перп к A (повёрнут влево):
-      const perpAx = -uay, perpAy = uax
-      // Проекция B на перп(A) — это «правильная» составляющая B
-      const bAlongPerp = ubx * perpAx + uby * perpAy
-      const sign = bAlongPerp >= 0 ? 1 : -1
-
-      const newX = next[0] - lenB * sign * perpAx
-      const newY = next[1] - lenB * sign * perpAy
-
-      // Отменяем снап если сдвиг слишком большой
-      const shift   = Math.hypot(newX - cur[0], newY - cur[1])
-      const minEdge = Math.min(lenA, lenB)
-      if (shift > minEdge * 0.35) continue
-
-      result[i] = [Math.round(newX), Math.round(newY)]
-      anySnapped = true
-    }
-    if (!anySnapped) break
-  }
-
-  // Финальная проверка: не допускаем схлопывания точек
-  const deduped = []
-  for (let i = 0; i < n; i++) {
-    const prev = result[(i - 1 + n) % n]
-    const cur  = result[i]
-    if (Math.hypot(cur[0] - prev[0], cur[1] - prev[1]) >= 1) deduped.push(cur)
-  }
-  return deduped.length >= 3 ? deduped : points.slice()
-}
-
-// Шаг 2. cleanJaggedEdges
-// Удаляет точки-зубчики вдоль прямых участков стен (между угловыми вершинами).
-// Угловые вершины определяются по величине поворота — они защищены от удаления.
-//
-// Edge cases:
-//  • Круглые помещения — угловых вершин нет или мало, функция возвращает исходный контур
-//  • Все точки — угловые (сложная форма) — зубчики не удаляются, форма сохранена
-//  • После чистки осталось < 3 точек — возвращаем исходный массив
-//  • Сегмент между углами содержит 0 промежуточных точек — пропускается корректно
-function cleanJaggedEdges(points, devEps) {
-  devEps = devEps || 3  // макс. допустимое отклонение от прямой, пикс
-  const n = points.length
-  if (n < 4) return points.slice()
-
-  // Порог угла: считаем вершину «угловой» если поворот > cornerThr°
-  // 30° — достаточно мягко, чтобы поймать слегка скошенные углы после снаппа
-  const cornerThrRad = 30 * Math.PI / 180
-
-  const isCorner = new Uint8Array(n)
-  for (let i = 0; i < n; i++) {
-    const prev = points[(i - 1 + n) % n]
-    const cur  = points[i]
-    const next = points[(i + 1) % n]
-    const ax = cur[0] - prev[0], ay = cur[1] - prev[1]
-    const bx = next[0] - cur[0], by = next[1] - cur[1]
-    const lenA = Math.hypot(ax, ay), lenB = Math.hypot(bx, by)
-    if (lenA < 1 || lenB < 1) { isCorner[i] = 1; continue }  // вырожденная — считаем угловой
-    const dot   = (ax * bx + ay * by) / (lenA * lenB)
-    const cross = (ax * by - ay * bx) / (lenA * lenB)
-    const turn  = Math.abs(Math.atan2(Math.abs(cross), dot))
-    if (turn > cornerThrRad) isCorner[i] = 1
-  }
-
-  const corners = []
-  for (let i = 0; i < n; i++) if (isCorner[i]) corners.push(i)
-
-  // Круглое или бесформенное помещение — угловых вершин нет или очень мало.
-  // Не трогаем: RDP уже дал оптимальное приближение.
-  if (corners.length < 2) return points.slice()
-
-  const keep = new Uint8Array(n)
-  for (const ci of corners) keep[ci] = 1
-
-  for (let k = 0; k < corners.length; k++) {
-    const a = corners[k]
-    const b = corners[(k + 1) % corners.length]
-    const [x1, y1] = points[a]
-    const [x2, y2] = points[b]
-    const segLen = Math.hypot(x2 - x1, y2 - y1)
-
-    // Обходим сегмент от a до b (может перематываться через 0)
-    let idx = (a + 1) % n
-    while (idx !== b) {
-      const [px, py] = points[idx]
-      // Расстояние от точки до прямой AB
-      const dist = segLen > 0
-        ? Math.abs((y2 - y1) * px - (x2 - x1) * py + x2 * y1 - y2 * x1) / segLen
-        : Math.hypot(px - x1, py - y1)
-
-      // Оставляем только точки, которые заметно отклоняются от прямой стены
-      if (dist > devEps) keep[idx] = 1
-      idx = (idx + 1) % n
-    }
-  }
-
-  const out = []
-  for (let i = 0; i < n; i++) if (keep[i]) out.push(points[i])
-
-  // Если после чистки потеряли слишком много — возвращаем исходное
-  return out.length >= 3 ? out : points.slice()
-}
-
-
-// ── Polygon overlap & union helpers ───────────────────────
-
-// Sutherland–Hodgman clip of subjectPolygon against one edge [edgeA→edgeB]
-function clipPolygonByEdge(poly, ax, ay, bx, by) {
-  if (!poly.length) return []
-  const out = []
-  const dx = bx - ax, dy = by - ay
-  function inside(px, py) { return dx * (py - ay) - dy * (px - ax) >= 0 }
-  function intersect(px, py, qx, qy) {
-    const t_num = (ax - px) * (ay - qy) - (ay - py) * (ax - qx)
-    const t_den = (px - qx) * (ay - by) - (py - qy) * (ax - bx)
-    if (t_den === 0) return [px, py]
-    const t = t_num / t_den
-    return [px + t * (qx - px), py + t * (qy - py)]
-  }
-  for (let i = 0; i < poly.length; i++) {
-    const [cx, cy] = poly[i]
-    const [px, py] = poly[(i + poly.length - 1) % poly.length]
-    const cIn = inside(cx, cy), pIn = inside(px, py)
-    if (cIn) {
-      if (!pIn) out.push(intersect(px, py, cx, cy))
-      out.push([cx, cy])
-    } else if (pIn) {
-      out.push(intersect(px, py, cx, cy))
-    }
-  }
-  return out
-}
-
-// Sutherland–Hodgman intersection of two convex-ish polygons
-// Returns the overlapping polygon or []
-function intersectPolygons(p, q) {
-  let clipped = p.slice()
-  for (let i = 0; i < q.length; i++) {
-    if (!clipped.length) return []
-    const [ax, ay] = q[i]
-    const [bx, by] = q[(i + 1) % q.length]
-    clipped = clipPolygonByEdge(clipped, ax, ay, bx, by)
-  }
-  return clipped
-}
-
-function polygonArea(pts) {
-  let a = 0
-  for (let i = 0; i < pts.length; i++) {
-    const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % pts.length]
-    a += x1 * y2 - x2 * y1
-  }
-  return Math.abs(a) / 2
-}
-
-// Axis-aligned bounding boxes overlap?
-function bboxOverlap(a, b) {
-  const axMin = Math.min(...a.map(p => p[0])), axMax = Math.max(...a.map(p => p[0]))
-  const ayMin = Math.min(...a.map(p => p[1])), ayMax = Math.max(...a.map(p => p[1]))
-  const bxMin = Math.min(...b.map(p => p[0])), bxMax = Math.max(...b.map(p => p[0]))
-  const byMin = Math.min(...b.map(p => p[1])), byMax = Math.max(...b.map(p => p[1]))
-  return axMin < bxMax && axMax > bxMin && ayMin < byMax && ayMax > byMin
-}
-
-// Union of two polygons: returns convex hull of all vertices of both
-// (works well for rooms which are mostly rectangular/convex)
-function unionPolygonsConvexHull(a, b) {
-  const pts = [...a, ...b]
-  // Convex hull (Graham scan)
-  pts.sort((p, q) => p[0] !== q[0] ? p[0] - q[0] : p[1] - q[1])
-  const cross = (O, A, B) => (A[0]-O[0])*(B[1]-O[1]) - (A[1]-O[1])*(B[0]-O[0])
-  const lower = [], upper = []
-  for (const p of pts) {
-    while (lower.length >= 2 && cross(lower[lower.length-2], lower[lower.length-1], p) <= 0) lower.pop()
-    lower.push(p)
-  }
-  for (let i = pts.length - 1; i >= 0; i--) {
-    const p = pts[i]
-    while (upper.length >= 2 && cross(upper[upper.length-2], upper[upper.length-1], p) <= 0) upper.pop()
-    upper.push(p)
-  }
-  upper.pop(); lower.pop()
-  return [...lower, ...upper]
-}
-
-// Merge rooms whose polygons overlap significantly (IoU or containment > threshold)
-// Returns new rooms array with overlapping rooms unified
-// Обрезаем полигон poly так, чтобы он не пересекался с полигоном clipper.
-// Используем инвертированный Sutherland-Hodgman: для каждого ребра clipper
-// оставляем пиксели СНАРУЖИ (outside) этого ребра.
-// Это даёт приближение разности A\ B для выпуклых clipper-ов.
-// Обрезаем poly по разделительной линии, сдвинутой на offset вдоль нормали ребра.
-// offset > 0 — линия смещается внутрь poly (отдаём часть перекрытия), < 0 — наружу.
-function clipPolyByOffsetEdge(poly, ax, ay, bx, by, offset) {
-  // Нормаль к ребру (a→b), единичная, направленная внутрь (влево)
-  const len = Math.hypot(bx - ax, by - ay)
-  if (len < 0.001) return poly
-  const nx = -(by - ay) / len
-  const ny =  (bx - ax) / len
-  // Смещаем ребро на offset вдоль нормали
-  const mx = ax + nx * offset
-  const my = ay + ny * offset
-  const ex = bx + nx * offset
-  const ey = by + ny * offset
-  // Оставляем пиксели снаружи сдвинутого ребра (переворачиваем — b→a)
-  return clipPolygonByEdge(poly, ex, ey, mx, my)
-}
-
-function mergeOverlappingRooms(roomList) {
-  if (!roomList.length) return roomList
-
-  const polys = roomList.map(r => r.polygon.map(p => [...p]))  // deep copy
-  const n = polys.length
-
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      if (!bboxOverlap(polys[i], polys[j])) continue
-
-      const inter = intersectPolygons(polys[i], polys[j])
-      if (!inter.length) continue
-
-      const interArea = polygonArea(inter)
-      if (interArea < 2) continue  // шум/артефакт
-
-      const areaI = polygonArea(polys[i])
-      const areaJ = polygonArea(polys[j])
-      if (areaI < 2 || areaJ < 2) continue
-
-      // Один полигон почти целиком внутри другого — поглощается (колонна, ниша)
-      const smaller = Math.min(areaI, areaJ)
-      if (interArea / smaller > 0.85) {
-        if (areaI < areaJ) polys[i] = []; else polys[j] = []
-        continue
-      }
-
-      // ── Смежные комнаты: делим перекрытие пополам ─────────────────────────
-      // Находим ребро полигона i, которое максимально "врезается" в j.
-      // Это ребро и есть граница стены. Делим перекрытие пополам:
-      // каждый полигон обрезается по линии, сдвинутой на половину глубины.
-      let bestEdge = -1, bestDepth = -Infinity, bestLen = 0
-      for (let e = 0; e < polys[i].length; e++) {
-        const [ax, ay] = polys[i][e]
-        const [bx, by] = polys[i][(e + 1) % polys[i].length]
-        const dx = bx - ax, dy = by - ay
-        // Глубина проникновения вершин j за это ребро
-        let depth = 0, count = 0
-        for (const [px, py] of polys[j]) {
-          const d = dx * (py - ay) - dy * (px - ax)  // > 0 = внутри i
-          if (d > 0) { depth += d; count++ }
-        }
-        if (count > 0 && depth > bestDepth) {
-          bestDepth = depth
-          bestEdge  = e
-          bestLen   = Math.hypot(dx, dy)
-        }
-      }
-
-      if (bestEdge < 0 || bestLen < 0.001) continue
-
-      const [ax, ay] = polys[i][bestEdge]
-      const [bx, by] = polys[i][(bestEdge + 1) % polys[i].length]
-
-      // Средняя глубина проникновения на вершину — половина этого = линия раздела
-      const avgDepth = bestDepth / polys[j].length
-      const half = avgDepth / 2
-
-      // Полигон i отступает на half (отдаёт половину перекрытия)
-      const newI = clipPolyByOffsetEdge(polys[i], ax, ay, bx, by, -half)
-      // Полигон j обрезается до той же линии (оставляет себе половину перекрытия)
-      const newJ = clipPolyByOffsetEdge(polys[j], ax, ay, bx, by,  half)
-
-      if (newI.length >= 3) polys[i] = newI
-      if (newJ.length >= 3) polys[j] = newJ
-    }
-  }
-
-  return roomList.map((room, i) => {
-    const poly = polys[i]
-    if (!poly || poly.length < 3) return null
-    return {
-      ...room,
-      polygon: poly.map(p => [Math.round(p[0]), Math.round(p[1])]),
-      areaPx:  Math.round(polygonArea(poly)),
-    }
-  }).filter(Boolean)
 }
 
 // ── Save ───────────────────────────────────────────────────
