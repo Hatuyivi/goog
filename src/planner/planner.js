@@ -793,7 +793,8 @@ async function analysePlaywright() {
     if (!resp.ok) throw new Error(`Сервер вернул ${resp.status}: ${resp.statusText}`)
     responseBlob = await resp.blob()
   } catch (err) {
-    throw new Error(`Не удалось подключиться к ${serverUrl}.\nПроверь, что сервер запущен.\n\n${err.message}`)
+    if (err.message.startsWith('Сервер вернул')) throw err
+    throw new Error(`Не удалось подключиться к ${serverUrl}.\nПроверь, что сервер запущен и в gemini_api.js добавлены CORS-заголовки.\n\n${err.message}`)
   }
 
   setProgressStep('Анализ цветных регионов…')
@@ -802,9 +803,10 @@ async function analysePlaywright() {
   // Загружаем ответное изображение в <img>
   const coloredUrl = URL.createObjectURL(responseBlob)
   const coloredImg = await new Promise((res, rej) => {
-    const img = new Image()
-    img.onload  = () => res(img)
-    img.onerror = () => rej(new Error('Не удалось декодировать ответное изображение'))
+    const img   = new Image()
+    const timer = setTimeout(() => rej(new Error('Таймаут декодирования изображения (10 сек)')), 10000)
+    img.onload  = () => { clearTimeout(timer); res(img) }
+    img.onerror = () => { clearTimeout(timer); rej(new Error('Не удалось декодировать ответное изображение')) }
     img.src = coloredUrl
   })
 
