@@ -145,7 +145,7 @@ function setMode(m) {
   localParams.classList.toggle('visible', m === 'local')
   aiInfo.style.display = m === 'ai' ? '' : 'none'
   const pwParams = document.getElementById('playwrightParams')
-  if (pwParams) pwParams.style.display = m === 'playwright' ? '' : 'none'
+  if (pwParams) pwParams.style.display = m === 'playwright' ? 'flex' : 'none'
 }
 
 // ── Tab switch ─────────────────────────────────────────────
@@ -162,23 +162,64 @@ function onDragLeave()  { dropzone.classList.remove('drag-over') }
 function onDrop(e) {
   e.preventDefault(); dropzone.classList.remove('drag-over')
   const file = e.dataTransfer.files[0]
-  if (file) loadFile(file.path)
+  if (file) loadFileFromBlob(file)
 }
 function onFileSelected(e) {
   const file = e.target.files[0]
-  if (file) loadFile(file.path)
+  if (file) loadFileFromBlob(file)
   e.target.value = ''
 }
 
+// Загрузка через FileReader (работает во всех версиях Electron без file.path)
+function loadFileFromBlob(file) {
+  const extMatch = file.name.match(/\.(\w+)$/)
+  const ext = extMatch ? extMatch[1].toLowerCase() : ''
+  const mimeMap = { 'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'webp': 'image/webp' }
+  currentMime = mimeMap[ext] || file.type || 'image/jpeg'
+
+  const reader = new FileReader()
+  reader.onload = ev => {
+    try {
+      const dataUrl    = ev.target.result
+      currentImageB64  = dataUrl.split(',')[1]
+
+      previewImg.src = dataUrl
+      previewThumb.style.display = 'block'
+      dropzone.style.display = 'none'
+      analyseBtn.disabled = false
+      clearResults()
+
+      const img = new Image()
+      img.onload = () => {
+        currentImageEl = img
+        currentImageBW = makeBWCanvas(img)
+        eraserStrokes = []
+        resizeCanvas(img)
+        drawPlan()
+        canvas.style.display = 'block'
+        canvasPlaceholder.style.display = 'none'
+        viewLabel.textContent = 'Нажми «Распознать помещения»'
+        resetZoom()
+      }
+      img.src = dataUrl
+    } catch(e) { alert('Ошибка загрузки: ' + e.message) }
+  }
+  reader.onerror = () => alert('Не удалось прочитать файл')
+  reader.readAsDataURL(file)
+}
+
+// Обратная совместимость: loadFile по пути (используется только из внутренней логики)
 function loadFile(filePath) {
   try {
     const buf  = fs.readFileSync(filePath)
-    const ext  = path.extname(filePath).toLowerCase()
-    const mimeMap = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' }
+    const extMatch = filePath.match(/\.(\w+)$/)
+    const ext  = extMatch ? extMatch[1].toLowerCase() : ''
+    const mimeMap = { 'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'webp': 'image/webp' }
     currentMime     = mimeMap[ext] || 'image/jpeg'
     currentImageB64 = buf.toString('base64')
 
-    previewImg.src = `data:${currentMime};base64,${currentImageB64}`
+    const dataUrl = `data:${currentMime};base64,${currentImageB64}`
+    previewImg.src = dataUrl
     previewThumb.style.display = 'block'
     dropzone.style.display = 'none'
     analyseBtn.disabled = false
@@ -196,7 +237,7 @@ function loadFile(filePath) {
       viewLabel.textContent = 'Нажми «Распознать помещения»'
       resetZoom()
     }
-    img.src = `data:${currentMime};base64,${currentImageB64}`
+    img.src = dataUrl
   } catch(e) { alert('Ошибка загрузки: ' + e.message) }
 }
 
