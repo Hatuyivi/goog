@@ -792,6 +792,15 @@ async function analysePlaywright() {
     const resp = await fetch(serverUrl, { method: 'POST', body: form })
     if (!resp.ok) throw new Error(`Сервер вернул ${resp.status}: ${resp.statusText}`)
     responseBlob = await resp.blob()
+
+    // 👇 ВРЕМЕННЫЙ ДЕБАГ — удали после проверки
+    const debugUrl = URL.createObjectURL(responseBlob)
+    const debugImg = document.createElement('img')
+    debugImg.src = debugUrl
+    debugImg.style.cssText = 'position:fixed;top:10px;right:10px;z-index:9999;max-width:400px;max-height:400px;border:3px solid red;background:#fff'
+    document.body.appendChild(debugImg)
+    setTimeout(() => debugImg.remove(), 30000)
+
   } catch (err) {
     if (err.message.startsWith('Сервер вернул')) throw err
     throw new Error(`Не удалось подключиться к ${serverUrl}.\nПроверь, что сервер запущен и в gemini_api.js добавлены CORS-заголовки.\n\n${err.message}`)
