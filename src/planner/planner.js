@@ -170,7 +170,7 @@ function onFileSelected(e) {
   e.target.value = ''
 }
 
-// Загрузка через FileReader (работает во всех версиях Electron без file.path)
+// Загрузка через FileReader — работает во всех версиях Electron без file.path
 function loadFileFromBlob(file) {
   const extMatch = file.name.match(/\.(\w+)$/)
   const ext = extMatch ? extMatch[1].toLowerCase() : ''
@@ -180,8 +180,8 @@ function loadFileFromBlob(file) {
   const reader = new FileReader()
   reader.onload = ev => {
     try {
-      const dataUrl    = ev.target.result
-      currentImageB64  = dataUrl.split(',')[1]
+      const dataUrl   = ev.target.result
+      currentImageB64 = dataUrl.split(',')[1]
 
       previewImg.src = dataUrl
       previewThumb.style.display = 'block'
@@ -208,7 +208,6 @@ function loadFileFromBlob(file) {
   reader.readAsDataURL(file)
 }
 
-// Обратная совместимость: loadFile по пути (используется только из внутренней логики)
 function loadFile(filePath) {
   try {
     const buf  = fs.readFileSync(filePath)
@@ -749,7 +748,6 @@ async function analyseAI() {
 }
 
 // ── Local CV learning ──────────────────────────────────────
-}
 
 // ── Playwright / local-model recognition ──────────────────
 //
