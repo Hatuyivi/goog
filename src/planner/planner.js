@@ -139,10 +139,13 @@ async function updateModelLabel() {
 // ── Mode toggle ────────────────────────────────────────────
 function setMode(m) {
   mode = m
-  document.getElementById('modeLocal').classList.toggle('active', m === 'local')
-  document.getElementById('modeAi').classList.toggle('active',    m === 'ai')
+  document.getElementById('modeLocal').classList.toggle('active',      m === 'local')
+  document.getElementById('modeAi').classList.toggle('active',         m === 'ai')
+  document.getElementById('modePlaywright').classList.toggle('active', m === 'playwright')
   localParams.classList.toggle('visible', m === 'local')
   aiInfo.style.display = m === 'ai' ? '' : 'none'
+  const pwParams = document.getElementById('playwrightParams')
+  if (pwParams) pwParams.style.display = m === 'playwright' ? '' : 'none'
 }
 
 // ── Tab switch ─────────────────────────────────────────────
@@ -669,8 +672,9 @@ async function analysePlan() {
   if (!currentImageB64) return
   analyseBtn.disabled = true
   try {
-    if (mode === 'local') await analyseLocal()
-    else                  await analyseAI()
+    if (mode === 'local')      await analyseLocal()
+    else if (mode === 'ai')    await analyseAI()
+    else                       await analysePlaywright()
   } catch(e) {
     alert('Ошибка: ' + e.message)
   } finally {
@@ -704,6 +708,217 @@ async function analyseAI() {
 }
 
 // ── Local CV learning ──────────────────────────────────────
+}
+
+// ── Playwright / local-model recognition ──────────────────
+//
+// Алгоритм:
+//  1. Отправляем оригинальное изображение на локальный сервер (multipart/form-data).
+//  2. Сервер возвращает PNG с помещениями, закрашенными уникальными цветами.
+//  3. Парсим цветные регионы через flood-fill прямо в браузере.
+//  4. Для каждого региона строим полигон контура (тот же traceContour из recognizer.js).
+//  5. Полигоны накладываем на ОРИГИНАЛЬНОЕ изображение.
+//
+async function analysePlaywright() {
+  const urlInput    = document.getElementById('playwrightUrl')
+  const promptInput = document.getElementById('playwrightPrompt')
+  const statusEl    = document.getElementById('playwrightStatus')
+
+  const serverUrl  = (urlInput?.value  || 'http://localhost:3000/generate').trim()
+  const userPrompt = (promptInput?.value || '').trim() ||
+    'выдели помещения уникальными цветами, игнорируй МОП'
+
+  if (statusEl) statusEl.textContent = ''
+
+  showProgress('Отправляем план на локальную модель…', serverUrl)
+  setProgressStep('Подготовка изображения…')
+  await tick()
+
+  // Конвертируем base64 → Blob
+  const byteStr  = atob(currentImageB64)
+  const byteArr  = new Uint8Array(byteStr.length)
+  for (let i = 0; i < byteStr.length; i++) byteArr[i] = byteStr.charCodeAt(i)
+  const blob     = new Blob([byteArr], { type: currentMime })
+  const ext      = currentMime.includes('png') ? 'png' : 'jpg'
+
+  const form = new FormData()
+  form.append('prompt', userPrompt)
+  form.append('image',  blob, `plan.${ext}`)
+
+  setProgressStep('Ожидаем ответ сервера…')
+  await tick()
+
+  let responseBlob
+  try {
+    const resp = await fetch(serverUrl, { method: 'POST', body: form })
+    if (!resp.ok) throw new Error(`Сервер вернул ${resp.status}: ${resp.statusText}`)
+    responseBlob = await resp.blob()
+  } catch (err) {
+    throw new Error(`Не удалось подключиться к ${serverUrl}.\nПроверь, что сервер запущен.\n\n${err.message}`)
+  }
+
+  setProgressStep('Анализ цветных регионов…')
+  await tick()
+
+  // Загружаем ответное изображение в <img>
+  const coloredUrl = URL.createObjectURL(responseBlob)
+  const coloredImg = await new Promise((res, rej) => {
+    const img = new Image()
+    img.onload  = () => res(img)
+    img.onerror = () => rej(new Error('Не удалось декодировать ответное изображение'))
+    img.src = coloredUrl
+  })
+
+  const CW = coloredImg.naturalWidth
+  const CH = coloredImg.naturalHeight
+
+  // Рисуем на offscreen canvas
+  const offC = document.createElement('canvas')
+  offC.width = CW; offC.height = CH
+  const offCtx = offC.getContext('2d')
+  offCtx.drawImage(coloredImg, 0, 0, CW, CH)
+  URL.revokeObjectURL(coloredUrl)
+
+  const imgData = offCtx.getImageData(0, 0, CW, CH)
+  const px      = imgData.data
+
+  // Масштаб: ответное изображение может отличаться по размеру от оригинала
+  const origW = currentImageEl.naturalWidth
+  const origH = currentImageEl.naturalHeight
+  const scaleX = origW / CW
+  const scaleY = origH / CH
+
+  // ── Разделяем пиксели на цветовые кластеры ──────────────
+  // Квантуем цвет → 32-bit ключ (каждый канал округляем до 8)
+  const QUANT = 32
+  const colorMap  = new Map()   // key → label
+  const labelArr  = new Int32Array(CW * CH)
+  let   nextLabel = 1
+
+  // Белые / серые / тёмные пиксели — фон/стены (игнорируем)
+  function isBg(r, g, b) {
+    const mn = Math.min(r, g, b)
+    const mx = Math.max(r, g, b)
+    // Ахроматический: насыщенность < порога  ИЛИ  очень светлый / очень тёмный
+    if (mx - mn < 30) return true     // серый / белый / чёрный
+    if (mx < 30)      return true     // очень тёмный
+    return false
+  }
+
+  for (let i = 0; i < CW * CH; i++) {
+    const r = px[i*4], g = px[i*4+1], b = px[i*4+2]
+    if (isBg(r, g, b)) { labelArr[i] = 0; continue }
+    const qr = Math.round(r / QUANT) * QUANT
+    const qg = Math.round(g / QUANT) * QUANT
+    const qb = Math.round(b / QUANT) * QUANT
+    const key = (qr << 16) | (qg << 8) | qb
+    if (!colorMap.has(key)) colorMap.set(key, nextLabel++)
+    labelArr[i] = colorMap.get(key)
+  }
+
+  // ── Flood-fill внутри каждого цветового класса ───────────
+  const regionLabels = new Int32Array(CW * CH)   // итоговые метки регионов
+  let   regionId     = 1
+  const regionInfo   = []   // { id, minX, maxX, minY, maxY, area, colorLabel }
+  const stack        = new Int32Array(CW * CH)
+
+  for (let y = 0; y < CH; y++) {
+    for (let x = 0; x < CW; x++) {
+      const idx = y * CW + x
+      if (labelArr[idx] === 0 || regionLabels[idx] !== 0) continue
+
+      const cl = labelArr[idx]
+      let minX = x, maxX = x, minY = y, maxY = y, area = 0
+      let sp = 0
+      stack[sp++] = idx
+      regionLabels[idx] = regionId
+
+      while (sp > 0) {
+        const p  = stack[--sp]
+        const py = (p / CW) | 0
+        const px_ = p - py * CW
+        area++
+        if (px_ < minX) minX = px_; if (px_ > maxX) maxX = px_
+        if (py  < minY) minY = py;  if (py  > maxY) maxY = py
+        const check = (nx, ny) => {
+          if (nx < 0 || nx >= CW || ny < 0 || ny >= CH) return
+          const ni = ny * CW + nx
+          if (labelArr[ni] === cl && regionLabels[ni] === 0) {
+            regionLabels[ni] = regionId
+            stack[sp++] = ni
+          }
+        }
+        check(px_-1, py); check(px_+1, py)
+        check(px_, py-1); check(px_, py+1)
+      }
+
+      regionInfo.push({ id: regionId, minX, maxX, minY, maxY, area, colorLabel: cl })
+      regionId++
+    }
+  }
+
+  await tick()
+
+  // ── Фильтрация: убираем слишком мелкие и слишком большие ─
+  const total    = CW * CH
+  const minArea  = total * 0.003   // < 0.3% площади → мусор
+  const maxArea  = total * 0.70
+
+  const candidates = regionInfo.filter(r =>
+    r.area >= minArea && r.area <= maxArea
+  )
+
+  if (!candidates.length) {
+    throw new Error(
+      'Сервер вернул изображение, но цветных помещений не обнаружено.\n' +
+      'Проверь промпт или вывод сервера.'
+    )
+  }
+
+  // Сортировка сверху-вниз, слева-направо (как в local CV)
+  candidates.sort((a, b) => {
+    const cyA = (a.minY + a.maxY) / 2, cyB = (b.minY + b.maxY) / 2
+    if (Math.abs(cyA - cyB) > 20) return cyA - cyB
+    return (a.minX + a.maxX) / 2 - (b.minX + b.maxX) / 2
+  })
+
+  // ── Строим полигоны (traceContour + rdp из recognizer.js) ─
+  rooms = []
+  let roomIdx = 1
+
+  for (const region of candidates) {
+    const poly = traceContour(regionLabels, region.id, CW, CH, region)
+    if (poly.length < 4) continue
+
+    const simp0 = rdp(poly, 2)
+    if (simp0.length < 3) continue
+    const simp1 = snapToRightAngles(simp0)
+    const simp  = cleanJaggedEdges(simp1)
+    if (simp.length < 3) continue
+
+    // Масштабируем координаты обратно на оригинальное изображение
+    const scaledPoly = simp.map(([x, y]) => [
+      Math.round(x * scaleX),
+      Math.round(y * scaleY),
+    ])
+
+    rooms.push({
+      id:      `r${roomIdx}`,
+      label:   `Помещение ${roomIdx}`,
+      areaPx:  Math.round(region.area * scaleX * scaleY),
+      compactness: null,
+      aspect:  null,
+      polygon: scaledPoly,
+      mode:    'playwright',
+    })
+    roomIdx++
+  }
+
+  if (!rooms.length) throw new Error('Помещения не найдены — полигоны не удалось построить.')
+
+  if (statusEl) statusEl.textContent = `✓ Получено ${rooms.length} помещений от локальной модели`
+
+  finishAnalysis()
 }
 
 async function analyseLocal() {

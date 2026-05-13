@@ -593,8 +593,9 @@
         <!-- Mode toggle -->
         <div class="section-label">Режим распознавания</div>
         <div class="seg">
-          <button id="modeLocal" class="active" onclick="setMode('local')">Локально (CV)</button>
-          <button id="modeAi"                  onclick="setMode('ai')">ИИ (API)</button>
+          <button id="modeLocal"      class="active" onclick="setMode('local')">Локально (CV)</button>
+          <button id="modeAi"                        onclick="setMode('ai')">ИИ (API)</button>
+          <button id="modePlaywright"                onclick="setMode('playwright')">🖌 Локал. модель</button>
         </div>
 
         <!-- Local CV params -->
@@ -629,6 +630,23 @@
           <span class="section-label">Модель</span>
           <span id="activeModelLabel" class="active-model-label">…</span>
           <span class="active-model-hint">Меняется в меню Σ</span>
+        </div>
+
+        <!-- Playwright local model settings -->
+        <div class="params" id="playwrightParams" style="display:none">
+          <div class="param-row">
+            <label>URL сервера</label>
+            <input type="text" id="playwrightUrl" value="http://localhost:3000/generate"
+              style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--panel);color:var(--text-pri);font-size:12px;margin-top:4px"
+              placeholder="http://localhost:3000/generate">
+          </div>
+          <div class="param-row" style="margin-top:6px">
+            <label>Промпт</label>
+            <textarea id="playwrightPrompt" rows="3"
+              style="width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--panel);color:var(--text-pri);font-size:11px;margin-top:4px;resize:vertical"
+              >выдели помещения уникальными цветами, игнорируй МОП (коридоры, лестницы, лифты, общие зоны), каждое отдельное помещение — свой цвет, фон и стены — белые</textarea>
+          </div>
+          <div id="playwrightStatus" style="font-size:11px;color:var(--text-sec);margin-top:4px"></div>
         </div>
 
         <button class="btn btn-primary" id="analyseBtn" disabled onclick="analysePlan()">
